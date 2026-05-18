@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::Path;
+use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -121,6 +122,24 @@ pub fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<bool, Proces
     }
 }
 
+pub fn hide_child_window(command: &mut Command) -> &mut Command {
+    hide_child_window_impl(command)
+}
+
+#[cfg(target_os = "windows")]
+fn hide_child_window_impl(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(target_os = "windows"))]
+const fn hide_child_window_impl(command: &mut Command) -> &mut Command {
+    command
+}
+
 #[cfg(target_os = "linux")]
 fn spawn_detached_impl(program: &Path, args: &[OsString]) -> Result<(), DetachedSpawnError> {
     let status = std::process::Command::new("setsid")
@@ -144,6 +163,7 @@ fn spawn_detached_impl(program: &Path, args: &[OsString]) -> Result<(), Detached
     use std::os::windows::process::CommandExt as _;
 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
 
     std::process::Command::new(program)
@@ -151,7 +171,7 @@ fn spawn_detached_impl(program: &Path, args: &[OsString]) -> Result<(), Detached
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()?;
     Ok(())
 }
@@ -183,8 +203,9 @@ fn process_status_impl(pid: u32) -> Result<ProcessStatus, ProcessStatusError> {
 #[cfg(target_os = "windows")]
 fn process_status_impl(pid: u32) -> Result<ProcessStatus, ProcessStatusError> {
     let filter = format!("PID eq {pid}");
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+    let mut command = std::process::Command::new("tasklist");
+    command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+    let output = hide_child_window(&mut command)
         .output()
         .map_err(|source| ProcessStatusError::Io { pid, source })?;
     if !output.status.success() {
@@ -222,8 +243,9 @@ fn terminate_process_impl(pid: u32) -> Result<(), TerminateProcessError> {
 
 #[cfg(target_os = "windows")]
 fn terminate_process_impl(pid: u32) -> Result<(), TerminateProcessError> {
-    let status = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T"])
+    let mut command = std::process::Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T"]);
+    let status = hide_child_window(&mut command)
         .status()
         .map_err(|source| TerminateProcessError::Io { pid, source })?;
     if status.success() {

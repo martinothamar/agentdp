@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostTarget {
@@ -62,9 +62,52 @@ pub const fn kvm_status() -> KvmStatus {
 #[must_use]
 pub fn find_binary(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+    env::split_paths(&path).find_map(|directory| find_binary_in_directory(&directory, name))
+}
+
+#[cfg(windows)]
+fn find_binary_in_directory(directory: &Path, name: &str) -> Option<PathBuf> {
+    let direct = directory.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    if Path::new(name).extension().is_some() {
+        return None;
+    }
+
+    for extension in executable_extensions() {
+        let candidate = directory.join(format!("{name}{extension}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn executable_extensions() -> Vec<String> {
+    env::var_os("PATHEXT")
+        .map(|extensions| {
+            env::split_paths(&extensions)
+                .map(|extension| extension.display().to_string())
+                .collect()
+        })
+        .filter(|extensions: &Vec<String>| !extensions.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                ".COM".to_owned(),
+                ".EXE".to_owned(),
+                ".BAT".to_owned(),
+                ".CMD".to_owned(),
+            ]
+        })
+}
+
+#[cfg(not(windows))]
+fn find_binary_in_directory(directory: &Path, name: &str) -> Option<PathBuf> {
+    let candidate = directory.join(name);
+    candidate.is_file().then_some(candidate)
 }
 
 #[cfg(target_os = "linux")]

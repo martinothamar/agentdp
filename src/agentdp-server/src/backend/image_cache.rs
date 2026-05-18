@@ -126,10 +126,12 @@ pub fn ensure_cached(context: &Context, plan: &Plan) -> Result<Status, Error> {
         plan.source.url,
         plan.image_path.display()
     ));
-    let output = Command::new(curl)
+    let mut command = Command::new(curl);
+    command
         .args(["--fail", "--location", "--show-error", "--silent", "--output"])
         .arg(&plan.download_path)
-        .arg(plan.source.url)
+        .arg(plan.source.url);
+    let output = platform::hide_child_window(&mut command)
         .output()
         .map_err(|source| Error::RunDownloader {
             url: plan.source.url,

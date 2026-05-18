@@ -82,10 +82,13 @@ fn up_starts_qemu_and_updates_runtime_state() {
     let result = fixture.up_with_fake_qemu().unwrap();
 
     assert_eq!(result.name, FULL_INSTANCE_NAME);
-    assert_eq!(result.process.pid, Some(TEST_PID));
     let state = fixture.read_state();
     assert_eq!(state.status, state::InstanceStatus::Running);
-    assert_eq!(state.backend.qemu().pid, Some(TEST_PID));
+    #[cfg(unix)]
+    assert_eq!(result.process.pid, Some(TEST_PID));
+    #[cfg(windows)]
+    assert!(result.process.pid.is_some());
+    assert_eq!(state.backend.qemu().pid, result.process.pid);
     assert!(state.backend.qemu().last_start_unix_seconds.is_some());
 }
 

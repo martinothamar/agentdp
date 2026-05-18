@@ -101,15 +101,15 @@ pub fn run_doctor(context: &Context) -> DoctorReport {
 
 fn check_host(context: &Context) -> DoctorCheck {
     let host = context.host_target();
-    if matches!(host, platform::HostTarget::Linux | platform::HostTarget::Wsl2) {
-        DoctorCheck::ok("Linux/WSL2 host", host.label())
+    if matches!(
+        host,
+        platform::HostTarget::Linux | platform::HostTarget::Wsl2 | platform::HostTarget::Windows
+    ) {
+        DoctorCheck::ok("QEMU host", host.label())
     } else {
         DoctorCheck::fail(
-            "Linux/WSL2 host",
-            format!(
-                "{} is not supported; only Linux and WSL2 hosts are supported in the first implementation",
-                host.label()
-            ),
+            "QEMU host",
+            format!("{} is not supported; use Linux, WSL2, or Windows", host.label()),
         )
     }
 }

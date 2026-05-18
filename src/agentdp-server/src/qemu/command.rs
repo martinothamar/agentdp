@@ -9,6 +9,7 @@ use crate::qemu::runtime::State as QemuState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CommandSpec {
     pub(super) name: String,
+    pub(super) accelerator: Accelerator,
     pub(super) cpus: u16,
     pub(super) memory: String,
     pub(super) disk: PathBuf,
@@ -35,6 +36,12 @@ pub(super) enum PortProtocol {
     Udp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Accelerator {
+    Kvm,
+    Whpx,
+}
+
 pub(super) fn spec_from_state(
     manifest: &AgentManifest,
     manifest_name: &str,
@@ -44,6 +51,7 @@ pub(super) fn spec_from_state(
 ) -> CommandSpec {
     CommandSpec {
         name: format!("agentdp-{manifest_name}-{instance}"),
+        accelerator: Accelerator::local_default(),
         cpus: manifest.resources.cpus,
         memory: manifest.resources.memory.clone(),
         disk: PathBuf::from(&state.disk),
@@ -67,7 +75,7 @@ pub(super) fn spec_from_state(
                 )
             })
             .collect(),
-        daemonize: true,
+        daemonize: !cfg!(target_os = "windows"),
     }
 }
 
@@ -76,9 +84,9 @@ pub(super) fn args(spec: &CommandSpec) -> Vec<String> {
         "-name".to_owned(),
         spec.name.clone(),
         "-machine".to_owned(),
-        "type=q35,accel=kvm".to_owned(),
+        format!("type=q35,accel={}", spec.accelerator.as_qemu_name()),
         "-cpu".to_owned(),
-        "host".to_owned(),
+        spec.accelerator.cpu_model().to_owned(),
         "-smp".to_owned(),
         spec.cpus.to_string(),
         "-m".to_owned(),
@@ -134,6 +142,30 @@ impl PortProtocol {
     }
 }
 
+impl Accelerator {
+    const fn local_default() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Whpx
+        } else {
+            Self::Kvm
+        }
+    }
+
+    const fn as_qemu_name(self) -> &'static str {
+        match self {
+            Self::Kvm => "kvm",
+            Self::Whpx => "whpx",
+        }
+    }
+
+    const fn cpu_model(self) -> &'static str {
+        match self {
+            Self::Kvm => "host",
+            Self::Whpx => "qemu64",
+        }
+    }
+}
+
 impl From<PortProtocolState> for PortProtocol {
     fn from(protocol: PortProtocolState) -> Self {
         match protocol {
@@ -152,12 +184,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use super::{CommandSpec, PortForward, PortProtocol, args};
+    use super::{Accelerator, CommandSpec, PortForward, PortProtocol, args};
 
     #[test]
     fn builds_qemu_system_args() {
         let spec = CommandSpec {
             name: "agentdp-altinn-studio-pr-0".to_owned(),
+            accelerator: Accelerator::Kvm,
             cpus: 4,
             memory: "16G".to_owned(),
             disk: PathBuf::from("/instances/altinn-studio/pr-0/disk.qcow2"),
@@ -224,5 +257,53 @@ mod tests {
                 "-daemonize",
             ]
         );
+    }
+
+    #[test]
+    fn builds_windows_qemu_system_args() {
+        let mut spec = qemu_spec();
+        spec.accelerator = Accelerator::Whpx;
+        spec.daemonize = false;
+
+        let args = args(&spec);
+
+        assert!(args.contains(&"type=q35,accel=whpx".to_owned()));
+        assert!(args.contains(&"qemu64".to_owned()));
+        assert!(!args.contains(&"-daemonize".to_owned()));
+    }
+
+    fn qemu_spec() -> CommandSpec {
+        CommandSpec {
+            name: "agentdp-altinn-studio-pr-0".to_owned(),
+            accelerator: Accelerator::Kvm,
+            cpus: 4,
+            memory: "16G".to_owned(),
+            disk: PathBuf::from("/instances/altinn-studio/pr-0/disk.qcow2"),
+            seed_media: PathBuf::from("/instances/altinn-studio/pr-0/generated/qemu/seed.img"),
+            monitor_socket: PathBuf::from("/instances/altinn-studio/pr-0/generated/qemu/monitor.sock"),
+            qmp_socket: PathBuf::from("/instances/altinn-studio/pr-0/generated/qemu/qmp.sock"),
+            pid_file: PathBuf::from("/instances/altinn-studio/pr-0/generated/qemu/qemu.pid"),
+            serial_log: PathBuf::from("/instances/altinn-studio/pr-0/logs/serial.log"),
+            qemu_log: PathBuf::from("/instances/altinn-studio/pr-0/logs/qemu.log"),
+            ports: BTreeMap::from([
+                (
+                    "code-server".to_owned(),
+                    PortForward {
+                        guest: 4090,
+                        host: 14090,
+                        protocol: PortProtocol::Tcp,
+                    },
+                ),
+                (
+                    "ssh".to_owned(),
+                    PortForward {
+                        guest: 22,
+                        host: 2222,
+                        protocol: PortProtocol::Tcp,
+                    },
+                ),
+            ]),
+            daemonize: true,
+        }
     }
 }

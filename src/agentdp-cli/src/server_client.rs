@@ -47,9 +47,9 @@ pub struct Ping {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Refresh {
+pub enum Stop {
     NotRunning,
-    Restarted(Ping),
+    Stopped(Ping),
 }
 
 /// Ensures agentdp-server is running and responding to ping.
@@ -94,15 +94,11 @@ pub fn request<T: DeserializeOwned>(
     send(paths, &request, on_event)
 }
 
-pub fn refresh_if_running(
-    context: &Context,
-    paths: &PlatformPaths,
-    server: &std::path::Path,
-) -> Result<Refresh, Error> {
+pub fn stop_if_running(context: &Context, paths: &PlatformPaths) -> Result<Stop, Error> {
     let ping = match ping(paths) {
         Ok(ping) => ping,
-        Err(Error::Socket(LocalSocketError::Unsupported)) => return Ok(Refresh::NotRunning),
-        Err(error) if should_start_after_ping_error(&error) => return Ok(Refresh::NotRunning),
+        Err(Error::Socket(LocalSocketError::Unsupported)) => return Ok(Stop::NotRunning),
+        Err(error) if should_start_after_ping_error(&error) => return Ok(Stop::NotRunning),
         Err(error) => return Err(error),
     };
 
@@ -113,8 +109,12 @@ pub fn refresh_if_running(
         )
     });
     stop_running(context, paths, &ping)?;
+    Ok(Stop::Stopped(ping))
+}
+
+pub fn start_server_from(context: &Context, paths: &PlatformPaths, server: &std::path::Path) -> Result<Ping, Error> {
     start_from(context, paths, server)?;
-    Ok(Refresh::Restarted(wait_for_ping(paths)?))
+    wait_for_ping(paths)
 }
 
 fn ping(paths: &PlatformPaths) -> Result<Ping, Error> {

@@ -49,7 +49,9 @@ impl QemuImg {
         if let Some(path) = std::env::var_os(QEMU_IMG_PATH_ENV).filter(|value| !value.is_empty()) {
             return Ok(Self::new(path));
         }
-        let binary = platform::find_binary("qemu-img").ok_or(Error::MissingQemuImg)?;
+        let binary = platform::find_binary("qemu-img")
+            .or_else(default_windows_qemu_img)
+            .ok_or(Error::MissingQemuImg)?;
         Ok(Self::new(binary))
     }
 
@@ -68,7 +70,9 @@ impl QemuImg {
         context
             .logger()
             .verbose_with(|| format!("creating QEMU instance disk {}", spec.disk.display()));
-        let output = Command::new(&self.binary).args(&args).output().map_err(Error::Run)?;
+        let mut command = Command::new(&self.binary);
+        command.args(&args);
+        let output = platform::hide_child_window(&mut command).output().map_err(Error::Run)?;
         if !output.status.success() {
             return Err(Error::CreateFailed {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -94,6 +98,12 @@ fn create_overlay_args(spec: &DiskCreateSpec) -> Vec<String> {
 
 fn path_text(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn default_windows_qemu_img() -> Option<PathBuf> {
+    cfg!(windows)
+        .then(|| PathBuf::from(r"C:\Program Files\qemu\qemu-img.exe"))
+        .filter(|path| path.is_file())
 }
 
 #[cfg(test)]

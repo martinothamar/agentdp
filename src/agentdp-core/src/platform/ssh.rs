@@ -136,7 +136,8 @@ impl SshKeygen {
         context
             .logger()
             .verbose_with(|| format!("generating instance SSH key {}", private_key.display()));
-        let output = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .arg("-t")
             .arg("ed25519")
             .arg("-N")
@@ -145,7 +146,8 @@ impl SshKeygen {
             .arg("agentdp")
             .arg("-f")
             .arg(&private_key)
-            .arg("-q")
+            .arg("-q");
+        let output = super::hide_child_window(&mut command)
             .output()
             .map_err(Error::RunKeygen)?;
         if !output.status.success() {
@@ -211,10 +213,9 @@ impl SshClient {
                 connection.user, connection.host, connection.port
             )
         });
-        let output = run_with_timeout(
-            Command::new(&self.binary).args(command_args(connection, command, privilege)),
-            timeout,
-        )?;
+        let mut ssh_command = Command::new(&self.binary);
+        ssh_command.args(command_args(connection, command, privilege));
+        let output = run_with_timeout(super::hide_child_window(&mut ssh_command), timeout)?;
         let status = output.status.code().unwrap_or(1);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

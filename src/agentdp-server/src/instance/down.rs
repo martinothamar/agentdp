@@ -8,7 +8,7 @@ use crate::runtime;
 
 use super::{Error, Instance, state};
 
-const DOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Instance {
     pub fn down(&mut self, context: &Context) -> Result<InstanceDownResult, Error> {

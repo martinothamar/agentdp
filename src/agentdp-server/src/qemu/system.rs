@@ -1,7 +1,7 @@
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use agentdp_core::Context;
 use agentdp_core::platform;
@@ -62,27 +62,55 @@ impl QemuSystem {
         if let Some(path) = std::env::var_os(QEMU_SYSTEM_PATH_ENV).filter(|value| !value.is_empty()) {
             return Ok(Self::new(path));
         }
-        let binary = platform::find_binary("qemu-system-x86_64").ok_or(Error::MissingQemuSystem)?;
+        let binary = platform::find_binary("qemu-system-x86_64")
+            .or_else(default_windows_qemu_system)
+            .ok_or(Error::MissingQemuSystem)?;
         Ok(Self::new(binary))
     }
 
-    pub(super) fn start(&self, context: &Context, spec: &command::CommandSpec) -> Result<(), Error> {
+    pub(super) fn start(&self, context: &Context, spec: &command::CommandSpec) -> Result<u32, Error> {
         prepare_runtime_paths(spec)?;
         let args = command::args(spec);
         context
             .logger()
             .verbose_with(|| format!("starting QEMU with arguments: {}", args.join(" ")));
-        let output = Command::new(&self.binary)
-            .args(args.iter().map(OsString::from))
-            .output()
-            .map_err(Error::Run)?;
+        start_qemu(&self.binary, &args, spec)
+    }
+}
+
+fn start_qemu(binary: &Path, args: &[String], spec: &command::CommandSpec) -> Result<u32, Error> {
+    if spec.daemonize {
+        let mut command = Command::new(binary);
+        command.args(args.iter().map(OsString::from));
+        let output = platform::hide_child_window(&mut command).output().map_err(Error::Run)?;
         if !output.status.success() {
             return Err(Error::StartFailed {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             });
         }
-        Ok(())
+        return read_pid_file(&spec.pid_file);
     }
+
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&spec.qemu_log)
+        .map_err(Error::Run)?;
+    let stderr = log.try_clone().map_err(Error::Run)?;
+    let mut command = Command::new(binary);
+    command
+        .args(args.iter().map(OsString::from))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    let child = platform::hide_child_window(&mut command).spawn().map_err(Error::Run)?;
+    Ok(child.id())
+}
+
+fn default_windows_qemu_system() -> Option<PathBuf> {
+    cfg!(windows)
+        .then(|| PathBuf::from(r"C:\Program Files\qemu\qemu-system-x86_64.exe"))
+        .filter(|path| path.is_file())
 }
 
 pub(super) fn read_pid_file(path: &Path) -> Result<u32, Error> {

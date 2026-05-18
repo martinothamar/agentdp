@@ -1,3 +1,4 @@
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,8 @@ const CLOUD_INIT_WAIT_TIMEOUT: Duration = Duration::from_mins(45);
 const CLOUD_INIT_POLL_DELAY: Duration = Duration::from_secs(5);
 const CLOUD_INIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_INIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const MONITOR_POWERDOWN_WAIT: Duration = Duration::from_secs(30);
+const MONITOR_QUIT_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct Error {
@@ -357,8 +360,7 @@ impl QemuRuntimeBackend {
         qemu_state: &mut State,
     ) -> Result<runtime::StartOutput, Error> {
         let spec = command::spec_from_state(manifest, manifest_name, instance, network, qemu_state);
-        self.qemu_system.start(context, &spec)?;
-        let pid = system::read_pid_file(&PathBuf::from(&qemu_state.pid_file))?;
+        let pid = self.qemu_system.start(context, &spec)?;
         qemu_state.pid = Some(pid);
         qemu_state.last_start_unix_seconds = Some(current_unix_seconds());
         Ok(runtime::StartOutput {
@@ -501,25 +503,40 @@ pub fn down_with_process_control(
                 ProcessStatus::Running => {
                     context
                         .logger()
-                        .verbose_with(|| format!("terminating QEMU pid {pid} for {}", input.name));
-                    match terminate(pid) {
-                        Ok(()) => {
-                            if !wait_for_exit(pid)? {
-                                return Err(ErrorKind::ProcessStillRunning { pid }.into());
+                        .verbose_with(|| format!("requesting QEMU guest shutdown for {}", input.name));
+                    if request_qmp_command(context, state, "system_powerdown")
+                        && wait_for_process_exit_with_status(&mut process_status, pid, MONITOR_POWERDOWN_WAIT)?
+                    {
+                        terminated_pid = Some(pid);
+                        process_result = "powered-off";
+                    } else if request_qmp_command(context, state, "quit")
+                        && wait_for_process_exit_with_status(&mut process_status, pid, MONITOR_QUIT_WAIT)?
+                    {
+                        terminated_pid = Some(pid);
+                        process_result = "quit";
+                    } else {
+                        context
+                            .logger()
+                            .verbose_with(|| format!("terminating QEMU pid {pid} for {}", input.name));
+                        match terminate(pid) {
+                            Ok(()) => {
+                                if !wait_for_exit(pid)? {
+                                    return Err(ErrorKind::ProcessStillRunning { pid }.into());
+                                }
+                                terminated_pid = Some(pid);
+                                process_result = "terminated";
                             }
-                            terminated_pid = Some(pid);
-                            process_result = "terminated";
+                            Err(error) => match process_status(pid)? {
+                                ProcessStatus::NotFound => {
+                                    context.logger().warn(format!(
+                                        "QEMU pid {pid} for {} exited before termination completed",
+                                        input.name
+                                    ));
+                                    process_result = "missing";
+                                }
+                                ProcessStatus::Running => return Err(error.into()),
+                            },
                         }
-                        Err(error) => match process_status(pid)? {
-                            ProcessStatus::NotFound => {
-                                context.logger().warn(format!(
-                                    "QEMU pid {pid} for {} exited before termination completed",
-                                    input.name
-                                ));
-                                process_result = "missing";
-                            }
-                            ProcessStatus::Running => return Err(error.into()),
-                        },
                     }
                 }
                 ProcessStatus::NotFound => {
@@ -548,6 +565,91 @@ pub fn down_with_process_control(
             process_status: "not-started",
             terminated_pid: None,
         }),
+    }
+}
+
+fn request_qmp_command(context: &Context, state: &State, command: &str) -> bool {
+    let qmp_socket = PathBuf::from(&state.qmp_socket);
+    match platform::connect_local_socket(&qmp_socket) {
+        Ok(socket) => {
+            let mut reader = BufReader::new(socket);
+            if let Err(error) = read_qmp_greeting(&mut reader)
+                .and_then(|()| qmp_execute(&mut reader, "qmp_capabilities"))
+                .and_then(|()| qmp_execute(&mut reader, command))
+            {
+                context.logger().warn(format!(
+                    "failed to execute QMP command {command} on {}: {error}",
+                    qmp_socket.display()
+                ));
+                return false;
+            }
+            context
+                .logger()
+                .verbose_with(|| format!("executed QMP command {command} on {}", qmp_socket.display()));
+            true
+        }
+        Err(error) => {
+            context.logger().warn(format!(
+                "failed to connect to QEMU QMP socket {}: {error}",
+                qmp_socket.display()
+            ));
+            false
+        }
+    }
+}
+
+fn read_qmp_greeting(reader: &mut BufReader<platform::LocalSocket>) -> std::io::Result<()> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    if line.contains("\"QMP\"") {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "QMP greeting did not contain QMP marker",
+        ))
+    }
+}
+
+fn qmp_execute(reader: &mut BufReader<platform::LocalSocket>, command: &str) -> std::io::Result<()> {
+    writeln!(reader.get_mut(), r#"{{"execute":"{command}"}}"#)?;
+    reader.get_mut().flush()?;
+    read_qmp_command_response(reader)
+}
+
+fn read_qmp_command_response(reader: &mut BufReader<platform::LocalSocket>) -> std::io::Result<()> {
+    for _ in 0..8 {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        if line.contains("\"return\"") {
+            return Ok(());
+        }
+        if line.contains("\"error\"") {
+            return Err(std::io::Error::other(format!("QMP returned error: {}", line.trim())));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "QMP command response was not received",
+    ))
+}
+
+fn wait_for_process_exit_with_status(
+    process_status: &mut impl FnMut(u32) -> Result<ProcessStatus, platform::ProcessStatusError>,
+    pid: u32,
+    timeout: Duration,
+) -> Result<bool, Error> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if process_status(pid)? == ProcessStatus::NotFound {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
