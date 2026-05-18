@@ -14,10 +14,10 @@ const END_OF_CHAIN: u16 = 0xFFFF;
 const VOLUME_LABEL: &[u8; 11] = b"CIDATA     ";
 
 #[derive(Debug, Error)]
-pub(super) enum Error {
-    #[error("QEMU seed media contents are too large")]
+pub enum Error {
+    #[error("cloud-init seed media contents are too large")]
     TooLarge,
-    #[error("failed to write QEMU seed media {path}: {source}")]
+    #[error("failed to write cloud-init seed media {path}: {source}")]
     Write {
         path: PathBuf,
         #[source]
@@ -37,7 +37,13 @@ struct Layout {
     data_start_sector: usize,
 }
 
-pub(super) fn write(path: &Path, meta_data: &str, user_data: &str) -> Result<(), Error> {
+/// Writes a FAT `CIDATA` cloud-init seed image.
+///
+/// # Errors
+///
+/// Returns an error if the seed contents are too large or the image cannot be
+/// written to disk.
+pub fn write(path: &Path, meta_data: &str, user_data: &str) -> Result<(), Error> {
     let files = [
         SeedFile {
             long_name: "meta-data",
@@ -272,8 +278,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::qemu::seed_media;
-    use crate::qemu::seed_media::BYTES_PER_SECTOR;
+    use crate::backend::seed_media;
+    use crate::backend::seed_media::BYTES_PER_SECTOR;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 

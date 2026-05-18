@@ -12,12 +12,13 @@ use agentdp_protocol::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::backend::ssh;
 use crate::instance::state::{GuestAccessState, InstanceFiles, InstanceState, InstanceStatus, NetworkState};
 use crate::progress::Progress;
 use crate::runtime;
 
 use super::provisioning::{self, PreparedProvisioning};
-use super::{command, disk, image, ssh, system};
+use super::{command, disk, image, system};
 
 const CLOUD_INIT_WAIT_TIMEOUT: Duration = Duration::from_mins(45);
 const CLOUD_INIT_POLL_DELAY: Duration = Duration::from_secs(5);

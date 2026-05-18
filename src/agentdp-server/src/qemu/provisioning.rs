@@ -10,7 +10,9 @@ use agentdp_protocol::{
 };
 use thiserror::Error;
 
-use super::{host_seed, image, seed, ssh};
+use crate::backend::{host_seed, seed, ssh};
+
+use super::image;
 
 #[derive(Debug, Error)]
 pub(super) enum Error {
@@ -72,7 +74,7 @@ pub(super) fn prepare_manifest_with_keygen(
         },
     )?;
     let qemu_image = image::resolve_image(provisioning_plan.image);
-    let image_cache = image::plan_cache(paths, qemu_image.clone());
+    let image_cache = image::plan_cache(paths, qemu_image);
     let seed = seed::write_seed_artifacts(&work_dir, &provisioning_plan)?;
 
     Ok(PreparedProvisioning {

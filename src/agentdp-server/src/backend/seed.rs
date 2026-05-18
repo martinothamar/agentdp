@@ -8,20 +8,20 @@ use thiserror::Error;
 use super::seed_media;
 
 #[derive(Debug, Error)]
-pub(super) enum Error {
-    #[error("failed to create QEMU seed directory {path}: {source}")]
+pub enum Error {
+    #[error("failed to create cloud-init seed directory {path}: {source}")]
     CreateDirectory {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to write QEMU seed file {path}: {source}")]
+    #[error("failed to write cloud-init seed file {path}: {source}")]
     WriteFile {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to make QEMU bootstrap script executable {path}: {source}")]
+    #[error("failed to make cloud-init bootstrap script executable {path}: {source}")]
     SetExecutable {
         path: PathBuf,
         #[source]
@@ -32,22 +32,22 @@ pub(super) enum Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SeedArtifacts {
-    pub(super) work_dir: PathBuf,
-    pub(super) seed_dir: PathBuf,
-    pub(super) scripts_dir: PathBuf,
-    pub(super) meta_data: PathBuf,
-    pub(super) user_data: PathBuf,
-    pub(super) bootstrap_script: PathBuf,
-    pub(super) seed_media: PathBuf,
+pub struct SeedArtifacts {
+    pub work_dir: PathBuf,
+    pub seed_dir: PathBuf,
+    pub scripts_dir: PathBuf,
+    pub meta_data: PathBuf,
+    pub user_data: PathBuf,
+    pub bootstrap_script: PathBuf,
+    pub seed_media: PathBuf,
 }
 
-/// Writes QEMU seed artifacts derived from the shared provisioning plan.
+/// Writes cloud-init `NoCloud` seed artifacts derived from the shared provisioning plan.
 ///
 /// # Errors
 ///
 /// Returns an error if directories or files cannot be created.
-pub(super) fn write_seed_artifacts(work_dir: &Path, plan: &ProvisioningPlan) -> Result<SeedArtifacts, Error> {
+pub fn write_seed_artifacts(work_dir: &Path, plan: &ProvisioningPlan) -> Result<SeedArtifacts, Error> {
     let seed_dir = work_dir.join("seed");
     let scripts_dir = work_dir.join("scripts");
     create_directory(&seed_dir)?;

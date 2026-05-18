@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use agentdp_core::Context;
 
+pub mod backend;
 mod instance;
 mod progress;
 mod qemu;

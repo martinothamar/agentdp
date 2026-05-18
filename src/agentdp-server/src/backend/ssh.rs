@@ -8,20 +8,20 @@ use thiserror::Error;
 
 use crate::instance::state::{InstanceState, PortProtocolState};
 
-pub(super) type CommandOutput = platform_ssh::CommandOutput;
+pub type CommandOutput = platform_ssh::CommandOutput;
 
 const AGENT_ENV_COMMAND: &str = "/usr/local/bin/agentdp-agent-env";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct GuestAccess {
-    pub(super) user: String,
-    pub(super) private_key: PathBuf,
-    pub(super) public_key: PathBuf,
-    pub(super) public_key_contents: String,
+pub struct GuestAccess {
+    pub user: String,
+    pub private_key: PathBuf,
+    pub public_key: PathBuf,
+    pub public_key_contents: String,
 }
 
 #[derive(Debug, Error)]
-pub(super) enum Error {
+pub enum Error {
     #[error("{0}")]
     Tool(#[from] platform_ssh::Error),
     #[error("instance runtime has no guest SSH access metadata")]
@@ -34,7 +34,7 @@ pub(super) enum Error {
 
 impl Error {
     #[must_use]
-    pub(super) const fn is_retryable(&self) -> bool {
+    pub const fn is_retryable(&self) -> bool {
         match self {
             Self::Tool(error) => error.is_retryable(),
             Self::MissingAccess | Self::MissingSshPort | Self::MissingPrivateKey(_) => false,
@@ -42,7 +42,12 @@ impl Error {
     }
 }
 
-pub(super) fn generate_guest_access(
+/// Generates SSH key material used by the host to access the guest.
+///
+/// # Errors
+///
+/// Returns an error if `ssh-keygen` cannot create the key pair.
+pub fn generate_guest_access(
     context: &Context,
     work_dir: &Path,
     ssh_keygen: &platform_ssh::SshKeygen,
@@ -57,7 +62,12 @@ pub(super) fn generate_guest_access(
     })
 }
 
-pub(super) fn interactive_shell_command(state: &InstanceState) -> Result<HostCommandResult, Error> {
+/// Builds the host command used to open an interactive guest shell.
+///
+/// # Errors
+///
+/// Returns an error if guest SSH metadata is missing or invalid.
+pub fn interactive_shell_command(state: &InstanceState) -> Result<HostCommandResult, Error> {
     let connection = connection_info(state)?;
     Ok(HostCommandResult {
         program: platform_ssh::SSH_BINARY.to_owned(),
@@ -68,7 +78,12 @@ pub(super) fn interactive_shell_command(state: &InstanceState) -> Result<HostCom
     })
 }
 
-pub(super) fn run_command_with_timeout(
+/// Runs a root command in the guest over SSH.
+///
+/// # Errors
+///
+/// Returns an error if guest SSH metadata is missing or the SSH command fails.
+pub fn run_command_with_timeout(
     context: &Context,
     state: &InstanceState,
     command: &str,
@@ -77,7 +92,12 @@ pub(super) fn run_command_with_timeout(
     run(context, state, command, timeout, platform_ssh::CommandPrivilege::Root)
 }
 
-pub(super) fn run_user_command_with_timeout(
+/// Runs a user command in the guest over SSH after loading agent environment.
+///
+/// # Errors
+///
+/// Returns an error if guest SSH metadata is missing or the SSH command fails.
+pub fn run_user_command_with_timeout(
     context: &Context,
     state: &InstanceState,
     args: &[String],
@@ -144,12 +164,12 @@ fn connection_info(state: &InstanceState) -> Result<platform_ssh::ConnectionInfo
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::connection_info;
     use crate::instance::state::{
         GuestAccessState, InstanceState, InstanceStatus, ManifestState, NetworkModeState, NetworkState,
         PortMappingState, PortProtocolState,
     };
     use crate::qemu::runtime::{ImageState, State as QemuState};
-    use crate::qemu::ssh::connection_info;
     use crate::runtime::BackendState;
 
     #[test]

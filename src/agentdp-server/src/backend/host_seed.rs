@@ -12,7 +12,7 @@ const CUSTOM_BOOTSTRAP_PATH: &str = "/run/agentdp/bootstrap.sh";
 const CUSTOM_ENV_PATH: &str = "/run/agentdp/.env";
 
 #[derive(Debug, Error)]
-pub(super) enum Error {
+pub enum Error {
     #[error("manifest path has no parent directory: {0}")]
     MissingManifestParent(PathBuf),
     #[error("failed to read seed directory {path}: {source}")]
@@ -37,11 +37,13 @@ pub(super) enum Error {
     HostHome,
 }
 
-pub(super) fn collect(
-    context: &Context,
-    manifest_path: &Path,
-    manifest: &AgentManifest,
-) -> Result<Vec<SeedFile>, Error> {
+/// Collects host-side seed files referenced by a manifest.
+///
+/// # Errors
+///
+/// Returns an error if the manifest path cannot be resolved, seed files cannot be
+/// read, or host credential paths cannot be determined.
+pub fn collect(context: &Context, manifest_path: &Path, manifest: &AgentManifest) -> Result<Vec<SeedFile>, Error> {
     let manifest_dir = manifest_path
         .parent()
         .ok_or_else(|| Error::MissingManifestParent(manifest_path.to_path_buf()))?;
