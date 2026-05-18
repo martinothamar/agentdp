@@ -500,7 +500,7 @@ fn validate_relative_path(field: &str, value: &str, errors: &mut Vec<String>) {
     validate_non_empty(field, value, errors);
 
     let path = Path::new(value);
-    if path.is_absolute() {
+    if path.is_absolute() || value.starts_with('/') || value.starts_with('\\') {
         errors.push(format!("{field} must be relative"));
         return;
     }

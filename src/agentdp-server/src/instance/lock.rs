@@ -163,7 +163,7 @@ mod tests {
         let temp = TestTempDir::create("instance-stale-lock");
         let instance = temp.path.join("instances/altinn-studio/pr-0");
         fs::create_dir_all(instance.parent().unwrap()).unwrap();
-        fs::write(instance.parent().unwrap().join("pr-0.lock"), "pid=4294967295\n").unwrap();
+        fs::write(instance.parent().unwrap().join("pr-0.lock"), "pid=999999\n").unwrap();
 
         assert!(InstanceLock::acquire(&instance).is_ok());
     }

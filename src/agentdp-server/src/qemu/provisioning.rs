@@ -243,6 +243,13 @@ mod tests {
             path
         }
 
+        fn write_fake_tool(&self, name: &str, contents: &str) -> PathBuf {
+            let executable = executable_script_name(name);
+            let tool = self.write(&executable, contents);
+            agentdp_core::platform::set_executable(&tool).unwrap();
+            tool
+        }
+
         fn platform_paths(&self) -> PlatformPaths {
             PlatformPaths {
                 data: self.path.join("data"),
@@ -254,9 +261,7 @@ mod tests {
         }
 
         fn write_fake_ssh_keygen(&self) -> PathBuf {
-            let ssh_keygen = self.write("ssh-keygen", fake_ssh_keygen_script());
-            agentdp_core::platform::set_executable(&ssh_keygen).unwrap();
-            ssh_keygen
+            self.write_fake_tool("ssh-keygen", fake_ssh_keygen_script())
         }
     }
 
@@ -273,6 +278,16 @@ mod tests {
 
     #[cfg(windows)]
     const fn fake_ssh_keygen_script() -> &'static str {
-        "@echo off\r\n:loop\r\nif \"%1\"==\"\" exit /b 1\r\nif \"%1\"==\"-f\" (\r\n  shift\r\n  echo private key> %1\r\n  echo ssh-ed25519 AAAATEST agentdp> %1.pub\r\n  exit /b 0\r\n)\r\nshift\r\ngoto loop\r\n"
+        "@echo off\r\necho private key> \"%~8\"\r\necho ssh-ed25519 AAAATEST agentdp> \"%~8.pub\"\r\nexit /b 0\r\n"
+    }
+
+    #[cfg(windows)]
+    fn executable_script_name(name: &str) -> String {
+        format!("{name}.cmd")
+    }
+
+    #[cfg(unix)]
+    fn executable_script_name(name: &str) -> String {
+        name.to_owned()
     }
 }

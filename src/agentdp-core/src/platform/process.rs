@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -57,7 +58,18 @@ pub enum ProcessStatusError {
 /// # Errors
 ///
 /// Returns an error when detached spawning is unsupported or the detacher fails.
+#[cfg(target_os = "linux")]
 pub fn spawn_detached(program: &Path, args: &[OsString]) -> Result<(), DetachedSpawnError> {
+    spawn_detached_impl(program, args)
+}
+
+/// Spawns a process detached from the current CLI process.
+///
+/// # Errors
+///
+/// Returns an error because detached spawning is unsupported on this host.
+#[cfg(not(target_os = "linux"))]
+pub const fn spawn_detached(program: &Path, args: &[OsString]) -> Result<(), DetachedSpawnError> {
     spawn_detached_impl(program, args)
 }
 
@@ -118,7 +130,7 @@ fn spawn_detached_impl(program: &Path, args: &[OsString]) -> Result<(), Detached
 }
 
 #[cfg(not(target_os = "linux"))]
-fn spawn_detached_impl(_program: &Path, _args: &[OsString]) -> Result<(), DetachedSpawnError> {
+const fn spawn_detached_impl(_program: &Path, _args: &[OsString]) -> Result<(), DetachedSpawnError> {
     Err(DetachedSpawnError::Unsupported)
 }
 

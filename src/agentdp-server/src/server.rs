@@ -554,7 +554,7 @@ mod tests {
         let temp = TestTempDir::create("server-lock-stale");
         let socket = temp.path.join("agentdp-server.sock");
         let lock = server_lock_path(&socket);
-        fs::write(&lock, "pid=4294967295\n").unwrap();
+        fs::write(&lock, "pid=999999\n").unwrap();
 
         let guard = acquire_server_lock(&socket).unwrap();
 

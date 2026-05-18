@@ -48,12 +48,8 @@ pub fn local_socket_status(path: &Path) -> SocketStatus {
 /// # Errors
 ///
 /// Returns an error when permissions cannot be read or updated.
-pub fn set_executable(path: &Path) -> std::io::Result<()> {
-    set_executable_impl(path)
-}
-
 #[cfg(unix)]
-fn set_executable_impl(path: &Path) -> std::io::Result<()> {
+pub fn set_executable(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = fs::metadata(path)?.permissions();
@@ -61,7 +57,13 @@ fn set_executable_impl(path: &Path) -> std::io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
+/// Applies executable permissions where the host platform requires them.
+///
+/// # Errors
+///
+/// This platform does not require executable permission changes, so this
+/// function always succeeds.
 #[cfg(not(unix))]
-fn set_executable_impl(_path: &Path) -> std::io::Result<()> {
+pub const fn set_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

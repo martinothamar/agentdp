@@ -101,6 +101,7 @@ pub fn refresh_if_running(
 ) -> Result<Refresh, Error> {
     let ping = match ping(paths) {
         Ok(ping) => ping,
+        Err(Error::Socket(LocalSocketError::Unsupported)) => return Ok(Refresh::NotRunning),
         Err(error) if should_start_after_ping_error(&error) => return Ok(Refresh::NotRunning),
         Err(error) => return Err(error),
     };

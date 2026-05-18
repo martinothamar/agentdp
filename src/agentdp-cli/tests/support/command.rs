@@ -132,15 +132,11 @@ impl TestContext {
     }
 
     pub fn write_fake_ssh_keygen(&self) -> PathBuf {
-        let path = self.write("ssh-keygen", fake_ssh_keygen_script());
-        agentdp_core::platform::set_executable(&path).expect("make fake ssh-keygen executable");
-        path
+        self.write_fake_tool("ssh-keygen", fake_ssh_keygen_script())
     }
 
     pub fn write_fake_ssh(&self) -> PathBuf {
-        let path = self.write("ssh", fake_ssh_script());
-        agentdp_core::platform::set_executable(&path).expect("make fake ssh executable");
-        path
+        self.write_fake_tool("ssh", fake_ssh_script())
     }
 
     fn add_temp_home_env(&self, command: &mut ProcessCommand, runtime: &Path) {
@@ -154,6 +150,13 @@ impl TestContext {
             .env("XDG_RUNTIME_DIR", runtime)
             .env("LOCALAPPDATA", self.temp.path().join("local_app_data"))
             .env("APPDATA", self.temp.path().join("app_data"));
+    }
+
+    fn write_fake_tool(&self, name: &str, contents: &str) -> PathBuf {
+        let executable = executable_script_name(name);
+        let path = self.write(Path::new(&executable), contents);
+        agentdp_core::platform::set_executable(&path).expect("make fake tool executable");
+        path
     }
 
     fn snapshot_with_replacements(&self, output: &Output, replacements: &[(&Path, &str)]) -> CommandSnapshot {
@@ -170,7 +173,8 @@ impl TestContext {
             text = replace_path(&text, path, replacement);
         }
         let text = replace_path(&text, self.temp.path(), "$TMP");
-        replace_path(&text, &self.repo_root, "$REPO")
+        let text = replace_path(&text, &self.repo_root, "$REPO");
+        normalize_snapshot_paths(&normalize_help_binary_names(&text))
     }
 }
 
@@ -186,12 +190,22 @@ const fn fake_ssh_script() -> &'static str {
 
 #[cfg(windows)]
 const fn fake_ssh_keygen_script() -> &'static str {
-    "@echo off\r\n:loop\r\nif \"%1\"==\"\" exit /b 1\r\nif \"%1\"==\"-f\" (\r\n  shift\r\n  echo private key> %1\r\n  echo ssh-ed25519 AAAATEST agentdp> %1.pub\r\n  exit /b 0\r\n)\r\nshift\r\ngoto loop\r\n"
+    "@echo off\r\necho private key> \"%~8\"\r\necho ssh-ed25519 AAAATEST agentdp> \"%~8.pub\"\r\nexit /b 0\r\n"
 }
 
 #[cfg(windows)]
 const fn fake_ssh_script() -> &'static str {
     "@echo off\r\necho hello from guest\r\n"
+}
+
+#[cfg(windows)]
+fn executable_script_name(name: &str) -> String {
+    format!("{name}.cmd")
+}
+
+#[cfg(unix)]
+fn executable_script_name(name: &str) -> String {
+    name.to_owned()
 }
 
 fn agentctl_command() -> ProcessCommand {
@@ -209,5 +223,51 @@ fn repo_root() -> PathBuf {
 fn replace_path(text: &str, path: &Path, replacement: &str) -> String {
     let path = path.display().to_string();
     let normalized = path.replace('\\', "/");
-    text.replace(&path, replacement).replace(&normalized, replacement)
+    let extended = format!(r"\\?\{path}");
+    let extended_normalized = format!("//?/{normalized}");
+    text.replace(&extended, replacement)
+        .replace(&extended_normalized, replacement)
+        .replace(&path, replacement)
+        .replace(&normalized, replacement)
+}
+
+fn normalize_help_binary_names(text: &str) -> String {
+    text.replace("Usage: agentctl.exe", "Usage: agentctl")
+}
+
+fn normalize_snapshot_paths(text: &str) -> String {
+    let text = text
+        .replace('\\', "/")
+        .replace("$TMP/local_app_data/agentdp/bin", "$TMP/home/.local/bin")
+        .replace("$REPO/target/debug/agentctl.exe", "$REPO/target/debug/agentctl")
+        .replace(
+            "$REPO/target/debug/agentdp-server.exe",
+            "$REPO/target/debug/agentdp-server",
+        )
+        .replace("$TMP/home/.local/bin/agentctl.exe", "$TMP/home/.local/bin/agentctl")
+        .replace(
+            "$TMP/home/.local/bin/agentdp-server.exe",
+            "$TMP/home/.local/bin/agentdp-server",
+        );
+    collapse_repo_temp_paths(&text)
+}
+
+fn collapse_repo_temp_paths(text: &str) -> String {
+    const PREFIX: &str = "$REPO/src/agentdp-cli/tests/.tmp/";
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(index) = remaining.find(PREFIX) {
+        output.push_str(&remaining[..index]);
+        let after_prefix = &remaining[index + PREFIX.len()..];
+        output.push_str("$TMP");
+        if let Some(end) = after_prefix.find(['/', ';', ' ', '\n', '\r']) {
+            remaining = &after_prefix[end..];
+        } else {
+            remaining = "";
+        }
+    }
+
+    output.push_str(remaining);
+    output
 }

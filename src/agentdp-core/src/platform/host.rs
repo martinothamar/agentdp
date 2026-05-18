@@ -33,12 +33,26 @@ pub enum KvmStatus {
 }
 
 #[must_use]
+#[cfg(target_os = "linux")]
 pub fn host_target() -> HostTarget {
     host_target_impl()
 }
 
 #[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn host_target() -> HostTarget {
+    host_target_impl()
+}
+
+#[must_use]
+#[cfg(target_os = "linux")]
 pub fn kvm_status() -> KvmStatus {
+    kvm_status_impl()
+}
+
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn kvm_status() -> KvmStatus {
     kvm_status_impl()
 }
 
@@ -56,7 +70,7 @@ fn host_target_impl() -> HostTarget {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn host_target_impl() -> HostTarget {
+const fn host_target_impl() -> HostTarget {
     HostTarget::Unsupported(env::consts::OS)
 }
 
@@ -77,7 +91,7 @@ fn kvm_status_impl() -> KvmStatus {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn kvm_status_impl() -> KvmStatus {
+const fn kvm_status_impl() -> KvmStatus {
     KvmStatus::Unsupported(env::consts::OS)
 }
 

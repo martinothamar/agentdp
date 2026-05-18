@@ -141,6 +141,7 @@ fn user_bin_dir_impl() -> Result<PathBuf, Error> {
     Ok(home_dir()?.join(".local/bin"))
 }
 
+#[cfg(not(target_os = "windows"))]
 fn home_dir() -> Result<PathBuf, Error> {
     env::var_os("HOME")
         .filter(|value| !value.is_empty())

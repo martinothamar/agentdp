@@ -36,7 +36,10 @@ fn create_writes_seed_media_and_runtime_state() {
     assert_eq!(qemu.image.cache_key, "archlinux-x86_64-cloudimg.qcow2");
     assert_eq!(state.network.ports["ssh"].host, TEST_HOST_SSH_PORT);
     assert_eq!(state.network.ports["ssh"].guest, 22);
-    assert_eq!(fs::read_to_string(&qemu.disk).unwrap(), "fake qcow2\n");
+    assert_eq!(
+        fs::read_to_string(&qemu.disk).unwrap().replace("\r\n", "\n"),
+        "fake qcow2\n"
+    );
     assert_eq!(fs::metadata(&qemu.seed_media).unwrap().len(), 4 * 1024 * 1024);
     assert!(PathBuf::from(&qemu.seed_media).ends_with("generated/qemu/seed.img"));
     assert!(PathBuf::from(&qemu.monitor_socket).ends_with("runtime/instances/altinn-studio/pr-0/qemu/monitor.sock"));
@@ -429,6 +432,13 @@ impl TestTempDir {
         path
     }
 
+    fn write_fake_tool(&self, name: &str, contents: &str) -> PathBuf {
+        let executable = executable_script_name(name);
+        let tool = self.write(&executable, contents);
+        agentdp_core::platform::set_executable(&tool).unwrap();
+        tool
+    }
+
     fn write_cached_base_image(paths: &PlatformPaths) {
         let image = paths.cache.join("images/archlinux-x86_64-cloudimg.qcow2");
         fs::create_dir_all(image.parent().unwrap()).unwrap();
@@ -436,21 +446,15 @@ impl TestTempDir {
     }
 
     fn write_fake_qemu_img(&self) -> PathBuf {
-        let qemu_img = self.write("qemu-img", fake_qemu_img_script());
-        agentdp_core::platform::set_executable(&qemu_img).unwrap();
-        qemu_img
+        self.write_fake_tool("qemu-img", fake_qemu_img_script())
     }
 
     fn write_fake_qemu_system(&self) -> PathBuf {
-        let qemu_system = self.write("qemu-system-x86_64", fake_qemu_system_script());
-        agentdp_core::platform::set_executable(&qemu_system).unwrap();
-        qemu_system
+        self.write_fake_tool("qemu-system-x86_64", fake_qemu_system_script())
     }
 
     fn write_fake_ssh_keygen(&self) -> PathBuf {
-        let ssh_keygen = self.write("ssh-keygen", fake_ssh_keygen_script());
-        agentdp_core::platform::set_executable(&ssh_keygen).unwrap();
-        ssh_keygen
+        self.write_fake_tool("ssh-keygen", fake_ssh_keygen_script())
     }
 
     fn platform_paths(&self) -> PlatformPaths {
@@ -516,7 +520,7 @@ const fn fake_qemu_system_script() -> &'static str {
 
 #[cfg(windows)]
 const fn fake_qemu_system_script() -> &'static str {
-    "@echo off\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif \"%1\"==\"-pidfile\" (\r\n  shift\r\n  echo 4242> %1\r\n)\r\nshift\r\ngoto loop\r\n:done\r\n"
+    "@echo off\r\n:loop\r\nif \"%~1\"==\"\" exit /b 0\r\nif \"%~1\"==\"-pidfile\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\necho 4242> \"%~1\"\r\nexit /b 0\r\n"
 }
 
 #[cfg(unix)]
@@ -526,5 +530,15 @@ const fn fake_ssh_keygen_script() -> &'static str {
 
 #[cfg(windows)]
 const fn fake_ssh_keygen_script() -> &'static str {
-    "@echo off\r\n:loop\r\nif \"%1\"==\"\" exit /b 1\r\nif \"%1\"==\"-f\" (\r\n  shift\r\n  echo private key> %1\r\n  echo ssh-ed25519 AAAATEST agentdp> %1.pub\r\n  exit /b 0\r\n)\r\nshift\r\ngoto loop\r\n"
+    "@echo off\r\necho private key> \"%~8\"\r\necho ssh-ed25519 AAAATEST agentdp> \"%~8.pub\"\r\nexit /b 0\r\n"
+}
+
+#[cfg(windows)]
+fn executable_script_name(name: &str) -> String {
+    format!("{name}.cmd")
+}
+
+#[cfg(unix)]
+fn executable_script_name(name: &str) -> String {
+    name.to_owned()
 }

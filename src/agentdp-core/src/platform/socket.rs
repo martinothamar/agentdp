@@ -1,9 +1,11 @@
+#[cfg(unix)]
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
 use thiserror::Error;
 
+#[cfg(unix)]
 use super::{SocketStatus, local_socket_status};
 
 #[derive(Debug, Error)]
@@ -23,6 +25,7 @@ pub struct LocalSocket {
 }
 
 impl LocalSocket {
+    #[cfg(unix)]
     fn new(inner: impl ReadWrite + Send + 'static) -> Self {
         Self { inner: Box::new(inner) }
     }
@@ -49,6 +52,7 @@ pub struct LocalSocketListener {
 }
 
 impl LocalSocketListener {
+    #[cfg(unix)]
     fn new(inner: impl Listener + Send + 'static) -> Self {
         Self { inner: Box::new(inner) }
     }
@@ -83,7 +87,18 @@ trait Listener {
 /// # Errors
 ///
 /// Returns an error when local sockets are unsupported or the connection fails.
+#[cfg(unix)]
 pub fn connect_local_socket(path: &Path) -> Result<LocalSocket, LocalSocketError> {
+    connect_local_socket_impl(path)
+}
+
+/// Connects to a local user socket.
+///
+/// # Errors
+///
+/// Returns an error because local sockets are unsupported on this host.
+#[cfg(not(unix))]
+pub const fn connect_local_socket(path: &Path) -> Result<LocalSocket, LocalSocketError> {
     connect_local_socket_impl(path)
 }
 
@@ -92,7 +107,18 @@ pub fn connect_local_socket(path: &Path) -> Result<LocalSocket, LocalSocketError
 /// # Errors
 ///
 /// Returns an error when local sockets are unsupported or binding fails.
+#[cfg(unix)]
 pub fn bind_local_socket(path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
+    bind_local_socket_impl(path)
+}
+
+/// Binds a local user socket.
+///
+/// # Errors
+///
+/// Returns an error because local sockets are unsupported on this host.
+#[cfg(not(unix))]
+pub const fn bind_local_socket(path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
     bind_local_socket_impl(path)
 }
 
@@ -102,7 +128,7 @@ fn connect_local_socket_impl(path: &Path) -> Result<LocalSocket, LocalSocketErro
 }
 
 #[cfg(not(unix))]
-fn connect_local_socket_impl(_path: &Path) -> Result<LocalSocket, LocalSocketError> {
+const fn connect_local_socket_impl(_path: &Path) -> Result<LocalSocket, LocalSocketError> {
     Err(LocalSocketError::Unsupported)
 }
 
@@ -127,7 +153,7 @@ fn bind_local_socket_impl(path: &Path) -> Result<LocalSocketListener, LocalSocke
 }
 
 #[cfg(not(unix))]
-fn bind_local_socket_impl(_path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
+const fn bind_local_socket_impl(_path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
     Err(LocalSocketError::Unsupported)
 }
 
