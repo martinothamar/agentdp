@@ -10,7 +10,7 @@ user:
 resources:
   cpus: 4
   memory: 16G
-  storage: 80G
+  storage: 40G
 
 network:
   mode: user
