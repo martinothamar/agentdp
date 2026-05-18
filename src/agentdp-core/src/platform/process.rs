@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::path::Path;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -68,7 +68,17 @@ pub fn spawn_detached(program: &Path, args: &[OsString]) -> Result<(), DetachedS
 /// # Errors
 ///
 /// Returns an error because detached spawning is unsupported on this host.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn spawn_detached(program: &Path, args: &[OsString]) -> Result<(), DetachedSpawnError> {
+    spawn_detached_impl(program, args)
+}
+
+/// Spawns a process detached from the current CLI process.
+///
+/// # Errors
+///
+/// Returns an error because detached spawning is unsupported on this host.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub const fn spawn_detached(program: &Path, args: &[OsString]) -> Result<(), DetachedSpawnError> {
     spawn_detached_impl(program, args)
 }
@@ -129,7 +139,24 @@ fn spawn_detached_impl(program: &Path, args: &[OsString]) -> Result<(), Detached
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn spawn_detached_impl(program: &Path, args: &[OsString]) -> Result<(), DetachedSpawnError> {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 const fn spawn_detached_impl(_program: &Path, _args: &[OsString]) -> Result<(), DetachedSpawnError> {
     Err(DetachedSpawnError::Unsupported)
 }

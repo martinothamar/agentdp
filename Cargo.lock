@@ -20,6 +20,7 @@ name = "agentdp-core"
 version = "0.1.0"
 dependencies = [
  "agentdp-test-support",
+ "agentdp-windows-uds",
  "base64",
  "serde",
  "serde_yaml",
@@ -52,6 +53,13 @@ dependencies = [
 [[package]]
 name = "agentdp-test-support"
 version = "0.1.0"
+
+[[package]]
+name = "agentdp-windows-uds"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
+]
 
 [[package]]
 name = "anstream"

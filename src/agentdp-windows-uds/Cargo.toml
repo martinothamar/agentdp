@@ -1,0 +1,9 @@
+[package]
+name = "agentdp-windows-uds"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }

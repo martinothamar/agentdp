@@ -37,7 +37,15 @@ pub fn local_socket_status(path: &Path) -> SocketStatus {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        match agentdp_windows_uds::UnixStream::connect(path) {
+            Ok(_) => SocketStatus::Connected,
+            Err(error) => SocketStatus::Unavailable(error.to_string()),
+        }
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         SocketStatus::Unsupported
     }

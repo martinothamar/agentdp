@@ -11,6 +11,9 @@ serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+agentdp-windows-uds = { path = "../agentdp-windows-uds" }
+
 [dev-dependencies]
 agentdp-test-support.workspace = true
 

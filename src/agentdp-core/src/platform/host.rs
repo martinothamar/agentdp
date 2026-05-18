@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum HostTarget {
     Linux,
     Wsl2,
+    Windows,
     Unsupported(&'static str),
 }
 
@@ -14,6 +15,7 @@ impl HostTarget {
         match self {
             Self::Linux => "Linux",
             Self::Wsl2 => "WSL2",
+            Self::Windows => "windows",
             Self::Unsupported(name) => name,
         }
     }
@@ -39,9 +41,15 @@ pub fn host_target() -> HostTarget {
 }
 
 #[must_use]
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 pub const fn host_target() -> HostTarget {
     host_target_impl()
+}
+
+#[must_use]
+#[cfg(target_os = "windows")]
+pub const fn host_target() -> HostTarget {
+    HostTarget::Windows
 }
 
 #[must_use]
@@ -69,7 +77,7 @@ fn host_target_impl() -> HostTarget {
     if is_wsl2() { HostTarget::Wsl2 } else { HostTarget::Linux }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 const fn host_target_impl() -> HostTarget {
     HostTarget::Unsupported(env::consts::OS)
 }

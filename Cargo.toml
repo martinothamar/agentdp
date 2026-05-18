@@ -5,6 +5,7 @@ members = [
     "src/agentdp-cli",
     "src/agentdp-server",
     "src/agentdp-test-support",
+    "src/agentdp-windows-uds",
 ]
 exclude = ["fuzz"]
 resolver = "3"
@@ -41,3 +42,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["raw_value"] }
 serde_yaml = "0.9.34"
 thiserror = "2.0.17"
+windows-sys = "0.61.2"

@@ -1,11 +1,11 @@
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
 use thiserror::Error;
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 use super::{SocketStatus, local_socket_status};
 
 #[derive(Debug, Error)]
@@ -25,7 +25,7 @@ pub struct LocalSocket {
 }
 
 impl LocalSocket {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     fn new(inner: impl ReadWrite + Send + 'static) -> Self {
         Self { inner: Box::new(inner) }
     }
@@ -52,7 +52,7 @@ pub struct LocalSocketListener {
 }
 
 impl LocalSocketListener {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     fn new(inner: impl Listener + Send + 'static) -> Self {
         Self { inner: Box::new(inner) }
     }
@@ -87,7 +87,7 @@ trait Listener {
 /// # Errors
 ///
 /// Returns an error when local sockets are unsupported or the connection fails.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub fn connect_local_socket(path: &Path) -> Result<LocalSocket, LocalSocketError> {
     connect_local_socket_impl(path)
 }
@@ -97,7 +97,7 @@ pub fn connect_local_socket(path: &Path) -> Result<LocalSocket, LocalSocketError
 /// # Errors
 ///
 /// Returns an error because local sockets are unsupported on this host.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 pub const fn connect_local_socket(path: &Path) -> Result<LocalSocket, LocalSocketError> {
     connect_local_socket_impl(path)
 }
@@ -107,7 +107,7 @@ pub const fn connect_local_socket(path: &Path) -> Result<LocalSocket, LocalSocke
 /// # Errors
 ///
 /// Returns an error when local sockets are unsupported or binding fails.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub fn bind_local_socket(path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
     bind_local_socket_impl(path)
 }
@@ -117,7 +117,7 @@ pub fn bind_local_socket(path: &Path) -> Result<LocalSocketListener, LocalSocket
 /// # Errors
 ///
 /// Returns an error because local sockets are unsupported on this host.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 pub const fn bind_local_socket(path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
     bind_local_socket_impl(path)
 }
@@ -127,12 +127,17 @@ fn connect_local_socket_impl(path: &Path) -> Result<LocalSocket, LocalSocketErro
     Ok(LocalSocket::new(std::os::unix::net::UnixStream::connect(path)?))
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn connect_local_socket_impl(path: &Path) -> Result<LocalSocket, LocalSocketError> {
+    Ok(LocalSocket::new(agentdp_windows_uds::UnixStream::connect(path)?))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 const fn connect_local_socket_impl(_path: &Path) -> Result<LocalSocket, LocalSocketError> {
     Err(LocalSocketError::Unsupported)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 fn bind_local_socket_impl(path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -148,11 +153,14 @@ fn bind_local_socket_impl(path: &Path) -> Result<LocalSocketListener, LocalSocke
     }
 
     Ok(LocalSocketListener::new(UnixListener {
+        #[cfg(unix)]
         inner: std::os::unix::net::UnixListener::bind(path)?,
+        #[cfg(target_os = "windows")]
+        inner: agentdp_windows_uds::UnixListener::bind(path)?,
     }))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 const fn bind_local_socket_impl(_path: &Path) -> Result<LocalSocketListener, LocalSocketError> {
     Err(LocalSocketError::Unsupported)
 }
@@ -162,11 +170,23 @@ struct UnixListener {
     inner: std::os::unix::net::UnixListener,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "windows")]
+struct UnixListener {
+    inner: agentdp_windows_uds::UnixListener,
+}
+
+#[cfg(any(unix, target_os = "windows"))]
 impl Listener for UnixListener {
     fn accept(&self) -> std::io::Result<LocalSocket> {
-        let (stream, _address) = self.inner.accept()?;
-        Ok(LocalSocket::new(stream))
+        #[cfg(unix)]
+        {
+            let (stream, _address) = self.inner.accept()?;
+            Ok(LocalSocket::new(stream))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Ok(LocalSocket::new(self.inner.accept()?))
+        }
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
