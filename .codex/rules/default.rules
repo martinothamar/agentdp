@@ -6,6 +6,13 @@ prefix_rule(
 )
 
 prefix_rule(
+    pattern = ["just", ["default", "fmt", "lint", "build", "test", "deps", "install"]],
+    decision = "allow",
+    justification = "Allow routine repo formatting, linting, building, testing, dependency review, and user-local install targets.",
+    match = ["just fmt", "just lint", "just build", "just test", "just deps", "just install"],
+)
+
+prefix_rule(
     pattern = ["cargo", "fmt"],
     decision = "allow",
     justification = "Allow Rust formatting checks and formatting for this workspace.",
