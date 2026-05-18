@@ -1,0 +1,16 @@
+status: 0
+--- stdout
+started altinn-studio/pr-0
+pid: 4242
+state: $TMP/data/agentdp/instances/altinn-studio/pr-0/runtime.json
+monitor: $TMP/runtime/agentdp/instances/altinn-studio/pr-0/qemu/monitor.sock
+serial: $TMP/data/agentdp/instances/altinn-studio/pr-0/logs/serial.log
+ready: true
+code-server: http://127.0.0.1:24090
+--- stderr
+info: starting pr-0 from $TMP/agent.yaml
+info: waiting for VM boot, cloud-init, and manifest healthchecks
+info: qemu started pid 4242
+info: waiting for cloud-init
+info: cloud-init status: done
+info: cloud-init completed

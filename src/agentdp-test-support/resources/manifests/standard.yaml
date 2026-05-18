@@ -1,0 +1,49 @@
+version: 1
+name: altinn-studio
+image:
+  os: archlinux
+user:
+  name: agent
+resources:
+  cpus: 4
+  memory: 16G
+  storage: 80G
+network:
+  mode: user
+  ports:
+    code-server:
+      guest: 4090
+      protocol: tcp
+    ssh:
+      guest: 22
+      protocol: tcp
+bootstrap:
+  packages:
+    - git
+  repos:
+    - url: https://github.com/martinothamar-agent/altinn-studio.git
+      path: altinn-studio
+  shell:
+    - npm install -g playwright
+  healthchecks:
+    - name: code-server
+      tcp: 127.0.0.1:4090
+      timeout: 60s
+plugins:
+  docker:
+    compose: true
+    buildx: true
+    healthcheck: true
+  mise:
+    packages:
+      - node@lts
+  codex:
+    yolo: true
+    auth: mediated
+  github:
+    auth: mediated
+    setup_git: true
+  vscode:
+    settings: data/home/.local/share/code-server/User/settings.json
+    extensions:
+      - redhat.vscode-yaml

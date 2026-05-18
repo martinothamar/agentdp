@@ -1,0 +1,5 @@
+status: 1
+--- stdout
+
+--- stderr
+agentdp-server returned error instance_rm_failed: instance altinn-studio/pr-0 is running; run `agentctl down pr-0` before removing it

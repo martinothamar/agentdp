@@ -1,0 +1,11 @@
+[package]
+name = "agentdp-test-support"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

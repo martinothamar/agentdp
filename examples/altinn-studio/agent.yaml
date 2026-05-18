@@ -1,0 +1,94 @@
+version: 1
+name: altinn-studio
+
+image:
+  os: archlinux
+
+user:
+  name: agent
+
+resources:
+  cpus: 4
+  memory: 16G
+  storage: 80G
+
+network:
+  mode: user
+  allow: all
+  ports:
+    code-server:
+      guest: 4090
+      protocol: tcp
+    ssh:
+      guest: 22
+      protocol: tcp
+
+bootstrap:
+  packages:
+    - base-devel
+    - shellcheck
+    - unzip
+    - unrar
+    - vim
+    - fd
+    - which
+    - make
+    - htop
+    - btop
+    - dive
+    - just
+    - hyperfine
+    - step-cli
+    - git
+    - openssh
+    - curl
+    - wget
+    - jq
+    - yq
+    - kubectl
+    - kubectx
+    - helm
+    - fluxcd
+    - k9s
+    - ripgrep
+    - tmux
+    - chromium
+
+  repos:
+    - url: https://github.com/martinothamar-agent/altinn-studio.git
+    - url: https://github.com/martinothamar-agent/altinn-studio-docs.git
+    - url: https://github.com/martinothamar-agent/altinn-storage.git
+    - url: https://github.com/martinothamar-agent/app-lib-dotnet.git
+    - url: https://github.com/martinothamar-agent/app-frontend-react.git
+    - url: https://github.com/martinothamar-agent/app-localtest.git
+
+  healthchecks:
+    - name: code-server
+      tcp: 127.0.0.1:4090
+      timeout: 30m
+
+plugins:
+  docker:
+    compose: true
+    buildx: true
+    healthcheck: true
+  mise:
+    packages:
+      - node@lts
+      - python@latest
+      - go@latest
+      - dotnet@8
+      - dotnet@9
+      - dotnet@10
+  codex:
+    yolo: true
+    auth: copy-from-host
+  github:
+    auth: mediated
+    setup_git: false
+  vscode:
+    settings: data/home/.local/share/code-server/User/settings.json
+    extensions:
+      - EditorConfig.EditorConfig
+      - redhat.vscode-yaml
+      - ms-dotnettools.csdevkit

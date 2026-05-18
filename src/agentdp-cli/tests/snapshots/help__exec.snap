@@ -1,0 +1,15 @@
+status: 0
+--- stdout
+Usage: agentctl exec [OPTIONS] <INSTANCE> <COMMAND>...
+
+Arguments:
+  <INSTANCE>    
+  <COMMAND>...  
+
+Options:
+  -f, --file <PATH>         
+  -v, --verbose             
+      --timeout <DURATION>  [default: 300s]
+  -h, --help                Print help
+--- stderr
+

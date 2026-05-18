@@ -1,0 +1,30 @@
+version: 1
+name: altinn-studio
+image:
+  os: archlinux
+user:
+  name: agent
+resources:
+  cpus: 4
+  memory: 16G
+  storage: 80G
+network:
+  mode: user
+  ports:
+    code-server:
+      guest: 4090
+      protocol: tcp
+    ssh:
+      guest: 22
+      protocol: tcp
+bootstrap:
+  packages:
+    - git
+plugins:
+  codex:
+    yolo: true
+    auth: mediated
+  github:
+    auth: mediated
+    setup_git: true
+  vscode: {}

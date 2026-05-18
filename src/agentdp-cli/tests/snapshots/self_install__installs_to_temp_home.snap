@@ -1,0 +1,10 @@
+status: 0
+--- stdout
+installed agentctl
+source: $REPO/target/debug/agentctl
+destination: $TMP/home/.local/bin/agentctl
+installed agentdp-server
+source: $REPO/target/debug/agentdp-server
+destination: $TMP/home/.local/bin/agentdp-server
+--- stderr
+

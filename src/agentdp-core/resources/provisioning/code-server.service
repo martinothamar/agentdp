@@ -1,0 +1,15 @@
+[Unit]
+Description=agentdp code-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{user}}
+Group={{group}}
+WorkingDirectory={{code_dir}}
+ExecStart=/usr/local/bin/agentdp-agent-env /usr/local/bin/code-server --bind-addr 0.0.0.0:{{guest_port}} --auth none {{code_dir}}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

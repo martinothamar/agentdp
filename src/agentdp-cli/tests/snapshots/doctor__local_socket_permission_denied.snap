@@ -1,0 +1,5 @@
+--- stdout
+fail  agentdp-server           local socket error: Operation not permitted (os error 1)
+socket   $TMP/runtime/agentdp/agentdp-server.sock
+--- stderr
+

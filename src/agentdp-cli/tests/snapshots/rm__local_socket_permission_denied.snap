@@ -1,0 +1,5 @@
+status: 1
+--- stdout
+
+--- stderr
+local socket error: Operation not permitted (os error 1)

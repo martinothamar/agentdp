@@ -1,0 +1,7 @@
+status: 0
+--- stdout
+manifest ok: $TMP/valid.yaml
+name: altinn-studio
+image.os: Archlinux
+--- stderr
+

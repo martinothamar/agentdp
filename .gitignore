@@ -1,0 +1,15 @@
+.codex/*
+!.codex/
+!.codex/rules/
+!.codex/rules/default.rules
+/target
+/tmp
+.env
+.env.*
+**/.env
+**/.env.*
+src/agentdp-cli/tests/.tmp/
+mutants.ou*/
+/fuzz/artifacts
+/fuzz/corpus
+/fuzz/target

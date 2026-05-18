@@ -1,0 +1,9 @@
+status: 0
+--- stdout
+Usage: agentctl self install [OPTIONS]
+
+Options:
+  -v, --verbose  
+  -h, --help     Print help
+--- stderr
+

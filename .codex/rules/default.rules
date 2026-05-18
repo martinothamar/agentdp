@@ -1,0 +1,48 @@
+prefix_rule(
+    pattern = ["make", ["fmt", "lint", "build", "test", "deps", "install"]],
+    decision = "allow",
+    justification = "Allow routine repo formatting, linting, building, testing, dependency review, and user-local install targets.",
+    match = ["make fmt", "make lint", "make build", "make test", "make deps", "make install"],
+)
+
+prefix_rule(
+    pattern = ["cargo", "fmt"],
+    decision = "allow",
+    justification = "Allow Rust formatting checks and formatting for this workspace.",
+    match = ["cargo fmt", "cargo fmt --all", "cargo fmt --all --check"],
+)
+
+prefix_rule(
+    pattern = ["cargo", "clippy"],
+    decision = "allow",
+    justification = "Allow Rust linting for this workspace.",
+    match = ["cargo clippy", "cargo clippy --workspace --all-targets"],
+)
+
+prefix_rule(
+    pattern = ["cargo", "build"],
+    decision = "allow",
+    justification = "Allow Rust builds for this workspace.",
+    match = ["cargo build", "cargo build --workspace", "cargo build --release -p agentdp-cli"],
+)
+
+prefix_rule(
+    pattern = ["cargo", "nextest", "run"],
+    decision = "allow",
+    justification = "Allow Rust tests through cargo-nextest for this workspace.",
+    match = ["cargo nextest run", "cargo nextest run --workspace"],
+)
+
+prefix_rule(
+    pattern = ["cargo", "tree"],
+    decision = "allow",
+    justification = "Allow Rust dependency tree review for this workspace.",
+    match = ["cargo tree", "cargo tree --workspace"],
+)
+
+prefix_rule(
+    pattern = ["target/release/agentctl", "self", "install"],
+    decision = "allow",
+    justification = "Allow the release-built agentctl binary to install itself for the current user.",
+    match = ["target/release/agentctl self install"],
+)

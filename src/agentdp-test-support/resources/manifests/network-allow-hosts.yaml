@@ -1,0 +1,20 @@
+version: 1
+name: altinn-studio
+image:
+  os: archlinux
+user:
+  name: agent
+resources:
+  cpus: 1
+  memory: 1G
+  storage: 8G
+network:
+  mode: user
+  allow:
+    - github.com
+    - api.github.com
+  ports:
+    ssh:
+      guest: 22
+      protocol: tcp
+bootstrap: {}

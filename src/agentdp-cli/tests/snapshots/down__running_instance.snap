@@ -1,0 +1,8 @@
+status: 0
+--- stdout
+down altinn-studio/pr-0
+status: stopped
+process: terminated
+state: $TMP/data/agentdp/instances/altinn-studio/pr-0/runtime.json
+--- stderr
+

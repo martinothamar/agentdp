@@ -1,0 +1,6 @@
+status: 0
+--- stdout
+instances:
+  altinn-studio/pr-0: created pid:none readiness:unknown
+--- stderr
+

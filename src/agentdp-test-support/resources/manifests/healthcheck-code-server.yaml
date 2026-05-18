@@ -1,0 +1,21 @@
+version: 1
+name: altinn-studio
+image:
+  os: archlinux
+user:
+  name: agent
+resources:
+  cpus: 1
+  memory: 1G
+  storage: 8G
+network:
+  mode: user
+  ports:
+    code-server:
+      guest: 4090
+      protocol: tcp
+bootstrap:
+  healthchecks:
+    - name: code-server
+      tcp: 127.0.0.1:4090
+      timeout: 1s

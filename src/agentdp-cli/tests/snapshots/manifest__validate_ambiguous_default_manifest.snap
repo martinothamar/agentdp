@@ -1,0 +1,5 @@
+status: 1
+--- stdout
+
+--- stderr
+both agent.yaml and agent.yml exist in $TMP; pass -f to choose one

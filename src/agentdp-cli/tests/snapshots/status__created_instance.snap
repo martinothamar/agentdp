@@ -1,0 +1,17 @@
+status: 0
+--- stdout
+status altinn-studio/pr-0
+status: created
+state: $TMP/data/agentdp/instances/altinn-studio/pr-0/runtime.json
+process: not-recorded
+pid: none
+readiness: unknown
+disk: $TMP/data/agentdp/instances/altinn-studio/pr-0/disk.qcow2
+seed: $TMP/data/agentdp/instances/altinn-studio/pr-0/generated/qemu/seed.img
+monitor: $TMP/runtime/agentdp/instances/altinn-studio/pr-0/qemu/monitor.sock
+qmp: $TMP/runtime/agentdp/instances/altinn-studio/pr-0/qemu/qmp.sock
+ports:
+  code-server: tcp 24090->4090
+  ssh: tcp 2222->22
+--- stderr
+

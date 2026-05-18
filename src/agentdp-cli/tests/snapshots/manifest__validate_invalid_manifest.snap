@@ -1,0 +1,7 @@
+status: 1
+--- stdout
+
+--- stderr
+manifest $TMP/invalid.yaml is invalid:
+- bootstrap.repos[0].path must be relative
+

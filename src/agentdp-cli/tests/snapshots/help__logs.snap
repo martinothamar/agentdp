@@ -1,0 +1,16 @@
+status: 0
+--- stdout
+Usage: agentctl logs [OPTIONS] <INSTANCE>
+
+Arguments:
+  <INSTANCE>  
+
+Options:
+  -f, --file <PATH>    
+  -v, --verbose        
+      --serial         
+      --qemu           
+      --lines <LINES>  [default: 200]
+  -h, --help           Print help
+--- stderr
+

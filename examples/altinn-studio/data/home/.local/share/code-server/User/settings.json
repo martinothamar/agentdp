@@ -1,0 +1,17 @@
+{
+  "workbench.colorTheme": "Dark 2026",
+  "workbench.startupEditor": "none",
+  "extensions.ignoreRecommendations": true,
+  "editor.renderWhitespace": "all",
+  "editor.minimap.enabled": false,
+  "[csharp]": {
+    "editor.defaultFormatter": "csharpier.csharpier-vscode"
+  },
+  "[xml]": {
+    "editor.defaultFormatter": "csharpier.csharpier-vscode"
+  },
+  "dotnet.solution.autoOpen": "false",
+  "rust-analyzer.inlayHints.typeHints.enable": false,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.checkOnSave": true
+}

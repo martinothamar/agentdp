@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "src/agentdp-core",
+    "src/agentdp-protocol",
+    "src/agentdp-cli",
+    "src/agentdp-server",
+    "src/agentdp-test-support",
+]
+exclude = ["fuzz"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "UNLICENSED"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(fuzzing)'] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+unwrap_used = { level = "deny", priority = -1 }
+expect_used = { level = "deny", priority = -1 }
+panic = { level = "deny", priority = -1 }
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+
+[workspace.dependencies]
+agentdp-core = { path = "src/agentdp-core" }
+agentdp-protocol = { path = "src/agentdp-protocol" }
+agentdp-test-support = { path = "src/agentdp-test-support" }
+base64 = "0.22.1"
+clap = { version = "4.5.50", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["raw_value"] }
+serde_yaml = "0.9.34"
+thiserror = "2.0.17"

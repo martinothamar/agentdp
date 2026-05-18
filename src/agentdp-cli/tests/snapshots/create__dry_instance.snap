@@ -1,0 +1,10 @@
+status: 0
+--- stdout
+created altinn-studio/pr-0
+state: $TMP/data/agentdp/instances/altinn-studio/pr-0/runtime.json
+manifest: $TMP/data/agentdp/instances/altinn-studio/pr-0/manifest.yaml
+disk: $TMP/data/agentdp/instances/altinn-studio/pr-0/disk.qcow2
+seed: $TMP/data/agentdp/instances/altinn-studio/pr-0/generated/qemu/seed.img
+image: $TMP/cache/agentdp/images/archlinux-x86_64-cloudimg.qcow2
+--- stderr
+
