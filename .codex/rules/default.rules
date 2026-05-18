@@ -55,14 +55,15 @@ prefix_rule(
 )
 
 prefix_rule(
-    pattern = ["agentctl", ["create", "status", "up", "down", "exec", "logs", "ps", "shell", "doctor", "manifest", "self"]],
+    pattern = ["agentctl", ["create", "status", "up", "down", "rm", "exec", "logs", "ps", "shell", "doctor", "manifest", "self"]],
     decision = "allow",
-    justification = "Allow routine installed agentctl commands except destructive instance removal.",
+    justification = "Allow routine installed agentctl commands.",
     match = [
         "agentctl create",
         "agentctl status",
         "agentctl up",
         "agentctl down",
+        "agentctl rm",
         "agentctl exec",
         "agentctl logs",
         "agentctl ps",
