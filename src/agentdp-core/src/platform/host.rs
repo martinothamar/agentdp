@@ -19,11 +19,6 @@ impl HostTarget {
             Self::Unsupported(name) => name,
         }
     }
-
-    #[must_use]
-    pub const fn is_supported_first_cut(self) -> bool {
-        matches!(self, Self::Linux | Self::Wsl2)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

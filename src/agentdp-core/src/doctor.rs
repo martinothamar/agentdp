@@ -101,7 +101,7 @@ pub fn run_doctor(context: &Context) -> DoctorReport {
 
 fn check_host(context: &Context) -> DoctorCheck {
     let host = context.host_target();
-    if host.is_supported_first_cut() {
+    if matches!(host, platform::HostTarget::Linux | platform::HostTarget::Wsl2) {
         DoctorCheck::ok("Linux/WSL2 host", host.label())
     } else {
         DoctorCheck::fail(

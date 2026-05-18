@@ -12,7 +12,10 @@ use agentdp_protocol::{self as protocol, Request, RequestKind, Response};
 
 #[test]
 fn responds_to_ping_over_jsonl_socket() {
-    if !platform::host_target().is_supported_first_cut() {
+    if !matches!(
+        platform::host_target(),
+        platform::HostTarget::Linux | platform::HostTarget::Wsl2 | platform::HostTarget::Windows
+    ) {
         return;
     }
 
