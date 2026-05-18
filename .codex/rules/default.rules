@@ -53,3 +53,22 @@ prefix_rule(
     justification = "Allow the release-built agentctl binary to install itself for the current user.",
     match = ["target/release/agentctl self install"],
 )
+
+prefix_rule(
+    pattern = ["agentctl", ["create", "status", "up", "down", "exec", "logs", "ps", "shell", "doctor", "manifest", "self"]],
+    decision = "allow",
+    justification = "Allow routine installed agentctl commands except destructive instance removal.",
+    match = [
+        "agentctl create",
+        "agentctl status",
+        "agentctl up",
+        "agentctl down",
+        "agentctl exec",
+        "agentctl logs",
+        "agentctl ps",
+        "agentctl shell",
+        "agentctl doctor",
+        "agentctl manifest",
+        "agentctl self",
+    ],
+)
