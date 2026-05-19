@@ -55,11 +55,12 @@ prefix_rule(
 )
 
 prefix_rule(
-    pattern = ["agentctl", ["create", "status", "up", "down", "rm", "exec", "logs", "ps", "shell", "doctor", "manifest", "self"]],
+    pattern = ["agentctl", ["create", "clone", "status", "up", "down", "rm", "exec", "logs", "ps", "shell", "doctor", "manifest", "self"]],
     decision = "allow",
     justification = "Allow routine installed agentctl commands.",
     match = [
         "agentctl create",
+        "agentctl clone",
         "agentctl status",
         "agentctl up",
         "agentctl down",
@@ -71,5 +72,26 @@ prefix_rule(
         "agentctl doctor",
         "agentctl manifest",
         "agentctl self",
+    ],
+)
+
+prefix_rule(
+    pattern = ["agentctl", "-v", ["create", "clone", "status", "up", "down", "rm", "exec", "logs", "ps", "shell", "doctor", "manifest", "self"]],
+    decision = "allow",
+    justification = "Allow routine installed agentctl commands when the global verbose flag is used before the subcommand.",
+    match = [
+        "agentctl -v create",
+        "agentctl -v clone",
+        "agentctl -v status",
+        "agentctl -v up",
+        "agentctl -v down",
+        "agentctl -v rm",
+        "agentctl -v exec",
+        "agentctl -v logs",
+        "agentctl -v ps",
+        "agentctl -v shell",
+        "agentctl -v doctor",
+        "agentctl -v manifest",
+        "agentctl -v self",
     ],
 )

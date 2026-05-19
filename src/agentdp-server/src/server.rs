@@ -236,6 +236,10 @@ fn handle_request(context: &Context, request: &Request, progress: &mut dyn Progr
             instance_create_response(context, request, params),
             ConnectionAction::Continue,
         ),
+        RequestKind::InstanceClone(params) => (
+            instance_clone_response(context, request, params),
+            ConnectionAction::Continue,
+        ),
         RequestKind::InstanceStatus(params) => (
             instance_status_response(context, request, params),
             ConnectionAction::Continue,
@@ -379,6 +383,23 @@ fn instance_create_response(
         |context, params, paths| {
             let instance = instance::Instance::create_new(context, params, paths)?;
             Ok::<_, instance::Error>(instance.create_result())
+        },
+    )
+}
+
+fn instance_clone_response(
+    context: &Context,
+    request: &Request,
+    params: &agentdp_protocol::InstanceCloneParams,
+) -> Response {
+    handle_params(
+        context,
+        request,
+        params,
+        "instance_clone_failed",
+        |context, params, paths| {
+            let instance = instance::Instance::clone_existing(context, params, paths)?;
+            Ok::<_, instance::Error>(instance.clone_result(params.source.clone()))
         },
     )
 }

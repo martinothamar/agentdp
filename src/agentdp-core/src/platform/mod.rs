@@ -5,7 +5,9 @@ pub mod process;
 pub mod socket;
 pub mod ssh;
 
-pub use fs::{SocketStatus, ensure_writable_directory, local_socket_status, set_executable};
+pub use fs::{
+    SocketStatus, ensure_writable_directory, local_socket_status, restrict_private_file_permissions, set_executable,
+};
 pub use host::{HostTarget, KvmStatus, find_binary, host_target, kvm_status};
 pub use paths::{Error, PlatformPaths, user_bin_dir};
 pub use process::{

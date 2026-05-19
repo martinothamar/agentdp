@@ -9,6 +9,12 @@ fn root_help() {
 }
 
 #[test]
+fn clone_help() {
+    let context = TestContext::new("help-clone");
+    snapshot::assert(file!(), "clone", &context.run(["clone", "--help"]).render());
+}
+
+#[test]
 fn manifest_help() {
     let context = TestContext::new("help-manifest");
     snapshot::assert(file!(), "manifest", &context.run(["manifest", "--help"]).render());

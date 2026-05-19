@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Response;
 use crate::{
-    InstanceCreateParams, InstanceExecParams, InstanceLogsParams, InstancePsParams, InstanceRef,
+    InstanceCloneParams, InstanceCreateParams, InstanceExecParams, InstanceLogsParams, InstancePsParams, InstanceRef,
     ProvisioningPlanParams, ServerDoctorParams,
 };
 
@@ -48,6 +48,8 @@ pub enum RequestKind {
     ProvisioningPlan(ProvisioningPlanParams),
     #[serde(rename = "instance.create")]
     InstanceCreate(InstanceCreateParams),
+    #[serde(rename = "instance.clone")]
+    InstanceClone(InstanceCloneParams),
     #[serde(rename = "instance.status")]
     InstanceStatus(InstanceRef),
     #[serde(rename = "instance.up")]

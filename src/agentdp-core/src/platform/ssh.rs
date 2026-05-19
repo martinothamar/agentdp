@@ -70,6 +70,12 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to restrict SSH private key permissions {path}: {source}")]
+    RestrictPrivateKeyPermissions {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to run ssh-keygen: {0}")]
     RunKeygen(#[source] std::io::Error),
     #[error("ssh-keygen failed: {stderr}")]
@@ -155,6 +161,12 @@ impl SshKeygen {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             });
         }
+        super::restrict_private_file_permissions(&private_key).map_err(|source| {
+            Error::RestrictPrivateKeyPermissions {
+                path: private_key.clone(),
+                source,
+            }
+        })?;
 
         let public_key_contents = fs::read_to_string(&public_key).map_err(|source| Error::ReadPublicKey {
             path: public_key.clone(),

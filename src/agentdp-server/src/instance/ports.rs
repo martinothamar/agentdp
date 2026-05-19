@@ -24,15 +24,24 @@ pub fn assign(
     manifest: &AgentManifest,
     requested: &BTreeMap<String, u16>,
 ) -> Result<BTreeMap<String, PortMappingState>, Error> {
-    assign_with_allocator(manifest, requested, allocate_host_port)
+    assign_avoiding(manifest, requested, BTreeSet::new())
+}
+
+pub fn assign_avoiding(
+    manifest: &AgentManifest,
+    requested: &BTreeMap<String, u16>,
+    reserved: BTreeSet<u16>,
+) -> Result<BTreeMap<String, PortMappingState>, Error> {
+    assign_with_allocator(manifest, requested, reserved, allocate_host_port)
 }
 
 fn assign_with_allocator(
     manifest: &AgentManifest,
     requested: &BTreeMap<String, u16>,
+    reserved: BTreeSet<u16>,
     mut allocate: impl FnMut(NetworkProtocol, &mut BTreeSet<u16>) -> Result<u16, Error>,
 ) -> Result<BTreeMap<String, PortMappingState>, Error> {
-    let mut used = BTreeSet::new();
+    let mut used = reserved;
     for (name, host) in requested {
         if !manifest.network.ports.contains_key(name) {
             return Err(Error::UnknownPort(name.clone()));
@@ -116,7 +125,7 @@ const fn port_protocol_state(protocol: NetworkProtocol) -> PortProtocolState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use agentdp_core::manifest::AgentManifest;
     use agentdp_test_support::manifest;
@@ -130,7 +139,7 @@ mod tests {
         let manifest = manifest();
         let requested = BTreeMap::from([("ssh".to_owned(), 2222)]);
 
-        let ports = assign_with_allocator(&manifest, &requested, |_protocol, used| {
+        let ports = assign_with_allocator(&manifest, &requested, BTreeSet::new(), |_protocol, used| {
             let port = 14090;
             assert!(used.insert(port));
             Ok(port)
@@ -142,6 +151,27 @@ mod tests {
         assert_eq!(ports["ssh"].protocol, PortProtocolState::Tcp);
         assert!(ports["code-server"].host > 0);
         assert_ne!(ports["code-server"].host, 2222);
+    }
+
+    #[test]
+    fn auto_ports_avoid_reserved_ports() {
+        let manifest = manifest();
+        let mut next_port = 14090;
+        let ports = assign_with_allocator(
+            &manifest,
+            &BTreeMap::new(),
+            BTreeSet::from([2222]),
+            |_protocol, used| {
+                assert!(used.contains(&2222));
+                let port = next_port;
+                next_port += 1;
+                assert!(used.insert(port));
+                Ok(port)
+            },
+        )
+        .unwrap();
+
+        assert_ne!(ports["ssh"].host, 2222);
     }
 
     #[test]

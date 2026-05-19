@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod clone;
 mod create;
 mod doctor;
 mod down;
@@ -11,6 +12,7 @@ mod exec;
 mod logging;
 mod logs;
 mod manifest;
+mod port;
 mod ps;
 mod rm;
 #[path = "self/mod.rs"]
@@ -34,6 +36,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Create(create::Command),
+    Clone(clone::Command),
     Status(status::Command),
     Up(up::Command),
     Down(down::Command),
@@ -54,6 +57,7 @@ fn main() -> ExitCode {
 
     match &cli.command {
         Command::Create(command) => create::run(command, &context),
+        Command::Clone(command) => clone::run(command, &context),
         Command::Status(command) => status::run(command, &context),
         Command::Up(command) => up::run(command, &context),
         Command::Down(command) => down::run(command, &context),

@@ -8,7 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentdp_core::Context;
 use agentdp_core::platform::ssh::SshKeygen;
 use agentdp_core::platform::{PlatformPaths, ProcessStatus};
-use agentdp_protocol::{InstanceCreateParams, InstanceCreateResult, InstanceRef, InstanceUpResult, ReadinessResult};
+use agentdp_protocol::{
+    InstanceCloneParams, InstanceCloneResult, InstanceCreateParams, InstanceCreateResult, InstanceRef,
+    InstanceUpResult, ReadinessResult,
+};
 
 use super::state::{self, InstanceState, ReadinessState};
 use crate::progress::{NoopProgress, Progress};
@@ -72,6 +75,66 @@ fn rm_refuses_running_instance() {
             .contains("run `agentctl down pr-0` before removing it")
     );
     assert!(fixture.state_path().exists());
+}
+
+#[test]
+fn clone_copies_stopped_instance_with_target_runtime_state() {
+    let fixture = InstanceFixture::create("instance-clone");
+    fixture.create_instance();
+    fixture.mark_stopped_ready();
+
+    let result = fixture.clone_instance("pr-1");
+
+    assert_eq!(result.source, FULL_INSTANCE_NAME);
+    assert_eq!(result.name, "altinn-studio/pr-1");
+    let target_state = fixture.read_target_state("pr-1");
+    assert_eq!(target_state.instance, "pr-1");
+    assert_eq!(target_state.status, state::InstanceStatus::Stopped);
+    assert!(target_state.readiness.is_none());
+    assert!(PathBuf::from(&target_state.manifest.copy).ends_with("altinn-studio/pr-1/manifest.yaml"));
+    assert!(PathBuf::from(&target_state.backend.qemu().disk).ends_with("altinn-studio/pr-1/disk.qcow2"));
+    assert!(
+        PathBuf::from(&target_state.backend.qemu().monitor_socket)
+            .ends_with("runtime/instances/altinn-studio/pr-1/qemu/monitor.sock")
+    );
+    assert!(
+        PathBuf::from(&target_state.guest_access.as_ref().unwrap().private_key)
+            .ends_with("altinn-studio/pr-1/generated/qemu/ssh/agentdp_ed25519")
+    );
+    assert_ne!(target_state.network.ports["ssh"].host, TEST_HOST_SSH_PORT);
+    assert_eq!(
+        fs::read_to_string(target_state.backend.qemu().disk.clone())
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "fake qcow2\n"
+    );
+}
+
+#[test]
+fn clone_accepts_target_port_overrides() {
+    let fixture = InstanceFixture::create("instance-clone-port");
+    fixture.create_instance();
+    fixture.mark_stopped_ready();
+
+    fixture.clone_instance_with_ports("pr-1", BTreeMap::from([("ssh".to_owned(), 4091)]));
+
+    let target_state = fixture.read_target_state("pr-1");
+    assert_eq!(target_state.network.ports["ssh"].host, 4091);
+}
+
+#[test]
+fn clone_refuses_running_instance() {
+    let fixture = InstanceFixture::create("instance-clone-running");
+    fixture.create_instance();
+    fixture.mark_running();
+
+    let Err(error) = super::Instance::clone_existing(&Context::quiet(), &fixture.clone_params("pr-1"), &fixture.paths)
+    else {
+        panic!("running source should not clone");
+    };
+
+    assert!(error.to_string().contains("run `agentctl down pr-0` before cloning it"));
+    assert!(!fixture.target_instance_dir("pr-1").exists());
 }
 
 #[test]
@@ -297,6 +360,17 @@ impl InstanceFixture {
         instance.create_result()
     }
 
+    fn clone_instance(&self, target: &str) -> InstanceCloneResult {
+        self.clone_instance_with_ports(target, BTreeMap::default())
+    }
+
+    fn clone_instance_with_ports(&self, target: &str, ports: BTreeMap<String, u16>) -> InstanceCloneResult {
+        let mut params = self.clone_params(target);
+        params.ports = ports;
+        let instance = super::Instance::clone_existing(&Context::quiet(), &params, &self.paths).unwrap();
+        instance.clone_result(FULL_INSTANCE_NAME)
+    }
+
     fn up_with_fake_qemu(&self) -> Result<InstanceUpResult, super::Error> {
         self.up_with_fake_qemu_and_wait(|_context, _state, _progress| Ok(()))
     }
@@ -336,6 +410,15 @@ impl InstanceFixture {
         }
     }
 
+    fn clone_params(&self, target: &str) -> InstanceCloneParams {
+        InstanceCloneParams {
+            manifest: self.manifest.clone(),
+            source: INSTANCE_NAME.to_owned(),
+            target: target.to_owned(),
+            ports: BTreeMap::default(),
+        }
+    }
+
     fn instance_ref(&self) -> InstanceRef {
         InstanceRef {
             manifest: self.manifest.clone(),
@@ -349,12 +432,21 @@ impl InstanceFixture {
             .join(format!("instances/{MANIFEST_NAME}/{INSTANCE_NAME}"))
     }
 
+    fn target_instance_dir(&self, instance: &str) -> PathBuf {
+        self.paths.data.join("instances").join(MANIFEST_NAME).join(instance)
+    }
+
     fn state_path(&self) -> PathBuf {
         self.instance_dir().join("runtime.json")
     }
 
     fn read_state(&self) -> InstanceState {
         serde_json::from_str(&fs::read_to_string(self.state_path()).unwrap()).unwrap()
+    }
+
+    fn read_target_state(&self, instance: &str) -> InstanceState {
+        serde_json::from_str(&fs::read_to_string(self.target_instance_dir(instance).join("runtime.json")).unwrap())
+            .unwrap()
     }
 
     fn write_state(&self, state: &InstanceState) {
@@ -376,6 +468,13 @@ impl InstanceFixture {
     fn mark_running_ready(&self) {
         self.update_state(|state| {
             state.status = state::InstanceStatus::Running;
+            state.readiness = Some(ready_state());
+        });
+    }
+
+    fn mark_stopped_ready(&self) {
+        self.update_state(|state| {
+            state.status = state::InstanceStatus::Stopped;
             state.readiness = Some(ready_state());
         });
     }

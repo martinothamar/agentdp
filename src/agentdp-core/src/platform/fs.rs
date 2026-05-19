@@ -23,6 +23,57 @@ pub fn ensure_writable_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Restricts a private file so OpenSSH accepts it as key material.
+///
+/// # Errors
+///
+/// Returns an error when platform permissions cannot be updated.
+#[cfg(unix)]
+pub fn restrict_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)
+}
+
+/// Restricts a private file so OpenSSH accepts it as key material.
+///
+/// # Errors
+///
+/// Returns an error when platform permissions cannot be updated.
+#[cfg(target_os = "windows")]
+pub fn restrict_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    let user = std::env::var("USERNAME").map_err(std::io::Error::other)?;
+    let status = super::process::hide_child_window(
+        std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{user}:F")),
+    )
+    .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "icacls failed for {} with {status}",
+            path.display()
+        )))
+    }
+}
+
+/// Restricts a private file so OpenSSH accepts it as key material.
+///
+/// # Errors
+///
+/// This platform does not require permission changes, so this function always
+/// succeeds.
+#[cfg(not(any(unix, target_os = "windows")))]
+pub const fn restrict_private_file_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[must_use]
 pub fn local_socket_status(path: &Path) -> SocketStatus {
     if !path.exists() {

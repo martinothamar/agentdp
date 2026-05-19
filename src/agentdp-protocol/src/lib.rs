@@ -13,26 +13,26 @@ pub use error::Error;
 pub use framing::{decode_request, decode_server_message, encode_line};
 pub use message::{Event, EventKind, EventLevel, ServerMessage, ServerMessageType};
 pub use params::{
-    InstanceCreateParams, InstanceExecParams, InstanceLogsParams, InstancePsParams, InstanceRef, LogFile,
-    ProvisioningPlanParams, ServerDoctorParams,
+    InstanceCloneParams, InstanceCreateParams, InstanceExecParams, InstanceLogsParams, InstancePsParams, InstanceRef,
+    LogFile, ProvisioningPlanParams, ServerDoctorParams,
 };
 pub use request::{Request, RequestFactory, RequestKind, request};
 pub use response::{ErrorObject, Response, invalid_request};
 pub use results::{
     BackendCreateResult, BackendProvisioningResult, BackendRuntimeResult, BackendStatusResult, DoctorCheckResult,
-    GuestAccessResult, HealthcheckResult, HostCommandResult, ImageResult, InstanceCreateResult, InstanceDownResult,
-    InstanceExecResult, InstanceListItem, InstanceLogsResult, InstancePsResult, InstanceRmResult, InstanceShellResult,
-    InstanceStatusResult, InstanceUpResult, ManifestResult, NetworkResult, PingResult, PortMappingResult,
-    PortProtocolResult, ProcessResult, ProvisioningImageResult, ProvisioningPlanResult, QemuCreateResult,
-    QemuImageResult, QemuProvisioningResult, QemuRuntimeResult, QemuStatusResult, ReadinessResult,
+    GuestAccessResult, HealthcheckResult, HostCommandResult, ImageResult, InstanceCloneResult, InstanceCreateResult,
+    InstanceDownResult, InstanceExecResult, InstanceListItem, InstanceLogsResult, InstancePsResult, InstanceRmResult,
+    InstanceShellResult, InstanceStatusResult, InstanceUpResult, ManifestResult, NetworkResult, PingResult,
+    PortMappingResult, PortProtocolResult, ProcessResult, ProvisioningImageResult, ProvisioningPlanResult,
+    QemuCreateResult, QemuImageResult, QemuProvisioningResult, QemuRuntimeResult, QemuStatusResult, ReadinessResult,
     ReadinessStateResult, SeedResult, ServerDoctorResult, ServiceResult, ShutdownResult,
 };
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Event, InstanceCreateParams, PingResult, RequestFactory, RequestKind, Response, ServerMessage, decode_request,
-        decode_server_message, encode_line,
+        Event, InstanceCloneParams, InstanceCreateParams, PingResult, RequestFactory, RequestKind, Response,
+        ServerMessage, decode_request, decode_server_message, encode_line,
     };
 
     #[test]
@@ -92,5 +92,27 @@ mod tests {
             panic!("expected instance.create");
         };
         assert_eq!(params.instance, "pr-0");
+    }
+
+    #[test]
+    fn clone_request_round_trips_as_json_line() {
+        let line = encode_line(
+            &RequestFactory::new(7).request(RequestKind::InstanceClone(InstanceCloneParams {
+                manifest: "/tmp/agent.yaml".into(),
+                source: "pr-0".to_owned(),
+                target: "pr-1".to_owned(),
+                ports: std::collections::BTreeMap::from([("code-server".to_owned(), 4091)]),
+            })),
+        )
+        .expect("encode request");
+
+        let decoded = decode_request(&line).expect("decode request");
+        assert_eq!(decoded.id, "cmd_7_0");
+        let RequestKind::InstanceClone(params) = decoded.kind else {
+            panic!("expected instance.clone");
+        };
+        assert_eq!(params.source, "pr-0");
+        assert_eq!(params.target, "pr-1");
+        assert_eq!(params.ports["code-server"], 4091);
     }
 }

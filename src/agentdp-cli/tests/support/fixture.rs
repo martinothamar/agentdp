@@ -112,6 +112,19 @@ impl AgentFixture {
         self.run(command, "run agentctl create")
     }
 
+    pub fn clone_instance(&self, target: &str) -> CommandSnapshot {
+        self.clone_instance_with_ports(target, &[])
+    }
+
+    pub fn clone_instance_with_ports(&self, target: &str, ports: &[&str]) -> CommandSnapshot {
+        let mut command = self.command();
+        command.args(["clone", "pr-0", target, "-f"]).arg(&self.manifest);
+        for port in ports {
+            command.arg("--port").arg(port);
+        }
+        self.run(command, "run agentctl clone")
+    }
+
     pub fn up(&self) -> CommandSnapshot {
         let mut command = self.command();
         command
@@ -171,6 +184,17 @@ impl AgentFixture {
 
     pub fn instance_dir(&self) -> PathBuf {
         self.context.path().join("data/agentdp/instances/altinn-studio/pr-0")
+    }
+
+    pub fn target_instance_dir(&self, target: &str) -> PathBuf {
+        self.context
+            .path()
+            .join("data/agentdp/instances/altinn-studio")
+            .join(target)
+    }
+
+    pub fn target_instance_file(&self, target: &str, suffix: &str) -> PathBuf {
+        self.target_instance_dir(target).join(suffix)
     }
 
     pub fn instance_file(&self, suffix: &str) -> PathBuf {

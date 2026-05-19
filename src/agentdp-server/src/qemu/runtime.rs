@@ -195,6 +195,34 @@ pub fn create_details(state: &State) -> BackendCreateResult {
     BackendCreateResult::Qemu(create_result_from_state(state))
 }
 
+#[must_use]
+pub fn clone_state(
+    source: &State,
+    files: &InstanceFiles,
+    paths: &PlatformPaths,
+    manifest_name: &str,
+    instance: &str,
+) -> State {
+    let work_dir = files.instance_dir.join("generated").join("qemu");
+    let qemu_runtime_dir = runtime_dir(paths, manifest_name, instance);
+    State {
+        image: source.image.clone(),
+        disk: path_text(&disk_path(files)),
+        work_dir: path_text(&work_dir),
+        seed_media: path_text(&work_dir.join("seed.img")),
+        seed_meta_data: path_text(&work_dir.join("seed").join("meta-data")),
+        seed_user_data: path_text(&work_dir.join("seed").join("user-data")),
+        bootstrap_script: path_text(&work_dir.join("scripts").join("bootstrap.sh")),
+        monitor_socket: path_text(&qemu_runtime_dir.join("monitor.sock")),
+        qmp_socket: path_text(&qemu_runtime_dir.join("qmp.sock")),
+        pid_file: path_text(&qemu_runtime_dir.join("qemu.pid")),
+        serial_log: path_text(&files.logs_dir.join("serial.log")),
+        qemu_log: path_text(&files.logs_dir.join("qemu.log")),
+        pid: None,
+        last_start_unix_seconds: None,
+    }
+}
+
 pub fn plan(
     context: &Context,
     manifest_path: PathBuf,

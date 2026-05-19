@@ -1,0 +1,15 @@
+status: 0
+--- stdout
+Usage: agentctl clone [OPTIONS] <SOURCE> <TARGET>
+
+Arguments:
+  <SOURCE>  
+  <TARGET>  
+
+Options:
+      --port <NAME:HOST_PORT>  
+  -v, --verbose                
+  -f, --file <PATH>            
+  -h, --help                   Print help
+--- stderr
+

@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::runtime;
 
+mod clone;
 mod create;
 mod down;
 mod exec;
@@ -50,6 +51,30 @@ pub enum Error {
     },
     #[error("instance {name} is running; run `agentctl down {instance}` before removing it")]
     RemoveRunning { name: String, instance: String },
+    #[error("source and target instance names must be different: {instance}")]
+    CloneSameInstance { instance: String },
+    #[error("instance {name} is running; run `agentctl down {instance}` before cloning it")]
+    CloneRunning { name: String, instance: String },
+    #[error("failed to copy instance directory from {source_path} to {destination_path}: {source}")]
+    CopyInstanceDirectory {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to copy instance file from {source_path} to {destination_path}: {source}")]
+    CopyInstanceFile {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to restrict cloned SSH private key permissions {path}: {source}")]
+    RestrictClonedPrivateKeyPermissions {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("{0}")]
     Terminate(#[from] platform::TerminateProcessError),
     #[error("{0}")]

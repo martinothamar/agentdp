@@ -95,6 +95,26 @@ impl Backend {
         }
     }
 
+    #[must_use]
+    pub fn clone_state(
+        self,
+        source_state: &BackendState,
+        files: &InstanceFiles,
+        paths: &PlatformPaths,
+        manifest_name: &str,
+        instance: &str,
+    ) -> BackendState {
+        match (self, source_state) {
+            (Self::Qemu, BackendState::Qemu(qemu_state)) => BackendState::Qemu(qemu::runtime::clone_state(
+                qemu_state,
+                files,
+                paths,
+                manifest_name,
+                instance,
+            )),
+        }
+    }
+
     pub fn start(
         self,
         context: &Context,

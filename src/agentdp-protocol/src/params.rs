@@ -33,6 +33,15 @@ pub struct InstanceCreateParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InstanceCloneParams {
+    pub manifest: PathBuf,
+    pub source: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ports: BTreeMap<String, u16>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct InstanceExecParams {
     pub manifest: PathBuf,
     pub instance: String,

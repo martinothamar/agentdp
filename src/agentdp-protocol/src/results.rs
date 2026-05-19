@@ -92,6 +92,17 @@ pub struct InstanceCreateResult {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InstanceCloneResult {
+    pub source: String,
+    pub name: String,
+    pub manifest: ManifestResult,
+    pub state: String,
+    pub backend: BackendCreateResult,
+    pub network: NetworkResult,
+    pub guest_access: GuestAccessResult,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ManifestResult {
     pub source: String,
     pub copy: String,

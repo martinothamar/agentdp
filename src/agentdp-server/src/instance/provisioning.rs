@@ -86,7 +86,7 @@ pub(super) fn load_manifest_for_params(context: &Context, params: &Params) -> Re
     load_manifest(context, &params.manifest).map_err(Error::Manifest)
 }
 
-fn validate_instance_name(instance: &str) -> Result<(), Error> {
+pub(super) fn validate_instance_name(instance: &str) -> Result<(), Error> {
     if instance.is_empty() {
         return Err(Error::InvalidInstance);
     }

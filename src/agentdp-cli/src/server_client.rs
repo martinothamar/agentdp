@@ -17,7 +17,9 @@ const SERVER_PATH_ENV: &str = "AGENTDP_SERVER_PATH";
 const START_RETRY_COUNT: usize = 40;
 const START_RETRY_DELAY: Duration = Duration::from_millis(50);
 const RESPONSE_TIMEOUT_ENV: &str = "AGENTDP_SERVER_RESPONSE_TIMEOUT_MS";
-const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -37,6 +39,8 @@ pub enum Error {
     Spawn(#[from] platform::DetachedSpawnError),
     #[error("failed to terminate agentdp-server: {0}")]
     Terminate(#[from] platform::TerminateProcessError),
+    #[error("failed to inspect agentdp-server process: {0}")]
+    ProcessStatus(#[from] platform::ProcessStatusError),
     #[error("agentdp-server did not stop after termination request")]
     ServerStillRunning,
     #[error("agentdp-server did not respond within {timeout_ms}ms")]
@@ -107,6 +111,7 @@ pub fn stop_if_running(context: &Context, paths: &PlatformPaths) -> Result<Stop,
         Err(Error::ServerResponseTimedOut { .. }) if cleanup_unowned_server_socket(context, paths)? => {
             return Ok(Stop::NotRunning);
         }
+        Err(Error::ServerResponseTimedOut { .. }) => return stop_unresponsive_lock_owner(context, paths),
         Err(error) if should_start_after_ping_error(&error) => return Ok(Stop::NotRunning),
         Err(error) => return Err(error),
     };
@@ -121,15 +126,46 @@ pub fn stop_if_running(context: &Context, paths: &PlatformPaths) -> Result<Stop,
     Ok(Stop::Stopped(ping))
 }
 
+fn stop_unresponsive_lock_owner(context: &Context, paths: &PlatformPaths) -> Result<Stop, Error> {
+    let socket = paths.socket_path();
+    let lock = socket.with_extension("lock");
+    let Some(pid) = live_lock_owner_pid(&lock) else {
+        return Ok(Stop::NotRunning);
+    };
+
+    context.logger().verbose_with(|| {
+        format!(
+            "terminating unresponsive agentdp-server pid {pid} recorded by {}",
+            lock.display()
+        )
+    });
+    platform::terminate_process(pid)?;
+    if !platform::wait_for_process_exit(pid, SERVER_STOP_TIMEOUT)? {
+        return Err(Error::ServerStillRunning);
+    }
+    remove_file_if_exists(&socket)?;
+    remove_file_if_exists(&lock)?;
+    Ok(Stop::Stopped(Ping {
+        socket,
+        pid,
+        version: None,
+        executable: None,
+    }))
+}
+
 pub fn start_server_from(context: &Context, paths: &PlatformPaths, server: &std::path::Path) -> Result<Ping, Error> {
     start_from(context, paths, server)?;
     wait_for_ping(paths)
 }
 
 fn ping(paths: &PlatformPaths) -> Result<Ping, Error> {
+    ping_with_timeout(paths, CONTROL_RESPONSE_TIMEOUT)
+}
+
+fn ping_with_timeout(paths: &PlatformPaths, response_timeout: Duration) -> Result<Ping, Error> {
     let socket = paths.socket_path();
     let request = protocol::request(RequestKind::ServerPing);
-    let response: PingResult = send(paths, &request, None)?;
+    let response: PingResult = send_with_timeout(paths, &request, None, response_timeout)?;
     if response.service != "agentdp-server" {
         return Err(Error::InvalidResponse(
             "server.ping response omitted service marker".to_owned(),
@@ -287,7 +323,7 @@ fn stop_running(context: &Context, paths: &PlatformPaths, running: &Ping) -> Res
 
 fn shutdown(paths: &PlatformPaths) -> Result<(), Error> {
     let request = protocol::request(RequestKind::ServerShutdown);
-    let response: ShutdownResult = send(paths, &request, None)?;
+    let response: ShutdownResult = send_with_timeout(paths, &request, None, CONTROL_RESPONSE_TIMEOUT)?;
     if response.shutdown {
         Ok(())
     } else {
@@ -339,13 +375,23 @@ fn cleanup_unowned_server_socket(context: &Context, paths: &PlatformPaths) -> Re
 }
 
 fn live_lock_owner(lock: &Path) -> bool {
+    live_lock_owner_pid(lock).is_some()
+}
+
+fn live_lock_owner_pid(lock: &Path) -> Option<u32> {
     let Ok(contents) = fs::read_to_string(lock) else {
-        return false;
+        return None;
     };
-    let Some(pid) = contents.lines().find_map(lock_owner_pid_from_line) else {
-        return false;
-    };
-    matches!(platform::process_status(pid), Ok(platform::ProcessStatus::Running))
+    let pid = lock_owner_pid_from_contents(&contents)?;
+    if matches!(platform::process_status(pid), Ok(platform::ProcessStatus::Running)) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+fn lock_owner_pid_from_contents(contents: &str) -> Option<u32> {
+    contents.lines().find_map(lock_owner_pid_from_line)
 }
 
 fn lock_owner_pid_from_line(line: &str) -> Option<u32> {
