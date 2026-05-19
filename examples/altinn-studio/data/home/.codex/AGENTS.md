@@ -103,8 +103,8 @@ Other relevant repos:
 - altinn-events
 - altinn-resource-registry
 
-If you need to read code from other repositories, feel free to clone repos into the code directory.
-
+All repos are in `/data/home/code/`.
+Apps should be cloned to `/data/home/code/apps`.
 
 ### Status
 
@@ -121,33 +121,68 @@ Currently working on
 - Prefer small, verifiable changes. Read local repository (and subfolder) instructions before editing code, and keep changes scoped to the task.
 - Worktrees are allowed, create them in the code/ folder and remember to clean up afterwards after merging
 - Use playwright for browser automation; it and chromium is installed
-
+- Make sure that builds, tests, lints and formatting is OK (there are often Makefile targets)
+  
 
 #### PR workflow
 
-This is how you must work on PRs:
+IMPORTANT: this is how you must work on PRs:
 
-- PRs body should describe what, why and how it was tested
-- PR titles should use conventional commit-style (`chore: `, `feat: `, `fix: ` etc)
+- Title should use conventional commit-style (`chore: `, `feat: `, `fix: ` etc)
+- Description should explain what was done, why it was done and how it was tested
+  - Provide brower screenshots when frontend/web interface changes is involved
+  - Provide command input and output history/transcript when CLI changes is involved 
+- Use repository issue/PR templates
+- Create PRs with `agentdp-pr create`, not raw `gh pr create`, so the agentdp PR subscriber can track follow-up work.
+  - Example from a fork: `agentdp-pr create --fill --repo Altinn/altinn-studio --base main --head martinothamar-agent:<branch-name>`
+- If a PR was created outside the wrapper, register it immediately from the repo worktree with `agentdp-pr register <pr-url>`.
+- After a PR is registered, the agentdp PR subscriber monitors CI, reviews, inline comments and top-level PR comments, then prompts the running Codex tmux session when there is follow-up work.
 - commits should be logically; the narrative and progress is important, that that it builds/tests/lints for each commit
 - builds, tests and lints must pass before push
 - cc @martinothamar at the bottom of PR bodies
-- keep yourself updated on the status of submitted PRs by using `sleep 5m` and follow up by checking CI, comments etc.
 - when PRs get merged, you need to sync forks to upstream
 
 Example lifecycle:
 
-1. Open PR
-2. Sleep/wait about ~5 minutes
-  - decide the appropriate duration yourself based on what needs to happen/run (some workflows are faster for example)
-3. Check CI
-4. Local commit with CI fixes
-5. Check review comments
-6. Local commit per review comment fix
-7. Comment back for anything you dont agree on. @martinothamar has final say
-8. Rebase on latest and synced main, push any changes, then go to step 2 (wait for next iteration)
-9. PR gets merged
-10. You go back to main, sync to upstream (cleanup if worktree), and yield/end turn
+1. Open PR with `agentdp-pr create`
+2. Wait for the subscriber to prompt follow-up, or manually check if you need immediate status
+3. Local commit with CI fixes
+4. Check review comments
+5. Local commit per review comment fix
+6. Comment back for anything you dont agree on. @martinothamar has final say
+7. Rebase on latest and synced main, push any changes, then go to step 2 (wait for next iteration)
+8. PR gets merged
+9. You go back to main, sync to upstream (cleanup if worktree), and yield/end turn
 
 NOTE: dont sleep forever if you are waiting for input/decision. Just yield and expect @martinothamar to pick things up.
 
+
+#### Review
+
+When asked to get a reviewer, or when you feel it is necessary, spawn a "reviewer" subagent.
+Provide complete context and scope:
+
+- the user request and intended outcome
+- PR/issue/branch information if applicable
+- repo/directory/package (whatever makes most sense)
+- relevant product/domain context and any non-obvious constraints
+- decisions made
+- assumptions made
+- commands already run and their results
+- areas of particular concern, for example security, migrations, data loss, accessibility, performance, or compatibility (omit if a general review is needed)
+
+Findings must be actionable and include file/line references when possible.
+After the reviewer responds, evaluate and handle the findings yourself. 
+Present findings, your evaluation and fixes in response (in Github PR comment if a PR exists).
+Do not outsource final judgment to the reviewer; @martinothamar has final say if there is doubt.
+
+
+#### Third party code
+
+If you need to read third party code that is not part of Altinn, it should be checked out and cached in `/data/home/code/.cache/`.
+
+
+#### Self
+
+The code for this (your) harness is at ``/data/home/code/agentdp/examples/altinn-studio`.
+Since it is still in development, it is important that you contribute to it (you have direct write access to the repo).

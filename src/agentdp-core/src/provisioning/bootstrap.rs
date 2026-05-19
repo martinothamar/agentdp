@@ -60,6 +60,8 @@ impl<'a> ProvisioningBuilder<'a> {
 
         let mut packages = manifest.bootstrap.packages.clone();
         packages.push("sudo".to_owned());
+        packages.push("cloud-guest-utils".to_owned());
+        packages.push("gptfdisk".to_owned());
         if !repos.is_empty() {
             packages.push("git".to_owned());
         }
@@ -80,6 +82,7 @@ impl<'a> ProvisioningBuilder<'a> {
     }
 
     fn build(mut self) -> BootstrapPlan {
+        self.add_root_shell(render_grow_root_filesystem());
         super::plugins::apply(&self.manifest.plugins, &mut self);
         self.add_agent_shell_lines(self.manifest.bootstrap.shell.iter().cloned());
         self.user.groups = dedupe(self.user.groups);
@@ -230,13 +233,7 @@ fn render_bootstrap_script(
     script.blank();
     script.block(templates::BOOTSTRAP_HELPERS);
     script.blank();
-    script.block(&render_harness_information(
-        manifest,
-        packages,
-        repos,
-        healthchecks,
-        agent_shell,
-    ));
+    script.block(&render_harness_information(manifest, packages, repos, healthchecks));
     script.blank();
 
     if !root_shell.is_empty() {
@@ -296,9 +293,8 @@ fn render_harness_information(
     packages: &[String],
     repos: &[RepoCheckout],
     healthchecks: &[HealthcheckPlan],
-    agent_shell: &[String],
 ) -> String {
-    let info = harness_information(manifest, packages, repos, healthchecks, agent_shell);
+    let info = harness_information(manifest, packages, repos, healthchecks);
     let encoded_info = BASE64.encode(info);
     let mut script = shell::ShellScript::new();
     script.line("target=\"$AGENTDP_HOME/.codex/AGENTS.md\"");
@@ -334,7 +330,6 @@ fn harness_information(
     packages: &[String],
     repos: &[RepoCheckout],
     healthchecks: &[HealthcheckPlan],
-    agent_shell: &[String],
 ) -> String {
     use std::fmt::Write as _;
 
@@ -363,10 +358,6 @@ fn harness_information(
             healthcheck.kind,
             healthcheck.timeout.as_deref().unwrap_or("<default>")
         );
-    }
-    output.push_str("\n## Bootstrap Shell\n\n");
-    for command in agent_shell {
-        let _ = writeln!(&mut output, "- `{command}`");
     }
     output
 }
@@ -410,6 +401,61 @@ fn render_agent_env_install(user: &AgentUserPlan) -> String {
     script.block(&agent_profile);
     script.line("EOF");
     script.line("chmod 0644 \"/etc/profile.d/agentdp-agent.sh\"");
+    script.render()
+}
+
+fn render_grow_root_filesystem() -> String {
+    let mut script = shell::ShellScript::new();
+    script.line("grow_agentdp_root() {");
+    script.line("  local root_source root_fstype parent partnum grow_output");
+    script.line("  root_source=\"$(findmnt -no SOURCE / || true)\"");
+    script.line("  root_fstype=\"$(findmnt -no FSTYPE / || true)\"");
+    script.line("  if [ -z \"$root_source\" ] || [ ! -b \"$root_source\" ]; then");
+    script.line("    echo \"agentdp grow-root skipped: root source is not a block device: $root_source\"");
+    script.line("    return 0");
+    script.line("  fi");
+    script.line("  parent=\"$(lsblk -no PKNAME \"$root_source\" | head -n1 || true)\"");
+    script.line("  partnum=\"$(lsblk -no PARTN \"$root_source\" | head -n1 || true)\"");
+    script.line("  if [ -z \"$parent\" ] || [ -z \"$partnum\" ]; then");
+    script.line("    echo \"agentdp grow-root skipped: root source is not a partition: $root_source\"");
+    script.line("    return 0");
+    script.line("  fi");
+    script.line("  echo \"Growing root partition $root_source on /dev/$parent\"");
+    script.line("  if ! grow_output=\"$(growpart \"/dev/$parent\" \"$partnum\" 2>&1)\"; then");
+    script.line("    if ! printf '%s\\n' \"$grow_output\" | grep -qi 'NOCHANGE'; then");
+    script.line("      printf '%s\\n' \"$grow_output\" >&2");
+    script.line("      return 1");
+    script.line("    fi");
+    script.line("  fi");
+    script.line("  if [ -n \"$grow_output\" ]; then");
+    script.line("    printf '%s\\n' \"$grow_output\"");
+    script.line("  fi");
+    script.line("  udevadm settle || true");
+    script.line("  case \"$root_fstype\" in");
+    script.line("    ext2|ext3|ext4)");
+    script.line("      resize2fs \"$root_source\"");
+    script.line("      ;;");
+    script.line("    xfs)");
+    script.line("      if command -v xfs_growfs >/dev/null 2>&1; then");
+    script.line("        xfs_growfs /");
+    script.line("      else");
+    script.line("        echo \"agentdp grow-root skipped: xfs_growfs is not installed\"");
+    script.line("      fi");
+    script.line("      ;;");
+    script.line("    btrfs)");
+    script.line("      if command -v btrfs >/dev/null 2>&1; then");
+    script.line("        btrfs filesystem resize max /");
+    script.line("      else");
+    script.line("        echo \"agentdp grow-root skipped: btrfs is not installed\"");
+    script.line("      fi");
+    script.line("      ;;");
+    script.line("    *)");
+    script.line("      echo \"agentdp grow-root skipped: unsupported root filesystem: $root_fstype\"");
+    script.line("      ;;");
+    script.line("  esac");
+    script.line("}");
+    script.line("grow_agentdp_root");
+    script.line("unset -f grow_agentdp_root");
     script.render()
 }
 

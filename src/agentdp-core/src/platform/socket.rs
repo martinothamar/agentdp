@@ -2,6 +2,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -16,9 +17,28 @@ pub enum LocalSocketError {
     Io(#[from] std::io::Error),
 }
 
-pub trait ReadWrite: Read + Write {}
+pub trait ReadWrite: Read + Write {
+    /// Sets the read timeout on the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying socket cannot apply the timeout.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
 
-impl<T> ReadWrite for T where T: Read + Write {}
+#[cfg(unix)]
+impl ReadWrite for std::os::unix::net::UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl ReadWrite for agentdp_windows_uds::UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
 
 pub struct LocalSocket {
     inner: Box<dyn ReadWrite + Send>,
@@ -28,6 +48,15 @@ impl LocalSocket {
     #[cfg(any(unix, target_os = "windows"))]
     fn new(inner: impl ReadWrite + Send + 'static) -> Self {
         Self { inner: Box::new(inner) }
+    }
+
+    /// Sets the read timeout on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying socket cannot apply the timeout.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.inner.set_read_timeout(timeout)
     }
 }
 

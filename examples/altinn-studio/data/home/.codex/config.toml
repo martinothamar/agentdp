@@ -7,6 +7,10 @@ tool_output_token_limit = 25000
 model_auto_compact_token_limit = 233000
 web_search = "cached"
 
+[mcp_servers.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest"]
+
 [agents]
 max_threads = 6
 max_depth = 1

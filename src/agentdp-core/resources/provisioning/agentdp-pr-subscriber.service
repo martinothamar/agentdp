@@ -1,0 +1,17 @@
+[Unit]
+Description=agentdp PR subscriber
+After=network-online.target
+After=agentdp-codex-session.service
+Wants=network-online.target agentdp-codex-session.service
+
+[Service]
+Type=simple
+Environment=AGENTDP_STATE_DIR=%h/.local/state/agentdp
+Environment=AGENTDP_PR_REGISTRY=%h/.local/state/agentdp/pr-watch.json
+Environment=AGENTDP_CODEX_PANE_FILE=%h/.local/state/agentdp/codex-pane-id
+ExecStart=/usr/local/bin/agentdp-agent-env %h/.local/bin/agentdp-pr-subscriber
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=default.target

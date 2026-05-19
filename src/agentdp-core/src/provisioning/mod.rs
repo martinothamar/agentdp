@@ -93,6 +93,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_github_manifest_installs_pr_loop_tools() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(manifest::standard()).unwrap();
+
+        let plan = ProvisioningPlan::from_manifest(&manifest).unwrap();
+
+        assert!(!plan.bootstrap.packages.iter().any(|package| package == "nodejs"));
+        assert!(plan.bootstrap.packages.iter().any(|package| package == "mise"));
+        assert!(plan.bootstrap.packages.iter().any(|package| package == "tmux"));
+        assert!(plan.bootstrap.script.contains("node@lts"));
+        assert!(plan.bootstrap.script.contains("[projects.\"/data/home/code\"]"));
+        assert!(plan.bootstrap.script.contains("trust_level = \"trusted\""));
+        assert!(plan.bootstrap.script.contains("loginctl enable-linger"));
+        assert!(plan.bootstrap.script.contains("agentdp-codex-session"));
+        assert!(plan.bootstrap.script.contains("agentdp-pr create"));
+        assert!(plan.bootstrap.script.contains("agentdp-pr-subscriber.service"));
+    }
+
     fn plan_snapshot(plan: &ProvisioningPlan) -> String {
         let mut output = String::new();
         let _ = writeln!(

@@ -1,5 +1,5 @@
 image: Archlinux X86_64 Cloud
-packages: git, sudo, docker, docker-compose, docker-buildx, mise, npm, github-cli, curl
+packages: git, sudo, cloud-guest-utils, gptfdisk, docker, docker-compose, docker-buildx, mise, github-cli, curl, tmux
 groups: docker
 repos:
   https://github.com/martinothamar-agent/altinn-studio.git -> altinn-studio
@@ -15,13 +15,15 @@ package_update: true
 packages:
 - git
 - sudo
+- cloud-guest-utils
+- gptfdisk
 - docker
 - docker-compose
 - docker-buildx
 - mise
-- npm
 - github-cli
 - curl
+- tmux
 users:
 - default
 - name: agent
@@ -64,6 +66,10 @@ write_files:
     if [ "${HOME:-}" = "/data/home" ] || [ "${USER:-}" = "agent" ]; then
       export AGENTDP_HOME='/data/home'
       export AGENTDP_CODE_DIR='/data/home/code'
+      if [ -d "/data/home/.local/share/mise/dotnet-root" ]; then
+        export DOTNET_ROOT="/data/home/.local/share/mise/dotnet-root"
+        export DOTNET_ROOT_X64="$DOTNET_ROOT"
+      fi
 
       agentdp_prepend_path() {
         case ":${PATH:-}:" in
@@ -73,6 +79,7 @@ write_files:
       }
 
       agentdp_prepend_path "/opt/mise/shims"
+      agentdp_prepend_path "/data/home/.dotnet/tools"
       agentdp_prepend_path "/data/home/.cargo/bin"
       agentdp_prepend_path "/data/home/go/bin"
       agentdp_prepend_path "/data/home/.local/share/mise/shims"
@@ -129,13 +136,63 @@ write_files:
       if [ -s "$tmp" ]; then printf '\n'; fi
       printf '%s\n' "$start"
       cat <<'AGENTDP_INFO_B64' | base64 -d
-    IyBhZ2VudGRwIGdlbmVyYXRlZCBjb250ZXh0CgpUaGlzIHNlY3Rpb24gaXMgZ2VuZXJhdGVkIGJ5IGFnZW50ZHAuIEVkaXQgc291cmNlIHNlZWQgZmlsZXMgYmVzaWRlIGBhZ2VudC55YW1sYCwgbm90IGdlbmVyYXRlZCBndWVzdCBmaWxlcy4KCiMjIEd1ZXN0CgotIG1hbmlmZXN0OiBhbHRpbm4tc3R1ZGlvCi0gaW1hZ2Uub3M6IEFyY2hsaW51eAotIGhvbWU6IC9kYXRhL2hvbWUKLSBjb2RlOiAvZGF0YS9ob21lL2NvZGUKCiMjIFBhY2thZ2VzCgotIGdpdAotIHN1ZG8KLSBkb2NrZXIKLSBkb2NrZXItY29tcG9zZQotIGRvY2tlci1idWlsZHgKLSBtaXNlCi0gbnBtCi0gZ2l0aHViLWNsaQotIGN1cmwKCiMjIFJlcG9zaXRvcmllcwoKLSBodHRwczovL2dpdGh1Yi5jb20vbWFydGlub3RoYW1hci1hZ2VudC9hbHRpbm4tc3R1ZGlvLmdpdCAtPiAvZGF0YS9ob21lL2NvZGUvYWx0aW5uLXN0dWRpbwoKIyMgSGVhbHRoY2hlY2tzCgotIGNvZGUtc2VydmVyOiB0Y3AgMTI3LjAuMC4xOjQwOTAgdGltZW91dD02MHMKLSBkb2NrZXI6IGNvbW1hbmQgZG9ja2VyIHBzIHRpbWVvdXQ9NjBzCgojIyBCb290c3RyYXAgU2hlbGwKCi0gYGlmIGNvbW1hbmQgLXYgbWlzZSA+L2Rldi9udWxsIDI+JjE7IHRoZW4KICBtaXNlIHVzZSAtLWdsb2JhbCAnbm9kZUBsdHMnCmZpYAotIGBpZiBbICEgLXggIiRIT01FLy5sb2NhbC9zaGFyZS9hZ2VudGRwL2NvZGV4L2Jpbi9jb2RleCIgXTsgdGhlbiBucG0gaW5zdGFsbCAtZyAtLXByZWZpeCAiJEhPTUUvLmxvY2FsL3NoYXJlL2FnZW50ZHAvY29kZXgiIEBvcGVuYWkvY29kZXhAbGF0ZXN0OyBmaWAKLSBgaW5zdGFsbCAtZCAtbSAwNzU1ICIkSE9NRS8ubG9jYWwvYmluIgpjYXQgPiIkSE9NRS8ubG9jYWwvYmluL2NvZGV4IiA8PCdFT0YnCiMhL3Vzci9iaW4vZW52IGJhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmNvZGV4X3JlYWw9IiRIT01FLy5sb2NhbC9zaGFyZS9hZ2VudGRwL2NvZGV4L2Jpbi9jb2RleCIKaWYgWyAhIC14ICIkY29kZXhfcmVhbCIgXTsgdGhlbgogIGVjaG8gImFnZW50ZHAgY29kZXggd3JhcHBlciBjb3VsZCBub3QgZmluZCAkY29kZXhfcmVhbCIgPiYyCiAgZXhpdCAxMjcKZmkKZXhlYyAiJGNvZGV4X3JlYWwiIC0tc2FuZGJveCBkYW5nZXItZnVsbC1hY2Nlc3MgLS1hc2stZm9yLWFwcHJvdmFsIG5ldmVyICIkQCIKRU9GCmNobW9kIDA3NTUgIiRIT01FLy5sb2NhbC9iaW4vY29kZXgiYAotIGBpZiBbIC1mICIkSE9NRS8uY29uZmlnL2doL2hvc3RzLnltbCIgXTsgdGhlbiBnaCBhdXRoIHNldHVwLWdpdCA+L2Rldi9udWxsIHx8IHRydWU7IGZpYAotIGBjb2RlLXNlcnZlciAtLWluc3RhbGwtZXh0ZW5zaW9uICdyZWRoYXQudnNjb2RlLXlhbWwnIHx8IHRydWVgCi0gYG5wbSBpbnN0YWxsIC1nIHBsYXl3cmlnaHRgCg==
+    IyBhZ2VudGRwIGdlbmVyYXRlZCBjb250ZXh0CgpUaGlzIHNlY3Rpb24gaXMgZ2VuZXJhdGVkIGJ5IGFnZW50ZHAuIEVkaXQgc291cmNlIHNlZWQgZmlsZXMgYmVzaWRlIGBhZ2VudC55YW1sYCwgbm90IGdlbmVyYXRlZCBndWVzdCBmaWxlcy4KCiMjIEd1ZXN0CgotIG1hbmlmZXN0OiBhbHRpbm4tc3R1ZGlvCi0gaW1hZ2Uub3M6IEFyY2hsaW51eAotIGhvbWU6IC9kYXRhL2hvbWUKLSBjb2RlOiAvZGF0YS9ob21lL2NvZGUKCiMjIFBhY2thZ2VzCgotIGdpdAotIHN1ZG8KLSBjbG91ZC1ndWVzdC11dGlscwotIGdwdGZkaXNrCi0gZG9ja2VyCi0gZG9ja2VyLWNvbXBvc2UKLSBkb2NrZXItYnVpbGR4Ci0gbWlzZQotIGdpdGh1Yi1jbGkKLSBjdXJsCi0gdG11eAoKIyMgUmVwb3NpdG9yaWVzCgotIGh0dHBzOi8vZ2l0aHViLmNvbS9tYXJ0aW5vdGhhbWFyLWFnZW50L2FsdGlubi1zdHVkaW8uZ2l0IC0+IC9kYXRhL2hvbWUvY29kZS9hbHRpbm4tc3R1ZGlvCgojIyBIZWFsdGhjaGVja3MKCi0gY29kZS1zZXJ2ZXI6IHRjcCAxMjcuMC4wLjE6NDA5MCB0aW1lb3V0PTYwcwotIGRvY2tlcjogY29tbWFuZCBkb2NrZXIgcHMgdGltZW91dD02MHMK
     AGENTDP_INFO_B64
       printf '%s\n' "$end"
     } >"$target"
     chown "$AGENTDP_USER:$AGENTDP_USER" "$target"
     rm -f "$tmp"
 
+    grow_agentdp_root() {
+      local root_source root_fstype parent partnum grow_output
+      root_source="$(findmnt -no SOURCE / || true)"
+      root_fstype="$(findmnt -no FSTYPE / || true)"
+      if [ -z "$root_source" ] || [ ! -b "$root_source" ]; then
+        echo "agentdp grow-root skipped: root source is not a block device: $root_source"
+        return 0
+      fi
+      parent="$(lsblk -no PKNAME "$root_source" | head -n1 || true)"
+      partnum="$(lsblk -no PARTN "$root_source" | head -n1 || true)"
+      if [ -z "$parent" ] || [ -z "$partnum" ]; then
+        echo "agentdp grow-root skipped: root source is not a partition: $root_source"
+        return 0
+      fi
+      echo "Growing root partition $root_source on /dev/$parent"
+      if ! grow_output="$(growpart "/dev/$parent" "$partnum" 2>&1)"; then
+        if ! printf '%s\n' "$grow_output" | grep -qi 'NOCHANGE'; then
+          printf '%s\n' "$grow_output" >&2
+          return 1
+        fi
+      fi
+      if [ -n "$grow_output" ]; then
+        printf '%s\n' "$grow_output"
+      fi
+      udevadm settle || true
+      case "$root_fstype" in
+        ext2|ext3|ext4)
+          resize2fs "$root_source"
+          ;;
+        xfs)
+          if command -v xfs_growfs >/dev/null 2>&1; then
+            xfs_growfs /
+          else
+            echo "agentdp grow-root skipped: xfs_growfs is not installed"
+          fi
+          ;;
+        btrfs)
+          if command -v btrfs >/dev/null 2>&1; then
+            btrfs filesystem resize max /
+          else
+            echo "agentdp grow-root skipped: btrfs is not installed"
+          fi
+          ;;
+        *)
+          echo "agentdp grow-root skipped: unsupported root filesystem: $root_fstype"
+          ;;
+      esac
+    }
+    grow_agentdp_root
+    unset -f grow_agentdp_root
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files docker.service >/dev/null 2>&1; then
       systemctl enable --now docker.service
     fi
@@ -161,6 +218,9 @@ write_files:
     EOF
     systemctl daemon-reload
     systemctl enable --now code-server.service
+    if command -v loginctl >/dev/null 2>&1; then
+      loginctl enable-linger 'agent' || true
+    fi
     chown -R "$AGENTDP_USER:$AGENTDP_USER" "$AGENTDP_HOME"
 
     AGENTDP_CUSTOM_BOOTSTRAP='/run/agentdp/bootstrap.sh'
@@ -194,6 +254,17 @@ write_files:
     run_agent 'if command -v mise >/dev/null 2>&1; then
       mise use --global '"'"'node@lts'"'"'
     fi'
+    run_agent 'mise use --global '"'"'node@lts'"'"'
+    install -d -m 0755 "$HOME/.codex"
+    config="$HOME/.codex/config.toml"
+    touch "$config"
+    if ! grep -Fqx '"'"'[projects."/data/home/code"]'"'"' "$config"; then
+      {
+        printf '"'"'\n'"'"'
+        printf '"'"'%s\n'"'"' '"'"'[projects."/data/home/code"]'"'"'
+        printf '"'"'%s\n'"'"' '"'"'trust_level = "trusted"'"'"'
+      } >>"$config"
+    fi'
     run_agent 'if [ ! -x "$HOME/.local/share/agentdp/codex/bin/codex" ]; then npm install -g --prefix "$HOME/.local/share/agentdp/codex" @openai/codex@latest; fi'
     run_agent 'install -d -m 0755 "$HOME/.local/bin"
     cat >"$HOME/.local/bin/codex" <<'"'"'EOF'"'"'
@@ -210,6 +281,560 @@ write_files:
     chmod 0755 "$HOME/.local/bin/codex"'
     run_agent 'if [ -f "$HOME/.config/gh/hosts.yml" ]; then gh auth setup-git >/dev/null || true; fi'
     run_agent 'code-server --install-extension '"'"'redhat.vscode-yaml'"'"' || true'
+    run_agent 'mise use --global '"'"'node@lts'"'"''
+    run_agent 'install -d -m 0755 "$HOME/.local/bin" "$HOME/.config/systemd/user" "$HOME/.local/state/agentdp"
+    cat >"$HOME/.local/bin/agentdp-codex-session" <<'"'"'EOF'"'"'
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    session="${AGENTDP_TMUX_SESSION:-agentdp}"
+    state_dir="${AGENTDP_STATE_DIR:-$HOME/.local/state/agentdp}"
+    pane_file="${AGENTDP_CODEX_PANE_FILE:-$state_dir/codex-pane-id}"
+    workdir="${AGENTDP_CODE_DIR:-$HOME/code}"
+
+    mkdir -p "$state_dir"
+
+    if ! tmux has-session -t "$session" >/dev/null 2>&1; then
+      tmux new-session -d -s "$session" -c "$workdir" "codex resume --last || codex"
+    fi
+
+    pane_id="$(tmux display-message -p -t "$session:0.0" '"'"'#{pane_id}'"'"')"
+    tmp="$pane_file.tmp"
+    printf '"'"'%s\n'"'"' "$pane_id" >"$tmp"
+    mv "$tmp" "$pane_file"
+    printf '"'"'%s\n'"'"' "$pane_id"
+    EOF
+    chmod 0755 "$HOME/.local/bin/agentdp-codex-session"
+    cat >"$HOME/.local/bin/agentdp-pr" <<'"'"'EOF'"'"'
+    #!/usr/bin/env node
+
+    const fs = require("fs");
+    const os = require("os");
+    const path = require("path");
+    const { spawnSync } = require("child_process");
+
+    const home = os.homedir();
+    const stateDir = process.env.AGENTDP_STATE_DIR || path.join(home, ".local/state/agentdp");
+    const registry = process.env.AGENTDP_PR_REGISTRY || path.join(stateDir, "pr-watch.json");
+
+    function usage() {
+      console.error(`Usage:
+      agentdp-pr create [gh pr create args...]
+      agentdp-pr register [pr-url]`);
+    }
+
+    function run(command, args, options = {}) {
+      const result = spawnSync(command, args, {
+        cwd: options.cwd || process.cwd(),
+        encoding: "utf8",
+        stdio: options.capture ? ["inherit", "pipe", "pipe"] : "inherit",
+      });
+      if (result.status !== 0) {
+        if (options.capture && result.stderr) {
+          process.stderr.write(result.stderr);
+        }
+        process.exit(result.status || 1);
+      }
+      return options.capture ? result.stdout.trim() : "";
+    }
+
+    function repoRoot() {
+      return run("git", ["rev-parse", "--show-toplevel"], { capture: true });
+    }
+
+    function currentBranch() {
+      return run("git", ["branch", "--show-current"], { capture: true });
+    }
+
+    function readRegistry() {
+      if (!fs.existsSync(registry)) {
+        return { version: 1, prs: [] };
+      }
+      return JSON.parse(fs.readFileSync(registry, "utf8"));
+    }
+
+    function writeRegistryAtomic(contents) {
+      fs.mkdirSync(path.dirname(registry), { recursive: true });
+      const tmp = `${registry}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, `${JSON.stringify(contents, null, 2)}\n`);
+      fs.renameSync(tmp, registry);
+    }
+
+    function ghPrView(target) {
+      const args = [
+        "pr",
+        "view",
+        target,
+        "--json",
+        "number,url,headRefName,baseRefName,title,state,updatedAt",
+      ];
+      return JSON.parse(run("gh", args, { capture: true }));
+    }
+
+    function register(target) {
+      const repo = repoRoot();
+      const branch = currentBranch();
+      const pr = ghPrView(target || branch);
+      const existing = readRegistry();
+      const prs = (existing.prs || []).filter((entry) => entry.url !== pr.url);
+      prs.push({
+        ...pr,
+        repo_path: repo,
+        branch,
+        registered_at: new Date().toISOString(),
+      });
+      writeRegistryAtomic({ version: 1, prs });
+      console.log(pr.url);
+    }
+
+    function wantsHelp(args) {
+      return args.includes("--help") || args.includes("-h");
+    }
+
+    function findPrUrl(output) {
+      return output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/)?.[0] || "";
+    }
+
+    const [command, ...args] = process.argv.slice(2);
+    switch (command) {
+      case "create":
+        if (wantsHelp(args)) {
+          run("gh", ["pr", "create", ...args]);
+          break;
+        }
+        {
+          const output = run("gh", ["pr", "create", ...args], { capture: true });
+          if (output) {
+            console.log(output);
+          }
+          register(findPrUrl(output));
+        }
+        break;
+      case "register":
+        if (wantsHelp(args)) {
+          usage();
+          break;
+        }
+        register(args[0] || "");
+        break;
+      case "help":
+      case "--help":
+      case "-h":
+      case undefined:
+        usage();
+        break;
+      default:
+        usage();
+        process.exit(2);
+    }
+    EOF
+    chmod 0755 "$HOME/.local/bin/agentdp-pr"
+    cat >"$HOME/.local/bin/agentdp-pr-subscriber" <<'"'"'EOF'"'"'
+    #!/usr/bin/env node
+
+    const crypto = require("crypto");
+    const fs = require("fs");
+    const os = require("os");
+    const path = require("path");
+    const { spawnSync } = require("child_process");
+
+    const home = os.homedir();
+    const stateDir = process.env.AGENTDP_STATE_DIR || path.join(home, ".local/state/agentdp");
+    const registryPath = process.env.AGENTDP_PR_REGISTRY || path.join(stateDir, "pr-watch.json");
+    const paneFile = process.env.AGENTDP_CODEX_PANE_FILE || path.join(stateDir, "codex-pane-id");
+    const seenPath = path.join(stateDir, "pr-subscriber-seen.json");
+    const queueDir = path.join(stateDir, "pr-subscriber-queue");
+    const pollSeconds = Number(process.env.AGENTDP_PR_POLL_SECONDS || "60");
+    const maxListedItems = 6;
+    const maxPreviewLength = 220;
+    const trustedAuthorAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]);
+    let cachedGhLogin;
+
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(queueDir, { recursive: true });
+
+    function run(command, args, options = {}) {
+      const result = spawnSync(command, args, {
+        cwd: options.cwd || process.cwd(),
+        encoding: "utf8",
+        input: options.input,
+        stdio: options.input === undefined ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+      });
+      if (result.status !== 0) {
+        return null;
+      }
+      return result.stdout;
+    }
+
+    function readJson(file, fallback) {
+      try {
+        return JSON.parse(fs.readFileSync(file, "utf8"));
+      } catch {
+        return fallback;
+      }
+    }
+
+    function writeJsonAtomic(file, value) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+      fs.renameSync(tmp, file);
+    }
+
+    function hash(value) {
+      return crypto.createHash("sha256").update(value).digest("hex");
+    }
+
+    function registeredPrs() {
+      const registry = readJson(registryPath, { prs: [] });
+      return Array.isArray(registry.prs) ? registry.prs : [];
+    }
+
+    function currentGhLogin() {
+      if (cachedGhLogin !== undefined) return cachedGhLogin;
+      cachedGhLogin = (run("gh", ["api", "user", "--jq", ".login"]) || "").trim();
+      return cachedGhLogin;
+    }
+
+    function authoredBySelf(item, selfLogin) {
+      return Boolean(selfLogin && item.author?.login === selfLogin);
+    }
+
+    function trustedAuthor(item) {
+      return trustedAuthorAssociations.has(item.authorAssociation || "");
+    }
+
+    function prView(url) {
+      const stdout = run("gh", [
+        "pr",
+        "view",
+        url,
+        "--json",
+        "number,title,state,url,headRefName,baseRefName,updatedAt,reviewDecision,statusCheckRollup,reviews,comments",
+      ]);
+      return stdout ? JSON.parse(stdout) : null;
+    }
+
+    function parsePrUrl(url) {
+      const match = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+      if (!match) return null;
+      return { owner: match[1], repo: match[2], number: match[3] };
+    }
+
+    function compactText(value) {
+      if (!value) return "";
+      const text = String(value)
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/<details[\s\S]*?<\/details>/gi, " [details omitted] ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      return text.length > maxPreviewLength ? `${text.slice(0, maxPreviewLength - 1)}...` : text;
+    }
+
+    function checkName(check) {
+      return check.name || check.context || check.workflowName || "unknown";
+    }
+
+    function checkState(check) {
+      return {
+        name: checkName(check),
+        status: check.status || check.state || null,
+        conclusion: check.conclusion || null,
+        url: check.detailsUrl || check.targetUrl || null,
+      };
+    }
+
+    function summarizedChecks(checks) {
+      const normalized = checks.map(checkState);
+      const failed = normalized.filter((check) => ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"].includes(check.conclusion));
+      const pending = normalized.filter((check) =>
+        check.conclusion === null && !["SUCCESS", "SKIPPED", "NEUTRAL"].includes(check.status),
+      );
+      const passed = normalized.filter((check) =>
+        ["SUCCESS", "SKIPPED", "NEUTRAL"].includes(check.conclusion) ||
+        check.status === "SUCCESS",
+      );
+      return {
+        total: normalized.length,
+        passed: passed.length,
+        failed: failed.slice(0, maxListedItems),
+        pending: pending.slice(0, maxListedItems),
+      };
+    }
+
+    function summarizedReviews(reviews, selfLogin) {
+      const normalized = reviews
+        .filter((review) => !authoredBySelf(review, selfLogin))
+        .map((review) => {
+          const trusted = trustedAuthor(review);
+          return {
+            author: review.author?.login || "unknown",
+            trusted,
+            state: review.state || "UNKNOWN",
+            submittedAt: review.submittedAt || null,
+            preview: trusted ? compactText(review.body || "") : "",
+          };
+        });
+      return {
+        total: normalized.length,
+        changesRequested: normalized.filter((review) => review.state === "CHANGES_REQUESTED").length,
+        approved: normalized.filter((review) => review.state === "APPROVED").length,
+        latest: normalized.slice(-maxListedItems),
+      };
+    }
+
+    function summarizedComments(comments, selfLogin) {
+      const normalized = comments
+        .filter((comment) => !authoredBySelf(comment, selfLogin))
+        .map((comment) => {
+          const trusted = trustedAuthor(comment);
+          return {
+            author: comment.author?.login || "unknown",
+            trusted,
+            updatedAt: comment.updatedAt || comment.createdAt || null,
+            url: comment.url || null,
+            preview: trusted ? compactText(comment.body || "") : "",
+          };
+        });
+      return {
+        total: normalized.length,
+        latest: normalized.slice(-3),
+      };
+    }
+
+    function prSummary(view, selfLogin) {
+      const checks = summarizedChecks(view.statusCheckRollup || []);
+      const reviews = summarizedReviews(view.reviews || [], selfLogin);
+      const comments = summarizedComments(view.comments || [], selfLogin);
+      const parsed = parsePrUrl(view.url);
+      return {
+        pr: {
+          number: view.number || parsed?.number || null,
+          title: view.title || "",
+          state: view.state || "",
+          url: view.url,
+          head: view.headRefName || "",
+          base: view.baseRefName || "",
+          updatedAt: view.updatedAt,
+          reviewDecision: view.reviewDecision || "UNKNOWN",
+        },
+        checks,
+        reviews,
+        comments,
+      };
+    }
+
+    function prFingerprint(view, selfLogin) {
+      return {
+        url: view.url,
+        updatedAt: view.updatedAt,
+        reviewDecision: view.reviewDecision,
+        checks: (view.statusCheckRollup || []).map(checkState),
+        reviews: (view.reviews || [])
+          .filter((review) => !authoredBySelf(review, selfLogin))
+          .map((review) => ({
+            author: review.author?.login || "unknown",
+            authorAssociation: review.authorAssociation || "",
+            state: review.state,
+            submittedAt: review.submittedAt,
+            body: trustedAuthor(review) ? review.body || "" : "",
+          })),
+        comments: (view.comments || [])
+          .filter((comment) => !authoredBySelf(comment, selfLogin))
+          .map((comment) => ({
+            author: comment.author?.login || "unknown",
+            authorAssociation: comment.authorAssociation || "",
+            updatedAt: comment.updatedAt || comment.createdAt || null,
+            url: comment.url || null,
+            body: trustedAuthor(comment) ? comment.body || "" : "",
+          })),
+      };
+    }
+
+    function bulletList(items, formatter, emptyText) {
+      if (!items.length) return `- ${emptyText}`;
+      return items.map((item) => `- ${formatter(item)}`).join("\n");
+    }
+
+    function checkLine(check) {
+      const status = check.conclusion || check.status || "unknown";
+      return `${check.name} (${status})${check.url ? ` ${check.url}` : ""}`;
+    }
+
+    function pendingCheckLine(check) {
+      return `${check.name} (${check.status || "pending"})${check.url ? ` ${check.url}` : ""}`;
+    }
+
+    function reviewLine(review) {
+      const submittedAt = review.submittedAt ? ` at ${review.submittedAt}` : "";
+      const preview = review.trusted && review.preview
+        ? ` - ${review.preview}`
+        : review.trusted
+          ? ""
+          : " - body omitted";
+      return `${review.author}: ${review.state}${submittedAt}${preview}`;
+    }
+
+    function commentLine(comment) {
+      const updatedAt = comment.updatedAt ? ` at ${comment.updatedAt}` : "";
+      const url = comment.url ? ` ${comment.url}` : "";
+      const preview = comment.trusted && comment.preview
+        ? ` - ${comment.preview}`
+        : comment.trusted
+          ? ""
+          : " - body omitted";
+      return `${comment.author}${updatedAt}${url}${preview}`;
+    }
+
+    function renderPrompt(summary) {
+      const pr = summary.pr;
+      const checks = summary.checks;
+      const reviews = summary.reviews;
+      const comments = summary.comments;
+      const failedCount = checks.failed.length;
+      const pendingCount = checks.pending.length;
+      const promptReason = failedCount > 0
+        ? "check failure"
+        : reviews.changesRequested > 0
+          ? "changes requested"
+          : comments.latest.length > 0
+            ? "new or updated PR comment"
+            : pendingCount > 0
+              ? "check status update"
+              : "PR status update";
+
+      return `<github_pr_summary_update>
+    Reason: ${promptReason}
+    PR: #${pr.number || "?"} ${pr.title}
+    URL: ${pr.url}
+    State: ${pr.state || "unknown"} | Review: ${pr.reviewDecision} | Branch: ${pr.head || "?"} -> ${pr.base || "?"}
+    Updated: ${pr.updatedAt || "unknown"}
+
+    Checks: ${checks.passed}/${checks.total} passed, ${checks.failed.length} failed, ${checks.pending.length} pending
+    Failed checks:
+    ${bulletList(checks.failed, checkLine, "none")}
+    Pending checks:
+    ${bulletList(checks.pending, pendingCheckLine, "none")}
+
+    Reviews: ${reviews.approved} approved, ${reviews.changesRequested} changes requested, ${reviews.total} total
+    Recent reviews:
+    ${bulletList(reviews.latest, reviewLine, "none")}
+
+    Top-level comments: ${comments.total} total
+    Recent comments:
+    ${bulletList(comments.latest, commentLine, "none")}
+    </github_pr_summary_update>
+    `;
+    }
+
+    function paneId() {
+      try {
+        return fs.readFileSync(paneFile, "utf8").trim();
+      } catch {
+        return "";
+      }
+    }
+
+    function paneExists(id) {
+      const panes = run("tmux", ["list-panes", "-a", "-F", "#{pane_id}"]);
+      return panes ? panes.split(/\r?\n/).includes(id) : false;
+    }
+
+    function injectPrompt(id, url, summary) {
+      const promptFile = path.join(stateDir, `pr-prompt.${process.pid}.txt`);
+      fs.writeFileSync(promptFile, renderPrompt(summary));
+      run("tmux", ["load-buffer", "-b", "agentdp-pr", promptFile]);
+      run("tmux", ["paste-buffer", "-b", "agentdp-pr", "-t", id, "-p", "-r"]);
+      run("tmux", ["send-keys", "-t", id, "Enter"]);
+      fs.rmSync(promptFile, { force: true });
+    }
+
+    function queuePrompt(key, url, summary) {
+      writeJsonAtomic(path.join(queueDir, `${key}.json`), { url, summary });
+    }
+
+    function clearQueuedPrompt(key) {
+      fs.rmSync(path.join(queueDir, `${key}.json`), { force: true });
+    }
+
+    function handlePr(entry) {
+      if (!entry.url) return;
+      const view = prView(entry.url);
+      if (!view) return;
+
+      const selfLogin = currentGhLogin();
+      const summary = prSummary(view, selfLogin);
+      const key = hash(entry.url);
+      const fingerprint = hash(JSON.stringify(prFingerprint(view, selfLogin)));
+      const seen = readJson(seenPath, { events: {} });
+      if (seen.events?.[key] === fingerprint) return;
+
+      const targetPane = paneId();
+      if (targetPane && paneExists(targetPane)) {
+        injectPrompt(targetPane, entry.url, summary);
+        clearQueuedPrompt(key);
+        seen.events = { ...(seen.events || {}), [key]: fingerprint };
+        writeJsonAtomic(seenPath, seen);
+      } else {
+        queuePrompt(key, entry.url, summary);
+      }
+    }
+
+    async function main() {
+      while (true) {
+        for (const pr of registeredPrs()) {
+          handlePr(pr);
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollSeconds * 1000));
+      }
+    }
+
+    main().catch((error) => {
+      console.error(error);
+      process.exit(1);
+    });
+    EOF
+    chmod 0755 "$HOME/.local/bin/agentdp-pr-subscriber"
+    cat >"$HOME/.config/systemd/user/agentdp-codex-session.service" <<'"'"'EOF'"'"'
+    [Unit]
+    Description=agentdp Codex tmux session
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    Environment=AGENTDP_STATE_DIR=%h/.local/state/agentdp
+    Environment=AGENTDP_CODEX_PANE_FILE=%h/.local/state/agentdp/codex-pane-id
+    ExecStart=/usr/local/bin/agentdp-agent-env %h/.local/bin/agentdp-codex-session
+
+    [Install]
+    WantedBy=default.target
+    EOF
+    cat >"$HOME/.config/systemd/user/agentdp-pr-subscriber.service" <<'"'"'EOF'"'"'
+    [Unit]
+    Description=agentdp PR subscriber
+    After=network-online.target
+    After=agentdp-codex-session.service
+    Wants=network-online.target agentdp-codex-session.service
+
+    [Service]
+    Type=simple
+    Environment=AGENTDP_STATE_DIR=%h/.local/state/agentdp
+    Environment=AGENTDP_PR_REGISTRY=%h/.local/state/agentdp/pr-watch.json
+    Environment=AGENTDP_CODEX_PANE_FILE=%h/.local/state/agentdp/codex-pane-id
+    ExecStart=/usr/local/bin/agentdp-agent-env %h/.local/bin/agentdp-pr-subscriber
+    Restart=always
+    RestartSec=20
+
+    [Install]
+    WantedBy=default.target
+    EOF'
+    run_agent 'agentdp-codex-session
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    systemctl --user daemon-reload || true
+    systemctl --user enable --now agentdp-codex-session.service agentdp-pr-subscriber.service || true'
     run_agent 'npm install -g playwright'
 runcmd:
 - - bash

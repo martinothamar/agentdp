@@ -4,10 +4,12 @@ use std::io::{Read, Write};
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use windows_sys::Win32::Networking::WinSock::{
-    AF_UNIX, FIONBIO, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSADATA,
-    WSAGetLastError, WSAStartup, accept, bind, closesocket, connect, ioctlsocket, listen, recv, send, socket,
+    AF_UNIX, FIONBIO, INVALID_SOCKET, SO_RCVTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR,
+    SOL_SOCKET, WSADATA, WSAGetLastError, WSAStartup, accept, bind, closesocket, connect, ioctlsocket, listen, recv,
+    send, setsockopt, socket,
 };
 
 const BACKLOG: i32 = 128;
@@ -41,6 +43,34 @@ impl UnixStream {
 
     fn from_raw(raw: SOCKET) -> Self {
         Self { socket: Socket { raw } }
+    }
+
+    /// Sets the read timeout for this stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if WinSock cannot apply the receive timeout.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        let millis = timeout
+            .map(|duration| u32::try_from(duration.as_millis()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        let optlen = i32::try_from(size_of_val(&millis)).unwrap_or(i32::MAX);
+        // SAFETY: `self.socket.raw` is a valid WinSock socket. `millis` is a
+        // DWORD receive timeout value that lives for the duration of the call.
+        let result = unsafe {
+            setsockopt(
+                self.socket.raw,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                std::ptr::from_ref(&millis).cast(),
+                optlen,
+            )
+        };
+        if result == SOCKET_ERROR {
+            Err(last_error())
+        } else {
+            Ok(())
+        }
     }
 }
 

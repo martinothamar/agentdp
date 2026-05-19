@@ -8,7 +8,7 @@ user:
   name: agent
 
 resources:
-  cpus: 4
+  cpus: 8
   memory: 16G
   storage: 40G
 
@@ -36,6 +36,14 @@ bootstrap:
     - htop
     - btop
     - dive
+    - strace
+    - gdb
+    - perf
+    - lsof
+    - tcpdump
+    - sysstat
+    - bpftrace
+    - bcc
     - just
     - hyperfine
     - step-cli
@@ -48,6 +56,7 @@ bootstrap:
     - kubectl
     - kubectx
     - helm
+    - hugo
     - fluxcd
     - k9s
     - ripgrep
@@ -61,11 +70,35 @@ bootstrap:
     - url: https://github.com/martinothamar-agent/app-lib-dotnet.git
     - url: https://github.com/martinothamar-agent/app-frontend-react.git
     - url: https://github.com/martinothamar-agent/app-localtest.git
+    - url: https://github.com/martinothamar-agent/altinn-studio-charts.git
+    - url: https://github.com/martinothamar-agent/altinn-file-scan.git
+    - url: https://github.com/martinothamar-agent/altinn-receipt.git
+    - url: https://github.com/martinothamar/agentdp.git
 
   healthchecks:
     - name: code-server
       tcp: 127.0.0.1:4090
       timeout: 30m
+
+  shell:
+    - |
+      for extension in github.copilot github.copilot-chat; do
+        code-server --uninstall-extension "$extension" >/dev/null 2>&1 || true
+      done
+      gh extension remove github/gh-copilot >/dev/null 2>&1 || true
+    - |
+      dotnet tool install --global dotnet-dump || dotnet tool update --global dotnet-dump
+      dotnet tool install --global dotnet-trace || dotnet tool update --global dotnet-trace
+      dotnet tool install --global dotnet-counters || dotnet tool update --global dotnet-counters
+      dotnet tool install --global dotnet-gcdump || dotnet tool update --global dotnet-gcdump
+      dotnet tool install --global dotnet-symbol || dotnet tool update --global dotnet-symbol
+      dotnet tool install --global dotnet-sos || dotnet tool update --global dotnet-sos
+      dotnet sos install || true
+    - |
+      npm config set prefix "$HOME/.local"
+      npm install -g playwright@latest @playwright/test@latest @playwright/mcp@latest
+      playwright install chromium
+    - go install sigs.k8s.io/kind@latest
 
 plugins:
   docker:

@@ -1,6 +1,7 @@
 use std::ffi::OsString;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ use thiserror::Error;
 const SERVER_PATH_ENV: &str = "AGENTDP_SERVER_PATH";
 const START_RETRY_COUNT: usize = 40;
 const START_RETRY_DELAY: Duration = Duration::from_millis(50);
+const RESPONSE_TIMEOUT_ENV: &str = "AGENTDP_SERVER_RESPONSE_TIMEOUT_MS";
+const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -36,6 +39,8 @@ pub enum Error {
     Terminate(#[from] platform::TerminateProcessError),
     #[error("agentdp-server did not stop after termination request")]
     ServerStillRunning,
+    #[error("agentdp-server did not respond within {timeout_ms}ms")]
+    ServerResponseTimedOut { timeout_ms: u128 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +66,7 @@ pub enum Stop {
 pub fn ensure_running(context: &Context, paths: &PlatformPaths) -> Result<Ping, Error> {
     match ping(paths) {
         Ok(ping) => return Ok(ping),
+        Err(Error::ServerResponseTimedOut { .. }) if cleanup_unowned_server_socket(context, paths)? => {}
         Err(error) if should_start_after_ping_error(&error) => {
             context
                 .logger()
@@ -98,6 +104,9 @@ pub fn stop_if_running(context: &Context, paths: &PlatformPaths) -> Result<Stop,
     let ping = match ping(paths) {
         Ok(ping) => ping,
         Err(Error::Socket(LocalSocketError::Unsupported)) => return Ok(Stop::NotRunning),
+        Err(Error::ServerResponseTimedOut { .. }) if cleanup_unowned_server_socket(context, paths)? => {
+            return Ok(Stop::NotRunning);
+        }
         Err(error) if should_start_after_ping_error(&error) => return Ok(Stop::NotRunning),
         Err(error) => return Err(error),
     };
@@ -138,16 +147,26 @@ fn ping(paths: &PlatformPaths) -> Result<Ping, Error> {
 fn send<T: DeserializeOwned>(
     paths: &PlatformPaths,
     request: &Request,
+    on_event: Option<&mut dyn FnMut(Event)>,
+) -> Result<T, Error> {
+    send_with_timeout(paths, request, on_event, response_timeout())
+}
+
+fn send_with_timeout<T: DeserializeOwned>(
+    paths: &PlatformPaths,
+    request: &Request,
     mut on_event: Option<&mut dyn FnMut(Event)>,
+    response_timeout: Duration,
 ) -> Result<T, Error> {
     let mut stream = platform::connect_local_socket(&paths.socket_path())?;
+    stream.set_read_timeout(Some(response_timeout))?;
     stream.write_all(protocol::encode_line(&request)?.as_bytes())?;
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        if read_response_line(&mut reader, &mut line, response_timeout)? == 0 {
             return Err(Error::InvalidResponse(
                 "server closed connection before response".to_owned(),
             ));
@@ -177,6 +196,25 @@ fn send<T: DeserializeOwned>(
             }
         }
     }
+}
+
+fn read_response_line(
+    reader: &mut BufReader<platform::LocalSocket>,
+    line: &mut String,
+    timeout: Duration,
+) -> Result<usize, Error> {
+    reader.read_line(line).map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            Error::ServerResponseTimedOut {
+                timeout_ms: timeout.as_millis(),
+            }
+        } else {
+            Error::Io(error)
+        }
+    })
 }
 
 fn decode_response<T: DeserializeOwned>(request: &Request, response: protocol::Response) -> Result<T, Error> {
@@ -274,6 +312,54 @@ const fn should_start_after_ping_error(error: &Error) -> bool {
     matches!(error, Error::Socket(LocalSocketError::Io(_)) | Error::Io(_))
 }
 
+fn response_timeout() -> Duration {
+    std::env::var(RESPONSE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(DEFAULT_RESPONSE_TIMEOUT, Duration::from_millis)
+}
+
+fn cleanup_unowned_server_socket(context: &Context, paths: &PlatformPaths) -> Result<bool, Error> {
+    let socket = paths.socket_path();
+    let lock = socket.with_extension("lock");
+    if live_lock_owner(&lock) {
+        return Ok(false);
+    }
+
+    context.logger().verbose_with(|| {
+        format!(
+            "removing unresponsive agentdp-server socket without a live lock owner: {}",
+            socket.display()
+        )
+    });
+    remove_file_if_exists(&socket)?;
+    remove_file_if_exists(&lock)?;
+    Ok(true)
+}
+
+fn live_lock_owner(lock: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(lock) else {
+        return false;
+    };
+    let Some(pid) = contents.lines().find_map(lock_owner_pid_from_line) else {
+        return false;
+    };
+    matches!(platform::process_status(pid), Ok(platform::ProcessStatus::Running))
+}
+
+fn lock_owner_pid_from_line(line: &str) -> Option<u32> {
+    line.strip_prefix("pid=")?.trim().parse().ok()
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 fn resolve_server_binary() -> Result<PathBuf, Error> {
     if let Some(path) = std::env::var_os(SERVER_PATH_ENV).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
@@ -289,4 +375,61 @@ fn resolve_server_binary() -> Result<PathBuf, Error> {
     }
 
     platform::find_binary(&format!("agentdp-server{}", std::env::consts::EXE_SUFFIX)).ok_or(Error::ServerNotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn send_times_out_when_server_accepts_without_response() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = ShortTempDir::create()?;
+        let paths = PlatformPaths {
+            data: temp.path.join("data"),
+            config: temp.path.join("config"),
+            cache: temp.path.join("cache"),
+            runtime: temp.path.join("run"),
+            logs: temp.path.join("logs"),
+        };
+        let listener = platform::bind_local_socket(&paths.socket_path())?;
+        let server = std::thread::spawn(move || {
+            let Ok(_stream) = listener.accept() else {
+                return;
+            };
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let request = protocol::request(RequestKind::ServerPing);
+        let result: Result<PingResult, Error> = send_with_timeout(&paths, &request, None, Duration::from_millis(50));
+
+        assert!(matches!(result, Err(Error::ServerResponseTimedOut { timeout_ms: 50 })));
+        let _result = server.join();
+        Ok(())
+    }
+
+    struct ShortTempDir {
+        path: PathBuf,
+    }
+
+    impl ShortTempDir {
+        fn create() -> Result<Self, Box<dyn std::error::Error>> {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let leaf = if cfg!(target_os = "windows") {
+                format!("adp{:x}{timestamp:x}", std::process::id())
+            } else {
+                format!("agentdp-server-client-{:x}-{timestamp:x}", std::process::id())
+            };
+            let path = std::env::temp_dir().join(leaf);
+            fs::create_dir(&path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for ShortTempDir {
+        fn drop(&mut self) {
+            let _result = fs::remove_dir_all(&self.path);
+        }
+    }
 }

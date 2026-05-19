@@ -2,6 +2,7 @@ mod codex;
 mod docker;
 mod github;
 mod mise;
+mod pr_loop;
 mod vscode;
 
 use crate::manifest::plugins::Plugins;
@@ -23,6 +24,9 @@ pub(super) fn apply(plugins: &Plugins, builder: &mut ProvisioningBuilder<'_>) {
     }
     if let Some(vscode) = &plugins.vscode {
         vscode.apply(builder);
+    }
+    if let (Some(codex), Some(github)) = (&plugins.codex, &plugins.github) {
+        pr_loop::PrLoop::new(codex, github).apply(builder);
     }
 }
 
