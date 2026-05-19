@@ -26,7 +26,7 @@ terminal_resize_reflow = true
 goals = true
 
 [tui]
-status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used"]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used", "five-hour-limit", "weekly-limit"]
 
 [tui.keymap.editor]
 insert_newline = ["ctrl-j", "ctrl-m", "enter", "shift-enter", "alt-enter"]
