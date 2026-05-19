@@ -301,6 +301,14 @@ fn start_from(context: &Context, paths: &PlatformPaths, server: &std::path::Path
 fn stop_running(context: &Context, paths: &PlatformPaths, running: &Ping) -> Result<(), Error> {
     match shutdown(paths) {
         Ok(()) => {}
+        Err(Error::ServerResponseTimedOut { .. }) => {
+            context.logger().verbose_with(|| {
+                format!(
+                    "timed out waiting for agentdp-server pid {} shutdown response; checking whether it exited",
+                    running.pid
+                )
+            });
+        }
         Err(Error::Server { code, .. }) if code == "unknown_method" => {
             context
                 .logger()
@@ -311,14 +319,25 @@ fn stop_running(context: &Context, paths: &PlatformPaths, running: &Ping) -> Res
         Err(error) => return Err(error),
     }
 
-    for _attempt in 0..START_RETRY_COUNT {
-        match ping(paths) {
-            Ok(_) => thread::sleep(START_RETRY_DELAY),
-            Err(error) if should_start_after_ping_error(&error) => return Ok(()),
-            Err(error) => return Err(error),
-        }
+    if platform::wait_for_process_exit(running.pid, SERVER_STOP_TIMEOUT)? {
+        remove_file_if_exists(&paths.socket_path())?;
+        remove_file_if_exists(&paths.socket_path().with_extension("lock"))?;
+        return Ok(());
     }
-    Err(Error::ServerStillRunning)
+
+    context.logger().verbose_with(|| {
+        format!(
+            "agentdp-server pid {} did not exit after shutdown request; terminating",
+            running.pid
+        )
+    });
+    platform::terminate_process(running.pid)?;
+    if !platform::wait_for_process_exit(running.pid, SERVER_STOP_TIMEOUT)? {
+        return Err(Error::ServerStillRunning);
+    }
+    remove_file_if_exists(&paths.socket_path())?;
+    remove_file_if_exists(&paths.socket_path().with_extension("lock"))?;
+    Ok(())
 }
 
 fn shutdown(paths: &PlatformPaths) -> Result<(), Error> {
