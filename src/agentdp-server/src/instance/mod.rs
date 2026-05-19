@@ -75,6 +75,22 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to render cloned cloud-init meta-data: {0}")]
+    RenderClonedMetaData(#[source] agentdp_core::provisioning::cloud_init::Error),
+    #[error("failed to read cloned cloud-init user-data {path}: {source}")]
+    ReadClonedUserData {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write cloned cloud-init meta-data {path}: {source}")]
+    WriteClonedMetaData {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write cloned cloud-init seed media: {0}")]
+    WriteClonedSeedMedia(#[source] crate::backend::seed_media::Error),
     #[error("{0}")]
     Terminate(#[from] platform::TerminateProcessError),
     #[error("{0}")]

@@ -108,6 +108,16 @@ fn clone_copies_stopped_instance_with_target_runtime_state() {
             .replace("\r\n", "\n"),
         "fake qcow2\n"
     );
+    assert_eq!(
+        fs::read_to_string(&target_state.backend.qemu().seed_meta_data).unwrap(),
+        "instance-id: altinn-studio\nlocal-hostname: pr-1\n"
+    );
+    let seed_media = fs::read(&target_state.backend.qemu().seed_media).unwrap();
+    assert!(
+        seed_media
+            .windows(b"local-hostname: pr-1".len())
+            .any(|window| window == b"local-hostname: pr-1")
+    );
 }
 
 #[test]

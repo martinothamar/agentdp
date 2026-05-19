@@ -69,6 +69,7 @@ pub(super) fn prepare_manifest_with_keygen(
     let provisioning_plan = ProvisioningPlan::from_manifest_with_options(
         &manifest,
         &ProvisioningOptions {
+            hostname: Some(instance.clone()),
             ssh_authorized_key: Some(guest_access.public_key_contents.clone()),
             seed_files,
         },
@@ -214,7 +215,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(meta_data).unwrap(),
-            "instance-id: altinn-studio\nlocal-hostname: altinn-studio\n"
+            "instance-id: altinn-studio\nlocal-hostname: pr-0\n"
         );
         let user_data = fs::read_to_string(user_data).unwrap();
         assert!(user_data.starts_with("#cloud-config\n"));

@@ -24,6 +24,7 @@ pub struct ProvisioningPlan {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProvisioningOptions {
+    pub hostname: Option<String>,
     pub ssh_authorized_key: Option<String>,
     pub seed_files: Vec<SeedFile>,
 }
@@ -60,7 +61,8 @@ impl ProvisioningPlan {
     /// Returns an error if generated provisioning artifacts cannot be serialized.
     pub fn from_manifest_with_options(manifest: &AgentManifest, options: &ProvisioningOptions) -> Result<Self, Error> {
         let image = ImageCatalog::resolve(ImageRequest::from_manifest(manifest));
-        let bootstrap = BootstrapPlan::from_manifest(manifest);
+        let hostname = options.hostname.as_deref().unwrap_or(&manifest.name);
+        let bootstrap = BootstrapPlan::from_manifest_with_hostname(manifest, hostname);
         let cloud_init = CloudInitSeed::from_plan(manifest, &bootstrap, options)?;
         Ok(Self {
             image,

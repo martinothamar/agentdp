@@ -136,7 +136,7 @@ write_files:
       if [ -s "$tmp" ]; then printf '\n'; fi
       printf '%s\n' "$start"
       cat <<'AGENTDP_INFO_B64' | base64 -d
-    IyBhZ2VudGRwIGdlbmVyYXRlZCBjb250ZXh0CgpUaGlzIHNlY3Rpb24gaXMgZ2VuZXJhdGVkIGJ5IGFnZW50ZHAuIEVkaXQgc291cmNlIHNlZWQgZmlsZXMgYmVzaWRlIGBhZ2VudC55YW1sYCwgbm90IGdlbmVyYXRlZCBndWVzdCBmaWxlcy4KCiMjIEd1ZXN0CgotIG1hbmlmZXN0OiBhbHRpbm4tc3R1ZGlvCi0gaW1hZ2Uub3M6IEFyY2hsaW51eAotIGhvbWU6IC9kYXRhL2hvbWUKLSBjb2RlOiAvZGF0YS9ob21lL2NvZGUKCiMjIFBhY2thZ2VzCgotIGdpdAotIHN1ZG8KLSBjbG91ZC1ndWVzdC11dGlscwotIGdwdGZkaXNrCi0gZG9ja2VyCi0gZG9ja2VyLWNvbXBvc2UKLSBkb2NrZXItYnVpbGR4Ci0gbWlzZQotIGdpdGh1Yi1jbGkKLSBjdXJsCi0gdG11eAoKIyMgUmVwb3NpdG9yaWVzCgotIGh0dHBzOi8vZ2l0aHViLmNvbS9tYXJ0aW5vdGhhbWFyLWFnZW50L2FsdGlubi1zdHVkaW8uZ2l0IC0+IC9kYXRhL2hvbWUvY29kZS9hbHRpbm4tc3R1ZGlvCgojIyBIZWFsdGhjaGVja3MKCi0gY29kZS1zZXJ2ZXI6IHRjcCAxMjcuMC4wLjE6NDA5MCB0aW1lb3V0PTYwcwotIGRvY2tlcjogY29tbWFuZCBkb2NrZXIgcHMgdGltZW91dD02MHMK
+    IyBhZ2VudGRwIGdlbmVyYXRlZCBjb250ZXh0CgpUaGlzIHNlY3Rpb24gaXMgZ2VuZXJhdGVkIGJ5IGFnZW50ZHAuIEVkaXQgc291cmNlIHNlZWQgZmlsZXMgYmVzaWRlIGBhZ2VudC55YW1sYCwgbm90IGdlbmVyYXRlZCBndWVzdCBmaWxlcy4KCiMjIEd1ZXN0CgotIG1hbmlmZXN0OiBhbHRpbm4tc3R1ZGlvCi0gaG9zdG5hbWU6IGFsdGlubi1zdHVkaW8KLSBpbWFnZS5vczogQXJjaGxpbnV4Ci0gaG9tZTogL2RhdGEvaG9tZQotIGNvZGU6IC9kYXRhL2hvbWUvY29kZQoKIyMgUGFja2FnZXMKCi0gZ2l0Ci0gc3VkbwotIGNsb3VkLWd1ZXN0LXV0aWxzCi0gZ3B0ZmRpc2sKLSBkb2NrZXIKLSBkb2NrZXItY29tcG9zZQotIGRvY2tlci1idWlsZHgKLSBtaXNlCi0gZ2l0aHViLWNsaQotIGN1cmwKLSB0bXV4CgojIyBSZXBvc2l0b3JpZXMKCi0gaHR0cHM6Ly9naXRodWIuY29tL21hcnRpbm90aGFtYXItYWdlbnQvYWx0aW5uLXN0dWRpby5naXQgLT4gL2RhdGEvaG9tZS9jb2RlL2FsdGlubi1zdHVkaW8KCiMjIEhlYWx0aGNoZWNrcwoKLSBjb2RlLXNlcnZlcjogdGNwIDEyNy4wLjAuMTo0MDkwIHRpbWVvdXQ9NjBzCi0gZG9ja2VyOiBjb21tYW5kIGRvY2tlciBwcyB0aW1lb3V0PTYwcwo=
     AGENTDP_INFO_B64
       printf '%s\n' "$end"
     } >"$target"
@@ -193,6 +193,52 @@ write_files:
     }
     grow_agentdp_root
     unset -f grow_agentdp_root
+    install -d -m 0755 /usr/local/lib/agentdp
+    cat >/usr/local/lib/agentdp/sync-hostname-from-seed.sh <<'EOF'
+    #!/usr/bin/env sh
+    set -eu
+    device="$(blkid -L CIDATA 2>/dev/null || blkid -L cidata 2>/dev/null || true)"
+    [ -n "$device" ] || exit 0
+    mount_dir="$(mktemp -d)"
+    cleanup() {
+      umount "$mount_dir" >/dev/null 2>&1 || true
+      rmdir "$mount_dir" >/dev/null 2>&1 || true
+    }
+    trap cleanup EXIT
+    mount -o ro "$device" "$mount_dir" >/dev/null 2>&1 || exit 0
+    hostname="$(sed -n 's/^local-hostname:[[:space:]]*//p' "$mount_dir/meta-data" 2>/dev/null | head -n1 | tr -d "\"'")"
+    case "$hostname" in
+      ""|.*|-*|*-|*[!A-Za-z0-9.-]*) exit 0 ;;
+    esac
+    hostnamectl set-hostname "$hostname" || printf '%s\n' "$hostname" >/etc/hostname
+    agents='/data/home/.codex/AGENTS.md'
+    if [ -f "$agents" ]; then
+      tmp="$(mktemp)"
+      awk -v hostname="$hostname" '
+        $0 == "<!-- agentdp-info:start -->" { in_block = 1 }
+        in_block && $0 ~ /^- hostname: / { print "- hostname: " hostname; next }
+        $0 == "<!-- agentdp-info:end -->" { in_block = 0 }
+        { print }
+      ' "$agents" >"$tmp" && cat "$tmp" >"$agents"
+      rm -f "$tmp"
+    fi
+    EOF
+    chmod 0755 /usr/local/lib/agentdp/sync-hostname-from-seed.sh
+    cat >/etc/systemd/system/agentdp-hostname.service <<'EOF'
+    [Unit]
+    Description=Sync agentdp guest hostname from cloud-init seed
+    After=local-fs.target
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/lib/agentdp/sync-hostname-from-seed.sh
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    systemctl daemon-reload
+    systemctl enable agentdp-hostname.service
+    /usr/local/lib/agentdp/sync-hostname-from-seed.sh || true
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files docker.service >/dev/null 2>&1; then
       systemctl enable --now docker.service
     fi

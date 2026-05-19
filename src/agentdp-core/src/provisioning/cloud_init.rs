@@ -28,8 +28,9 @@ impl CloudInitSeed {
         bootstrap: &BootstrapPlan,
         options: &super::ProvisioningOptions,
     ) -> Result<Self, Error> {
+        let hostname = options.hostname.as_deref().unwrap_or(&manifest.name);
         Ok(Self {
-            meta_data: render_meta_data(&manifest.name)?,
+            meta_data: render_meta_data(&manifest.name, hostname)?,
             user_data: render_user_data(
                 &bootstrap.packages,
                 &bootstrap.user,
@@ -86,10 +87,15 @@ struct WriteFile {
     content: String,
 }
 
-fn render_meta_data(name: &str) -> Result<String, Error> {
+/// Renders cloud-init `NoCloud` metadata for an instance.
+///
+/// # Errors
+///
+/// Returns an error when the metadata cannot be serialized as YAML.
+pub fn render_meta_data(instance_id: &str, hostname: &str) -> Result<String, Error> {
     let meta_data = MetaData {
-        instance_id: name,
-        local_hostname: hostname_from_name(name),
+        instance_id,
+        local_hostname: hostname_from_name(hostname),
     };
     serde_yaml::to_string(&meta_data).map_err(Error::MetaData)
 }
@@ -159,11 +165,11 @@ mod tests {
 
     #[test]
     fn meta_data_is_structured_yaml() {
-        let meta_data = render_meta_data("agent.example_1").unwrap();
+        let meta_data = render_meta_data("agent.example_1", "pr_0").unwrap();
         let parsed = serde_yaml::from_str::<Value>(&meta_data).unwrap();
 
         assert_eq!(parsed["instance-id"], Value::from("agent.example_1"));
-        assert_eq!(parsed["local-hostname"], Value::from("agent-example-1"));
+        assert_eq!(parsed["local-hostname"], Value::from("pr-0"));
     }
 
     #[test]

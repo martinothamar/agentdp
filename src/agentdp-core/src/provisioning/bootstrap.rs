@@ -21,8 +21,8 @@ pub struct BootstrapPlan {
 }
 
 impl BootstrapPlan {
-    pub(crate) fn from_manifest(manifest: &AgentManifest) -> Self {
-        ProvisioningBuilder::from_manifest(manifest).build()
+    pub(crate) fn from_manifest_with_hostname(manifest: &AgentManifest, hostname: &str) -> Self {
+        ProvisioningBuilder::from_manifest(manifest, hostname).build()
     }
 }
 
@@ -35,6 +35,7 @@ pub struct AgentUserPlan {
 
 pub(super) struct ProvisioningBuilder<'a> {
     manifest: &'a AgentManifest,
+    hostname: String,
     user: AgentUserPlan,
     packages: Vec<String>,
     repos: Vec<RepoCheckout>,
@@ -44,7 +45,7 @@ pub(super) struct ProvisioningBuilder<'a> {
 }
 
 impl<'a> ProvisioningBuilder<'a> {
-    fn from_manifest(manifest: &'a AgentManifest) -> Self {
+    fn from_manifest(manifest: &'a AgentManifest, hostname: &str) -> Self {
         let repos = manifest
             .bootstrap
             .repos
@@ -68,6 +69,7 @@ impl<'a> ProvisioningBuilder<'a> {
 
         Self {
             manifest,
+            hostname: hostname.to_owned(),
             user: AgentUserPlan {
                 name: manifest.user.name.clone(),
                 home: AGENT_HOME.to_owned(),
@@ -83,20 +85,22 @@ impl<'a> ProvisioningBuilder<'a> {
 
     fn build(mut self) -> BootstrapPlan {
         self.add_root_shell(render_grow_root_filesystem());
+        self.add_root_shell(render_hostname_sync_service(&self.user));
         super::plugins::apply(&self.manifest.plugins, &mut self);
         self.add_agent_shell_lines(self.manifest.bootstrap.shell.iter().cloned());
         self.user.groups = dedupe(self.user.groups);
         let packages = dedupe(self.packages);
 
-        let script = render_bootstrap_script(
-            self.manifest,
-            &self.user,
-            &packages,
-            &self.repos,
-            &self.healthchecks,
-            &self.root_shell,
-            &self.agent_shell,
-        );
+        let script = render_bootstrap_script(&BootstrapScriptInput {
+            manifest: self.manifest,
+            hostname: &self.hostname,
+            user: &self.user,
+            packages: &packages,
+            repos: &self.repos,
+            healthchecks: &self.healthchecks,
+            root_shell: &self.root_shell,
+            agent_shell: &self.agent_shell,
+        });
 
         BootstrapPlan {
             user: self.user,
@@ -203,22 +207,25 @@ impl std::fmt::Display for HealthcheckKind {
     }
 }
 
-fn render_bootstrap_script(
-    manifest: &AgentManifest,
-    user: &AgentUserPlan,
-    packages: &[String],
-    repos: &[RepoCheckout],
-    healthchecks: &[HealthcheckPlan],
-    root_shell: &[String],
-    agent_shell: &[String],
-) -> String {
+struct BootstrapScriptInput<'a> {
+    manifest: &'a AgentManifest,
+    hostname: &'a str,
+    user: &'a AgentUserPlan,
+    packages: &'a [String],
+    repos: &'a [RepoCheckout],
+    healthchecks: &'a [HealthcheckPlan],
+    root_shell: &'a [String],
+    agent_shell: &'a [String],
+}
+
+fn render_bootstrap_script(input: &BootstrapScriptInput<'_>) -> String {
     let mut script = shell::ShellScript::new();
-    script.block(&render_bootstrap_preamble(user));
+    script.block(&render_bootstrap_preamble(input.user));
     script.blank();
-    script.block(&render_agent_env_install(user));
+    script.block(&render_agent_env_install(input.user));
     script.blank();
 
-    for group in &user.groups {
+    for group in &input.user.groups {
         script.line(format!(
             "if getent group {} >/dev/null 2>&1 && id \"$AGENTDP_USER\" >/dev/null 2>&1; then",
             shell::single_quote(group)
@@ -233,11 +240,17 @@ fn render_bootstrap_script(
     script.blank();
     script.block(templates::BOOTSTRAP_HELPERS);
     script.blank();
-    script.block(&render_harness_information(manifest, packages, repos, healthchecks));
+    script.block(&render_harness_information(
+        input.manifest,
+        input.hostname,
+        input.packages,
+        input.repos,
+        input.healthchecks,
+    ));
     script.blank();
 
-    if !root_shell.is_empty() {
-        for block in root_shell {
+    if !input.root_shell.is_empty() {
+        for block in input.root_shell {
             script.block(block);
         }
         script.line("chown -R \"$AGENTDP_USER:$AGENTDP_USER\" \"$AGENTDP_HOME\"");
@@ -247,7 +260,7 @@ fn render_bootstrap_script(
     script.block(&render_custom_bootstrap_hook());
     script.blank();
 
-    for repo in repos {
+    for repo in input.repos {
         script.line(format!(
             "target=\"$AGENTDP_CODE_DIR/{}\"",
             shell::double_quoted_fragment(&repo.path)
@@ -256,7 +269,7 @@ fn render_bootstrap_script(
         script.blank();
     }
 
-    for command in agent_shell {
+    for command in input.agent_shell {
         script.line(format!("run_agent {}", shell::single_quote(command)));
     }
     script.blank();
@@ -290,11 +303,12 @@ fn render_custom_bootstrap_hook() -> String {
 
 fn render_harness_information(
     manifest: &AgentManifest,
+    hostname: &str,
     packages: &[String],
     repos: &[RepoCheckout],
     healthchecks: &[HealthcheckPlan],
 ) -> String {
-    let info = harness_information(manifest, packages, repos, healthchecks);
+    let info = harness_information(manifest, hostname, packages, repos, healthchecks);
     let encoded_info = BASE64.encode(info);
     let mut script = shell::ShellScript::new();
     script.line("target=\"$AGENTDP_HOME/.codex/AGENTS.md\"");
@@ -327,6 +341,7 @@ fn render_harness_information(
 
 fn harness_information(
     manifest: &AgentManifest,
+    hostname: &str,
     packages: &[String],
     repos: &[RepoCheckout],
     healthchecks: &[HealthcheckPlan],
@@ -338,6 +353,7 @@ fn harness_information(
     output.push_str("This section is generated by agentdp. Edit source seed files beside `agent.yaml`, not generated guest files.\n\n");
     output.push_str("## Guest\n\n");
     let _ = writeln!(&mut output, "- manifest: {}", manifest.name);
+    let _ = writeln!(&mut output, "- hostname: {hostname}");
     let _ = writeln!(&mut output, "- image.os: {:?}", manifest.image.os);
     output.push_str("- home: /data/home\n");
     output.push_str("- code: /data/home/code\n\n");
@@ -459,6 +475,64 @@ fn render_grow_root_filesystem() -> String {
     script.render()
 }
 
+fn render_hostname_sync_service(user: &AgentUserPlan) -> String {
+    let mut script = shell::ShellScript::new();
+    script.line("install -d -m 0755 /usr/local/lib/agentdp");
+    script.line("cat >/usr/local/lib/agentdp/sync-hostname-from-seed.sh <<'EOF'");
+    script.line("#!/usr/bin/env sh");
+    script.line("set -eu");
+    script.line("device=\"$(blkid -L CIDATA 2>/dev/null || blkid -L cidata 2>/dev/null || true)\"");
+    script.line("[ -n \"$device\" ] || exit 0");
+    script.line("mount_dir=\"$(mktemp -d)\"");
+    script.line("cleanup() {");
+    script.line("  umount \"$mount_dir\" >/dev/null 2>&1 || true");
+    script.line("  rmdir \"$mount_dir\" >/dev/null 2>&1 || true");
+    script.line("}");
+    script.line("trap cleanup EXIT");
+    script.line("mount -o ro \"$device\" \"$mount_dir\" >/dev/null 2>&1 || exit 0");
+    script.line(
+        "hostname=\"$(sed -n 's/^local-hostname:[[:space:]]*//p' \"$mount_dir/meta-data\" 2>/dev/null | head -n1 | tr -d \"\\\"'\")\"",
+    );
+    script.line("case \"$hostname\" in");
+    script.line("  \"\"|.*|-*|*-|*[!A-Za-z0-9.-]*) exit 0 ;;");
+    script.line("esac");
+    script.line("hostnamectl set-hostname \"$hostname\" || printf '%s\\n' \"$hostname\" >/etc/hostname");
+    script.line(format!(
+        "agents={}",
+        shell::single_quote(&format!("{}/.codex/AGENTS.md", user.home))
+    ));
+    script.line("if [ -f \"$agents\" ]; then");
+    script.line("  tmp=\"$(mktemp)\"");
+    script.block(
+        "  awk -v hostname=\"$hostname\" '
+    $0 == \"<!-- agentdp-info:start -->\" { in_block = 1 }
+    in_block && $0 ~ /^- hostname: / { print \"- hostname: \" hostname; next }
+    $0 == \"<!-- agentdp-info:end -->\" { in_block = 0 }
+    { print }
+  ' \"$agents\" >\"$tmp\" && cat \"$tmp\" >\"$agents\"",
+    );
+    script.line("  rm -f \"$tmp\"");
+    script.line("fi");
+    script.line("EOF");
+    script.line("chmod 0755 /usr/local/lib/agentdp/sync-hostname-from-seed.sh");
+    script.line("cat >/etc/systemd/system/agentdp-hostname.service <<'EOF'");
+    script.line("[Unit]");
+    script.line("Description=Sync agentdp guest hostname from cloud-init seed");
+    script.line("After=local-fs.target");
+    script.line("");
+    script.line("[Service]");
+    script.line("Type=oneshot");
+    script.line("ExecStart=/usr/local/lib/agentdp/sync-hostname-from-seed.sh");
+    script.line("");
+    script.line("[Install]");
+    script.line("WantedBy=multi-user.target");
+    script.line("EOF");
+    script.line("systemctl daemon-reload");
+    script.line("systemctl enable agentdp-hostname.service");
+    script.line("/usr/local/lib/agentdp/sync-hostname-from-seed.sh || true");
+    script.render()
+}
+
 fn repo_checkout_block(repo: &RepoCheckout) -> String {
     [
         "mkdir -p \"$(dirname \"$target\")\"".to_owned(),
@@ -492,7 +566,7 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
 mod tests {
     use crate::manifest::AgentManifest;
     use crate::manifest::Repo;
-    use crate::provisioning::bootstrap::{AgentUserPlan, RepoCheckout, render_bootstrap_script};
+    use crate::provisioning::bootstrap::{AgentUserPlan, BootstrapScriptInput, RepoCheckout, render_bootstrap_script};
     use crate::provisioning::shell;
 
     #[test]
@@ -528,7 +602,18 @@ mod tests {
 
     #[test]
     fn empty_bootstrap_inputs_render_minimal_script() {
-        let script = render_bootstrap_script(&manifest(), &agent_user(), &[], &[], &[], &[], &[]);
+        let manifest = manifest();
+        let user = agent_user();
+        let script = render_bootstrap_script(&BootstrapScriptInput {
+            manifest: &manifest,
+            hostname: "pr-0",
+            user: &user,
+            packages: &[],
+            repos: &[],
+            healthchecks: &[],
+            root_shell: &[],
+            agent_shell: &[],
+        });
 
         assert!(script.contains("set -euo pipefail"));
         assert!(script.contains("AGENTDP_USER='agent'"));
@@ -558,7 +643,18 @@ mod tests {
         }];
         let agent_shell = [format!("mise use --global {}", shell::single_quote("node'20"))];
 
-        let script = render_bootstrap_script(&manifest(), &agent_user(), &[], &repos, &[], &[], &agent_shell);
+        let manifest = manifest();
+        let user = agent_user();
+        let script = render_bootstrap_script(&BootstrapScriptInput {
+            manifest: &manifest,
+            hostname: "pr-0",
+            user: &user,
+            packages: &[],
+            repos: &repos,
+            healthchecks: &[],
+            root_shell: &[],
+            agent_shell: &agent_shell,
+        });
 
         assert!(script.contains("mise use --global"));
         assert!(script.contains("node"));

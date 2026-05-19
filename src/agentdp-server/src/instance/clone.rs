@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 use agentdp_core::Context;
 use agentdp_core::platform;
 use agentdp_core::platform::PlatformPaths;
+use agentdp_core::provisioning::cloud_init;
 use agentdp_protocol::{InstanceCloneParams, InstanceCloneResult, InstanceRef};
+
+use crate::backend::seed_media;
+use crate::runtime::BackendState;
 
 use super::{
     Error, Instance, guest_access_result, lock, manifest_result, network_result, path_text, ports, provisioning, state,
@@ -81,6 +85,7 @@ impl Instance {
             &source.state.manifest_name,
             &target_instance,
         );
+        rewrite_clone_seed(&target_state, &target_instance)?;
         state::write_runtime(&target_files, &target_state)?;
 
         Ok(Self {
@@ -101,6 +106,25 @@ impl Instance {
             guest_access: guest_access_result(self.state.guest_access.as_ref()),
         }
     }
+}
+
+fn rewrite_clone_seed(state: &state::InstanceState, target_instance: &str) -> Result<(), Error> {
+    let BackendState::Qemu(qemu) = &state.backend;
+    let meta_data =
+        cloud_init::render_meta_data(&state.manifest_name, target_instance).map_err(Error::RenderClonedMetaData)?;
+    let meta_data_path = PathBuf::from(&qemu.seed_meta_data);
+    let user_data_path = PathBuf::from(&qemu.seed_user_data);
+    let seed_media_path = PathBuf::from(&qemu.seed_media);
+    let user_data = fs::read_to_string(&user_data_path).map_err(|source| Error::ReadClonedUserData {
+        path: user_data_path.clone(),
+        source,
+    })?;
+    fs::write(&meta_data_path, &meta_data).map_err(|source| Error::WriteClonedMetaData {
+        path: meta_data_path.clone(),
+        source,
+    })?;
+    seed_media::write(&seed_media_path, &meta_data, &user_data).map_err(Error::WriteClonedSeedMedia)?;
+    Ok(())
 }
 
 fn clone_guest_access(
