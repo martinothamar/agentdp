@@ -82,10 +82,13 @@ bootstrap:
 
   shell:
     - |
+      set -eu
       for extension in github.copilot github.copilot-chat; do
         code-server --uninstall-extension "$extension" >/dev/null 2>&1 || true
       done
+      rm -rf "$HOME/.local/share/code-server/extensions/github.copilot"*
       gh extension remove github/gh-copilot >/dev/null 2>&1 || true
+      sudo systemctl restart code-server.service >/dev/null 2>&1 || true
     - |
       dotnet tool install --global dotnet-dump || dotnet tool update --global dotnet-dump
       dotnet tool install --global dotnet-trace || dotnet tool update --global dotnet-trace

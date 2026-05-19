@@ -1,12 +1,9 @@
 {
   "workbench.colorTheme": "Dark 2026",
   "workbench.startupEditor": "none",
+  "security.workspace.trust.enabled": false,
+  "chat.disableAIFeatures": true,
   "extensions.ignoreRecommendations": true,
-  "github.copilot.enable": {
-    "*": false
-  },
-  "github.copilot.editor.enableAutoCompletions": false,
-  "github.copilot.chat.enabled": false,
   "keyboard.dispatch": "keyCode",
   "editor.renderWhitespace": "all",
   "editor.minimap.enabled": false,
