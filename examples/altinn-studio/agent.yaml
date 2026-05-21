@@ -67,6 +67,7 @@ bootstrap:
     - ripgrep
     - tmux
     - chromium
+    - noto-fonts
 
   repos:
     - url: https://github.com/martinothamar-agent/altinn-studio.git
