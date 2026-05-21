@@ -69,6 +69,10 @@ resources:
 network:
   mode: user
   allow: all
+  host_aliases:
+    - address: 10.0.2.2
+      names:
+        - host.docker.internal
   ports:
     code-server:
       guest: 4090
@@ -92,10 +96,12 @@ bootstrap:
 
   repos:
     - url: https://github.com/martinothamar-agent/altinn-studio.git
+      upstream: https://github.com/Altinn/altinn-studio.git
     - url: https://github.com/martinothamar-agent/altinn-studio-docs.git
     - name: <name override>
       url: <git remote>
       path: <relative path override>
+      upstream: <canonical upstream remote, optional>
 
   shell:
     - curl -sSL https://altinn.studio/designer/api/v1/studioctl/install.sh | sh
@@ -112,6 +118,11 @@ plugins:
     compose: true
     buildx: true
     healthcheck: true
+  dotnet:
+    from_mise: true
+    tools:
+      - dotnet-dump
+      - dotnet-trace
   mise:
     packages:
       - node@lts
@@ -125,9 +136,13 @@ plugins:
     auth: copy-from-host
   github:
     auth: mediated
-    setup_git: false
+    setup_git: true
   vscode:
     settings: data/home/.local/share/code-server/User/settings.json
+    trusted_domains:
+      - github.com
+      - "*.github.com"
+    restart_after_bootstrap: true
     extensions:
       - EditorConfig.EditorConfig
       - redhat.vscode-yaml
@@ -155,11 +170,12 @@ Defaults owned by the platform:
 - Repository `path` values are always relative to `HOME/code` when specified.
 - Agent-local seed files live next to the manifest and are copied into the VM on create/bootstrap.
   The default source directory is `data/home` beside `agent.yaml`.
-- A sibling `bootstrap.sh` is copied to a root-only temporary location and
-  sourced before repository checkout, with generated bootstrap helpers such as
-  `run_agent` in scope. A sibling `.env` is copied beside it, exported while
-  `bootstrap.sh` runs, and removed immediately after the custom bootstrap hook
-  finishes.
+- Generated plugin setup runs before repository checkout. A sibling
+  `bootstrap.sh` is copied to a root-only temporary location and sourced after
+  generated plugin setup and repository checkout, with generated bootstrap
+  helpers such as `run_agent` in scope. A sibling `.env` is copied beside it,
+  can be used by generated mediated auth setup, is exported while `bootstrap.sh`
+  runs, and is removed immediately after the custom bootstrap hook finishes.
 
 ## CLI Shape
 

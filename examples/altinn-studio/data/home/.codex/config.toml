@@ -9,7 +9,8 @@ web_search = "cached"
 
 [mcp_servers.playwright]
 command = "npx"
-args = ["@playwright/mcp@latest"]
+args = ["@playwright/mcp@latest", "--browser=chromium", "--executable-path=/usr/bin/chromium"]
+env = { PLAYWRIGHT_MCP_EXECUTABLE_PATH = "/usr/bin/chromium", PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "/usr/bin/chromium" }
 
 [agents]
 max_threads = 6

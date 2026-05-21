@@ -109,7 +109,7 @@ mod tests {
         assert!(plan.bootstrap.script.contains("trust_level = \"trusted\""));
         assert!(plan.bootstrap.script.contains("loginctl enable-linger"));
         assert!(plan.bootstrap.script.contains("agentdp-codex-session"));
-        assert!(plan.bootstrap.script.contains("agentdp-pr create"));
+        assert!(plan.bootstrap.script.contains("agentdp-pr register"));
         assert!(plan.bootstrap.script.contains("agentdp-pr-subscriber.service"));
     }
 

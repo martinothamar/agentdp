@@ -15,6 +15,10 @@ resources:
 network:
   mode: user
   allow: all
+  host_aliases:
+    - address: 10.0.2.2
+      names:
+        - host.docker.internal
   ports:
     code-server:
       guest: 4090
@@ -53,6 +57,7 @@ bootstrap:
     - wget
     - jq
     - yq
+    - actionlint
     - kubectl
     - kubectx
     - helm
@@ -65,14 +70,23 @@ bootstrap:
 
   repos:
     - url: https://github.com/martinothamar-agent/altinn-studio.git
+      upstream: https://github.com/Altinn/altinn-studio.git
     - url: https://github.com/martinothamar-agent/altinn-studio-docs.git
+      upstream: https://github.com/Altinn/altinn-studio-docs.git
     - url: https://github.com/martinothamar-agent/altinn-storage.git
+      upstream: https://github.com/Altinn/altinn-storage.git
     - url: https://github.com/martinothamar-agent/app-lib-dotnet.git
+      upstream: https://github.com/Altinn/app-lib-dotnet.git
     - url: https://github.com/martinothamar-agent/app-frontend-react.git
+      upstream: https://github.com/Altinn/app-frontend-react.git
     - url: https://github.com/martinothamar-agent/app-localtest.git
+      upstream: https://github.com/Altinn/app-localtest.git
     - url: https://github.com/martinothamar-agent/altinn-studio-charts.git
+      upstream: https://github.com/Altinn/altinn-studio-charts.git
     - url: https://github.com/martinothamar-agent/altinn-file-scan.git
+      upstream: https://github.com/Altinn/altinn-file-scan.git
     - url: https://github.com/martinothamar-agent/altinn-receipt.git
+      upstream: https://github.com/Altinn/altinn-receipt.git
     - url: https://github.com/martinothamar/agentdp.git
 
   healthchecks:
@@ -80,34 +94,22 @@ bootstrap:
       tcp: 127.0.0.1:4090
       timeout: 30m
 
-  shell:
-    - |
-      set -eu
-      for extension in github.copilot github.copilot-chat; do
-        code-server --uninstall-extension "$extension" >/dev/null 2>&1 || true
-      done
-      rm -rf "$HOME/.local/share/code-server/extensions/github.copilot"*
-      gh extension remove github/gh-copilot >/dev/null 2>&1 || true
-      sudo systemctl restart code-server.service >/dev/null 2>&1 || true
-    - |
-      dotnet tool install --global dotnet-dump || dotnet tool update --global dotnet-dump
-      dotnet tool install --global dotnet-trace || dotnet tool update --global dotnet-trace
-      dotnet tool install --global dotnet-counters || dotnet tool update --global dotnet-counters
-      dotnet tool install --global dotnet-gcdump || dotnet tool update --global dotnet-gcdump
-      dotnet tool install --global dotnet-symbol || dotnet tool update --global dotnet-symbol
-      dotnet tool install --global dotnet-sos || dotnet tool update --global dotnet-sos
-      dotnet sos install || true
-    - |
-      npm config set prefix "$HOME/.local"
-      npm install -g playwright@latest @playwright/test@latest @playwright/mcp@latest
-      playwright install chromium
-    - go install sigs.k8s.io/kind@latest
-
 plugins:
   docker:
     compose: true
     buildx: true
     healthcheck: true
+  dotnet:
+    from_mise: true
+    tools:
+      - dotnet-dump
+      - dotnet-trace
+      - dotnet-counters
+      - dotnet-gcdump
+      - dotnet-symbol
+      - dotnet-sos
+      - ilspycmd
+      - dotnet-ef
   mise:
     packages:
       - node@lts
@@ -121,9 +123,15 @@ plugins:
     auth: copy-from-host
   github:
     auth: mediated
-    setup_git: false
+    setup_git: true
   vscode:
     settings: data/home/.local/share/code-server/User/settings.json
+    trusted_domains:
+      - github.com
+      - "*.github.com"
+      - altinn.studio
+      - "*.altinn.studio"
+    restart_after_bootstrap: true
     extensions:
       - EditorConfig.EditorConfig
       - redhat.vscode-yaml

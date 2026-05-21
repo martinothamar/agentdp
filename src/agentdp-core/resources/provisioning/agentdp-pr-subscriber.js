@@ -13,10 +13,11 @@ const paneFile = process.env.AGENTDP_CODEX_PANE_FILE || path.join(stateDir, "cod
 const seenPath = path.join(stateDir, "pr-subscriber-seen.json");
 const queueDir = path.join(stateDir, "pr-subscriber-queue");
 const pollSeconds = Number(process.env.AGENTDP_PR_POLL_SECONDS || "60");
-const maxListedItems = 6;
+const idleSeconds = Number(process.env.AGENTDP_PR_IDLE_SECONDS || "20");
 const maxPreviewLength = 220;
 const trustedAuthorAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]);
 let cachedGhLogin;
+let lastPaneCapture = null;
 
 fs.mkdirSync(stateDir, { recursive: true });
 fs.mkdirSync(queueDir, { recursive: true });
@@ -113,186 +114,95 @@ function checkState(check) {
   };
 }
 
-function summarizedChecks(checks) {
-  const normalized = checks.map(checkState);
-  const failed = normalized.filter((check) => ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"].includes(check.conclusion));
-  const pending = normalized.filter((check) =>
-    check.conclusion === null && !["SUCCESS", "SKIPPED", "NEUTRAL"].includes(check.status),
-  );
-  const passed = normalized.filter((check) =>
-    ["SUCCESS", "SKIPPED", "NEUTRAL"].includes(check.conclusion) ||
-    check.status === "SUCCESS",
-  );
-  return {
-    total: normalized.length,
-    passed: passed.length,
-    failed: failed.slice(0, maxListedItems),
-    pending: pending.slice(0, maxListedItems),
-  };
+function prPrefix(view) {
+  const parsed = parsePrUrl(view.url);
+  const number = view.number || parsed?.number || "?";
+  return `pr=#${number} url=${view.url}`;
 }
 
-function summarizedReviews(reviews, selfLogin) {
-  const normalized = reviews
+function quote(value) {
+  return JSON.stringify(String(value));
+}
+
+function eventId(event) {
+  return hash(JSON.stringify(event.identity));
+}
+
+function failedCheckEvents(view) {
+  return (view.statusCheckRollup || [])
+    .map(checkState)
+    .filter((check) => ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"].includes(check.conclusion))
+    .map((check) => {
+      const status = check.conclusion || check.status || "unknown";
+      return {
+        identity: {
+          type: "check_failed",
+          url: view.url,
+          name: check.name,
+          status,
+        },
+        line: `${prPrefix(view)} event=check_failed status=${status} name=${quote(check.name)}${check.url ? ` details=${check.url}` : ""}`,
+      };
+    });
+}
+
+function reviewEvents(view, selfLogin) {
+  return (view.reviews || [])
     .filter((review) => !authoredBySelf(review, selfLogin))
     .map((review) => {
       const trusted = trustedAuthor(review);
+      const author = review.author?.login || "unknown";
+      const state = review.state || "UNKNOWN";
+      const submittedAt = review.submittedAt || "unknown";
+      const preview = trusted ? compactText(review.body || "") : "";
       return {
-        author: review.author?.login || "unknown",
-        trusted,
-        state: review.state || "UNKNOWN",
-        submittedAt: review.submittedAt || null,
-        preview: trusted ? compactText(review.body || "") : "",
+        identity: {
+          type: "review",
+          url: view.url,
+          author,
+          state,
+          submittedAt,
+          body: preview,
+        },
+        line: `${prPrefix(view)} event=review state=${state} author=${author} at=${submittedAt}${preview ? ` body=${quote(preview)}` : ""}`,
       };
     });
-  return {
-    total: normalized.length,
-    changesRequested: normalized.filter((review) => review.state === "CHANGES_REQUESTED").length,
-    approved: normalized.filter((review) => review.state === "APPROVED").length,
-    latest: normalized.slice(-maxListedItems),
-  };
 }
 
-function summarizedComments(comments, selfLogin) {
-  const normalized = comments
+function commentEvents(view, selfLogin) {
+  return (view.comments || [])
     .filter((comment) => !authoredBySelf(comment, selfLogin))
     .map((comment) => {
       const trusted = trustedAuthor(comment);
+      const author = comment.author?.login || "unknown";
+      const updatedAt = comment.updatedAt || comment.createdAt || "unknown";
+      const url = comment.url || view.url;
+      const preview = trusted ? compactText(comment.body || "") : "";
       return {
-        author: comment.author?.login || "unknown",
-        trusted,
-        updatedAt: comment.updatedAt || comment.createdAt || null,
-        url: comment.url || null,
-        preview: trusted ? compactText(comment.body || "") : "",
+        identity: {
+          type: "comment",
+          url,
+          author,
+          updatedAt,
+          body: preview,
+        },
+        line: `${prPrefix(view)} event=comment author=${author} at=${updatedAt} comment=${url}${preview ? ` body=${quote(preview)}` : ""}`,
       };
     });
-  return {
-    total: normalized.length,
-    latest: normalized.slice(-3),
-  };
 }
 
-function prSummary(view, selfLogin) {
-  const checks = summarizedChecks(view.statusCheckRollup || []);
-  const reviews = summarizedReviews(view.reviews || [], selfLogin);
-  const comments = summarizedComments(view.comments || [], selfLogin);
-  const parsed = parsePrUrl(view.url);
-  return {
-    pr: {
-      number: view.number || parsed?.number || null,
-      title: view.title || "",
-      state: view.state || "",
-      url: view.url,
-      head: view.headRefName || "",
-      base: view.baseRefName || "",
-      updatedAt: view.updatedAt,
-      reviewDecision: view.reviewDecision || "UNKNOWN",
-    },
-    checks,
-    reviews,
-    comments,
-  };
+function prEvents(view, selfLogin) {
+  return [
+    ...failedCheckEvents(view),
+    ...reviewEvents(view, selfLogin),
+    ...commentEvents(view, selfLogin),
+  ].map((event) => ({ id: eventId(event), line: event.line }));
 }
 
-function prFingerprint(view, selfLogin) {
-  return {
-    url: view.url,
-    updatedAt: view.updatedAt,
-    reviewDecision: view.reviewDecision,
-    checks: (view.statusCheckRollup || []).map(checkState),
-    reviews: (view.reviews || [])
-      .filter((review) => !authoredBySelf(review, selfLogin))
-      .map((review) => ({
-        author: review.author?.login || "unknown",
-        authorAssociation: review.authorAssociation || "",
-        state: review.state,
-        submittedAt: review.submittedAt,
-        body: trustedAuthor(review) ? review.body || "" : "",
-      })),
-    comments: (view.comments || [])
-      .filter((comment) => !authoredBySelf(comment, selfLogin))
-      .map((comment) => ({
-        author: comment.author?.login || "unknown",
-        authorAssociation: comment.authorAssociation || "",
-        updatedAt: comment.updatedAt || comment.createdAt || null,
-        url: comment.url || null,
-        body: trustedAuthor(comment) ? comment.body || "" : "",
-      })),
-  };
-}
-
-function bulletList(items, formatter, emptyText) {
-  if (!items.length) return `- ${emptyText}`;
-  return items.map((item) => `- ${formatter(item)}`).join("\n");
-}
-
-function checkLine(check) {
-  const status = check.conclusion || check.status || "unknown";
-  return `${check.name} (${status})${check.url ? ` ${check.url}` : ""}`;
-}
-
-function pendingCheckLine(check) {
-  return `${check.name} (${check.status || "pending"})${check.url ? ` ${check.url}` : ""}`;
-}
-
-function reviewLine(review) {
-  const submittedAt = review.submittedAt ? ` at ${review.submittedAt}` : "";
-  const preview = review.trusted && review.preview
-    ? ` - ${review.preview}`
-    : review.trusted
-      ? ""
-      : " - body omitted";
-  return `${review.author}: ${review.state}${submittedAt}${preview}`;
-}
-
-function commentLine(comment) {
-  const updatedAt = comment.updatedAt ? ` at ${comment.updatedAt}` : "";
-  const url = comment.url ? ` ${comment.url}` : "";
-  const preview = comment.trusted && comment.preview
-    ? ` - ${comment.preview}`
-    : comment.trusted
-      ? ""
-      : " - body omitted";
-  return `${comment.author}${updatedAt}${url}${preview}`;
-}
-
-function renderPrompt(summary) {
-  const pr = summary.pr;
-  const checks = summary.checks;
-  const reviews = summary.reviews;
-  const comments = summary.comments;
-  const failedCount = checks.failed.length;
-  const pendingCount = checks.pending.length;
-  const promptReason = failedCount > 0
-    ? "check failure"
-    : reviews.changesRequested > 0
-      ? "changes requested"
-      : comments.latest.length > 0
-        ? "new or updated PR comment"
-        : pendingCount > 0
-          ? "check status update"
-          : "PR status update";
-
-  return `<github_pr_summary_update>
-Reason: ${promptReason}
-PR: #${pr.number || "?"} ${pr.title}
-URL: ${pr.url}
-State: ${pr.state || "unknown"} | Review: ${pr.reviewDecision} | Branch: ${pr.head || "?"} -> ${pr.base || "?"}
-Updated: ${pr.updatedAt || "unknown"}
-
-Checks: ${checks.passed}/${checks.total} passed, ${checks.failed.length} failed, ${checks.pending.length} pending
-Failed checks:
-${bulletList(checks.failed, checkLine, "none")}
-Pending checks:
-${bulletList(checks.pending, pendingCheckLine, "none")}
-
-Reviews: ${reviews.approved} approved, ${reviews.changesRequested} changes requested, ${reviews.total} total
-Recent reviews:
-${bulletList(reviews.latest, reviewLine, "none")}
-
-Top-level comments: ${comments.total} total
-Recent comments:
-${bulletList(comments.latest, commentLine, "none")}
-</github_pr_summary_update>
+function renderPrompt(events) {
+  return `<pr_events>
+${events.map((event) => event.line).join("\n")}
+</pr_events>
 `;
 }
 
@@ -309,21 +219,70 @@ function paneExists(id) {
   return panes ? panes.split(/\r?\n/).includes(id) : false;
 }
 
-function injectPrompt(id, url, summary) {
+function capturePane(id) {
+  return run("tmux", ["capture-pane", "-p", "-t", id, "-S", "-80"]) || "";
+}
+
+function codexLooksIdle(id) {
+  if (idleSeconds <= 0) return true;
+  const capture = capturePane(id);
+  if (!capture) return false;
+
+  const now = Date.now();
+  const captureHash = hash(capture);
+  if (!lastPaneCapture || lastPaneCapture.id !== id || lastPaneCapture.hash !== captureHash) {
+    lastPaneCapture = { id, hash: captureHash, since: now };
+    return false;
+  }
+
+  return now - lastPaneCapture.since >= idleSeconds * 1000;
+}
+
+function injectPrompt(id, events) {
   const promptFile = path.join(stateDir, `pr-prompt.${process.pid}.txt`);
-  fs.writeFileSync(promptFile, renderPrompt(summary));
+  fs.writeFileSync(promptFile, renderPrompt(events));
   run("tmux", ["load-buffer", "-b", "agentdp-pr", promptFile]);
   run("tmux", ["paste-buffer", "-b", "agentdp-pr", "-t", id, "-p", "-r"]);
   run("tmux", ["send-keys", "-t", id, "Enter"]);
   fs.rmSync(promptFile, { force: true });
 }
 
-function queuePrompt(key, url, summary) {
-  writeJsonAtomic(path.join(queueDir, `${key}.json`), { url, summary });
+function queueEvents(key, url, events) {
+  const file = path.join(queueDir, `${key}.json`);
+  const queued = readJson(file, { url, events: [] });
+  const byId = new Map((queued.events || []).map((event) => [event.id, event]));
+  for (const event of events) {
+    byId.set(event.id, event);
+  }
+  writeJsonAtomic(file, {
+    url,
+    events: Array.from(byId.values()),
+    updated_at: new Date().toISOString(),
+  });
 }
 
-function clearQueuedPrompt(key) {
-  fs.rmSync(path.join(queueDir, `${key}.json`), { force: true });
+function queuedEventFiles() {
+  try {
+    return fs.readdirSync(queueDir)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => path.join(queueDir, name));
+  } catch {
+    return [];
+  }
+}
+
+function flushQueuedEvents() {
+  const files = queuedEventFiles();
+  const events = files.flatMap((file) => readJson(file, { events: [] }).events || []);
+  if (events.length === 0) return;
+
+  const targetPane = paneId();
+  if (!targetPane || !paneExists(targetPane) || !codexLooksIdle(targetPane)) return;
+
+  injectPrompt(targetPane, events);
+  for (const file of files) {
+    fs.rmSync(file, { force: true });
+  }
 }
 
 function handlePr(entry) {
@@ -332,21 +291,18 @@ function handlePr(entry) {
   if (!view) return;
 
   const selfLogin = currentGhLogin();
-  const summary = prSummary(view, selfLogin);
   const key = hash(entry.url);
-  const fingerprint = hash(JSON.stringify(prFingerprint(view, selfLogin)));
+  const events = prEvents(view, selfLogin);
   const seen = readJson(seenPath, { events: {} });
-  if (seen.events?.[key] === fingerprint) return;
+  const newEvents = events.filter((event) => !seen.events?.[event.id]);
+  if (newEvents.length === 0) return;
 
-  const targetPane = paneId();
-  if (targetPane && paneExists(targetPane)) {
-    injectPrompt(targetPane, entry.url, summary);
-    clearQueuedPrompt(key);
-    seen.events = { ...(seen.events || {}), [key]: fingerprint };
-    writeJsonAtomic(seenPath, seen);
-  } else {
-    queuePrompt(key, entry.url, summary);
+  queueEvents(key, entry.url, newEvents);
+  seen.events = { ...(seen.events || {}) };
+  for (const event of newEvents) {
+    seen.events[event.id] = true;
   }
+  writeJsonAtomic(seenPath, seen);
 }
 
 async function main() {
@@ -354,6 +310,7 @@ async function main() {
     for (const pr of registeredPrs()) {
       handlePr(pr);
     }
+    flushQueuedEvents();
     await new Promise((resolve) => setTimeout(resolve, pollSeconds * 1000));
   }
 }

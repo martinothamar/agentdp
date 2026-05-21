@@ -1,5 +1,5 @@
 param(
-    [string[]] $Instances = @("pr-0", "pr-1", "pr-2", "pr-3", "pr-4")
+    [string[]] $Instances = @("v1-0", "v1-1", "v1-2", "v1-3", "v1-4")
 )
 
 $ErrorActionPreference = "Stop"

@@ -1,5 +1,6 @@
 mod codex;
 mod docker;
+mod dotnet;
 mod github;
 mod mise;
 mod pr_loop;
@@ -15,6 +16,9 @@ pub(super) fn apply(plugins: &Plugins, builder: &mut ProvisioningBuilder<'_>) {
     }
     if let Some(mise) = &plugins.mise {
         mise.apply(builder);
+    }
+    if let Some(dotnet) = &plugins.dotnet {
+        dotnet.apply(builder);
     }
     if let Some(codex) = &plugins.codex {
         codex.apply(builder);

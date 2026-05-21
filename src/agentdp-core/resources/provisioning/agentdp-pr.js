@@ -11,8 +11,9 @@ const registry = process.env.AGENTDP_PR_REGISTRY || path.join(stateDir, "pr-watc
 
 function usage() {
   console.error(`Usage:
-  agentdp-pr create [gh pr create args...]
-  agentdp-pr register [pr-url]`);
+  agentdp-pr register [pr-url-or-number]
+  agentdp-pr unregister [pr-url-or-number]
+  agentdp-pr list`);
 }
 
 function run(command, args, options = {}) {
@@ -63,6 +64,13 @@ function ghPrView(target) {
   return JSON.parse(run("gh", args, { capture: true }));
 }
 
+function prMatches(entry, target, pr) {
+  if (pr) {
+    return entry.url === pr.url;
+  }
+  return entry.url === target || String(entry.number) === target;
+}
+
 function register(target) {
   const repo = repoRoot();
   const branch = currentBranch();
@@ -79,35 +87,53 @@ function register(target) {
   console.log(pr.url);
 }
 
+function unregister(target) {
+  const pr = target ? null : ghPrView(currentBranch());
+  const removeTarget = target || pr.url;
+  const existing = readRegistry();
+  const before = existing.prs || [];
+  const prs = before.filter((entry) => !prMatches(entry, removeTarget, pr));
+  writeRegistryAtomic({ version: 1, prs });
+  if (prs.length === before.length) {
+    console.error(`not registered: ${removeTarget}`);
+    process.exit(1);
+  }
+  console.log(removeTarget);
+}
+
+function list() {
+  for (const pr of readRegistry().prs || []) {
+    const branch = pr.branch ? ` ${pr.branch}` : "";
+    console.log(`#${pr.number} ${pr.url}${branch}`);
+  }
+}
+
 function wantsHelp(args) {
   return args.includes("--help") || args.includes("-h");
 }
 
-function findPrUrl(output) {
-  return output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/)?.[0] || "";
-}
-
 const [command, ...args] = process.argv.slice(2);
 switch (command) {
-  case "create":
-    if (wantsHelp(args)) {
-      run("gh", ["pr", "create", ...args]);
-      break;
-    }
-    {
-      const output = run("gh", ["pr", "create", ...args], { capture: true });
-      if (output) {
-        console.log(output);
-      }
-      register(findPrUrl(output));
-    }
-    break;
   case "register":
     if (wantsHelp(args)) {
       usage();
       break;
     }
     register(args[0] || "");
+    break;
+  case "unregister":
+    if (wantsHelp(args)) {
+      usage();
+      break;
+    }
+    unregister(args[0] || "");
+    break;
+  case "list":
+    if (wantsHelp(args)) {
+      usage();
+      break;
+    }
+    list();
     break;
   case "help":
   case "--help":

@@ -12,11 +12,17 @@ impl Plugin for VsCode {
         };
         builder.add_package("curl");
         builder.add_root_shell(render_code_server_setup(builder.agent_user(), guest_port));
+        if !self.trusted_domains.is_empty() {
+            builder.add_root_shell(render_code_server_config(builder.agent_user(), &self.trusted_domains));
+        }
         for extension in &self.extensions {
             builder.add_agent_shell(format!(
                 "code-server --install-extension {} || true",
                 shell::single_quote(extension)
             ));
+        }
+        if self.restart_after_bootstrap {
+            builder.add_post_bootstrap_root_shell("systemctl restart code-server.service >/dev/null 2>&1 || true");
         }
     }
 }
@@ -43,5 +49,31 @@ fi",
     script.line("EOF");
     script.line("systemctl daemon-reload");
     script.line("systemctl enable --now code-server.service");
+    script.render()
+}
+
+fn render_code_server_config(user: &AgentUserPlan, trusted_domains: &[String]) -> String {
+    let mut script = shell::ShellScript::new();
+    script.line(format!(
+        "install -d -o {} -g {} -m 0700 {}/.config/code-server",
+        shell::single_quote(&user.name),
+        shell::single_quote(&user.name),
+        shell::single_quote(&user.home)
+    ));
+    script.line(format!(
+        "cat >{}/.config/code-server/config.yaml <<'EOF'",
+        shell::single_quote(&user.home)
+    ));
+    script.line("link-protection-trusted-domains:");
+    for domain in trusted_domains {
+        script.line(format!("  - \"{}\"", shell::double_quoted_fragment(domain)));
+    }
+    script.line("EOF");
+    script.line(format!(
+        "chown {}:{} {}/.config/code-server/config.yaml",
+        shell::single_quote(&user.name),
+        shell::single_quote(&user.name),
+        shell::single_quote(&user.home)
+    ));
     script.render()
 }

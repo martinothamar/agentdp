@@ -1,5 +1,6 @@
 pub mod codex;
 pub mod docker;
+pub mod dotnet;
 pub mod github;
 pub mod mise;
 pub mod vscode;
@@ -10,6 +11,7 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct Plugins {
     pub docker: Option<docker::Docker>,
+    pub dotnet: Option<dotnet::DotNet>,
     pub mise: Option<mise::Mise>,
     pub codex: Option<codex::Codex>,
     pub github: Option<github::GitHub>,
@@ -20,6 +22,9 @@ impl Plugins {
     pub(super) fn validate(&self, errors: &mut Vec<String>) {
         if let Some(mise) = &self.mise {
             mise.validate(errors);
+        }
+        if let Some(dotnet) = &self.dotnet {
+            dotnet.validate(errors);
         }
         if let Some(vscode) = &self.vscode {
             vscode.validate(errors);

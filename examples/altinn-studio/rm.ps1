@@ -8,6 +8,6 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $manifest = Join-Path $scriptDir "agent.yaml"
 
 foreach ($instance in $Instances) {
-    Write-Host "Starting $instance"
-    agentctl up -f $manifest $instance
+    Write-Host "Removing $instance"
+    agentctl rm -f $manifest $instance
 }

@@ -3,12 +3,12 @@ use std::collections::BTreeSet;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::manifest::{AgentManifest, Healthcheck, Repo};
+use crate::manifest::{AgentManifest, Healthcheck, HostAlias, Repo};
 
 use super::{AGENT_HOME, CODE_DIR, shell, templates};
 
 const CUSTOM_BOOTSTRAP_PATH: &str = "/run/agentdp/bootstrap.sh";
-const CUSTOM_ENV_PATH: &str = "/run/agentdp/.env";
+pub(super) const CUSTOM_ENV_PATH: &str = "/run/agentdp/.env";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapPlan {
@@ -42,6 +42,7 @@ pub(super) struct ProvisioningBuilder<'a> {
     healthchecks: Vec<HealthcheckPlan>,
     root_shell: Vec<String>,
     agent_shell: Vec<String>,
+    post_bootstrap_root_shell: Vec<String>,
 }
 
 impl<'a> ProvisioningBuilder<'a> {
@@ -80,12 +81,16 @@ impl<'a> ProvisioningBuilder<'a> {
             healthchecks,
             root_shell: Vec::new(),
             agent_shell: Vec::new(),
+            post_bootstrap_root_shell: Vec::new(),
         }
     }
 
     fn build(mut self) -> BootstrapPlan {
         self.add_root_shell(render_grow_root_filesystem());
         self.add_root_shell(render_hostname_sync_service(&self.user));
+        if !self.manifest.network.host_aliases.is_empty() {
+            self.add_root_shell(render_host_aliases(&self.manifest.network.host_aliases));
+        }
         super::plugins::apply(&self.manifest.plugins, &mut self);
         self.add_agent_shell_lines(self.manifest.bootstrap.shell.iter().cloned());
         self.user.groups = dedupe(self.user.groups);
@@ -100,6 +105,7 @@ impl<'a> ProvisioningBuilder<'a> {
             healthchecks: &self.healthchecks,
             root_shell: &self.root_shell,
             agent_shell: &self.agent_shell,
+            post_bootstrap_root_shell: &self.post_bootstrap_root_shell,
         });
 
         BootstrapPlan {
@@ -122,6 +128,10 @@ impl<'a> ProvisioningBuilder<'a> {
 
     pub(super) fn add_agent_shell(&mut self, command: impl Into<String>) {
         self.agent_shell.push(command.into());
+    }
+
+    pub(super) fn add_post_bootstrap_root_shell(&mut self, command: impl Into<String>) {
+        self.post_bootstrap_root_shell.push(command.into());
     }
 
     pub(super) fn add_user_group(&mut self, group: impl Into<String>) {
@@ -156,6 +166,7 @@ pub struct RepoCheckout {
     pub name: String,
     pub url: String,
     pub path: String,
+    pub upstream: Option<String>,
 }
 
 impl RepoCheckout {
@@ -166,6 +177,7 @@ impl RepoCheckout {
             name,
             url: repo.url.clone(),
             path,
+            upstream: repo.upstream.clone(),
         }
     }
 }
@@ -216,6 +228,7 @@ struct BootstrapScriptInput<'a> {
     healthchecks: &'a [HealthcheckPlan],
     root_shell: &'a [String],
     agent_shell: &'a [String],
+    post_bootstrap_root_shell: &'a [String],
 }
 
 fn render_bootstrap_script(input: &BootstrapScriptInput<'_>) -> String {
@@ -257,9 +270,6 @@ fn render_bootstrap_script(input: &BootstrapScriptInput<'_>) -> String {
         script.blank();
     }
 
-    script.block(&render_custom_bootstrap_hook());
-    script.blank();
-
     for repo in input.repos {
         script.line(format!(
             "target=\"$AGENTDP_CODE_DIR/{}\"",
@@ -273,7 +283,52 @@ fn render_bootstrap_script(input: &BootstrapScriptInput<'_>) -> String {
         script.line(format!("run_agent {}", shell::single_quote(command)));
     }
     script.blank();
+
+    script.block(&render_custom_bootstrap_hook());
+    script.blank();
+
+    if !input.post_bootstrap_root_shell.is_empty() {
+        for block in input.post_bootstrap_root_shell {
+            script.block(block);
+        }
+        script.blank();
+    }
     script.render()
+}
+
+fn render_host_aliases(aliases: &[HostAlias]) -> String {
+    let mut script = shell::ShellScript::new();
+    for alias in aliases {
+        let names = alias.names.iter().map(String::as_str).collect::<Vec<_>>().join(" ");
+        let pattern = alias
+            .names
+            .iter()
+            .map(|name| format!("(^|[[:space:]]){}([[:space:]]|$)", regex_escape_for_grep(name)))
+            .collect::<Vec<_>>()
+            .join("|");
+        script.line(format!(
+            "if ! grep -Eq {} /etc/hosts; then",
+            shell::single_quote(&pattern)
+        ));
+        script.line(format!(
+            "  printf '%s\\n' {} >>/etc/hosts",
+            shell::single_quote(&format!("{} {}", alias.address, names))
+        ));
+        script.line("fi");
+    }
+    script.render()
+}
+
+fn regex_escape_for_grep(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '.' | '[' | ']' | '(' | ')' | '{' | '}' | '*' | '+' | '?' | '^' | '$' | '|' | '\\' => {
+                vec!['\\', character]
+            }
+            other => vec![other],
+        })
+        .collect()
 }
 
 fn render_custom_bootstrap_hook() -> String {
@@ -534,7 +589,7 @@ fn render_hostname_sync_service(user: &AgentUserPlan) -> String {
 }
 
 fn repo_checkout_block(repo: &RepoCheckout) -> String {
-    [
+    let mut lines = vec![
         "mkdir -p \"$(dirname \"$target\")\"".to_owned(),
         "chown -R \"$AGENTDP_USER:$AGENTDP_USER\" \"$(dirname \"$target\")\"".to_owned(),
         "if [ ! -d \"$target/.git\" ]; then".to_owned(),
@@ -543,8 +598,23 @@ fn repo_checkout_block(repo: &RepoCheckout) -> String {
         "run_agent_args git -C \"$target\" config core.preloadIndex true".to_owned(),
         "run_agent_args git -C \"$target\" config core.untrackedCache true".to_owned(),
         "run_agent_args git -C \"$target\" update-index --test-untracked-cache >/dev/null 2>&1 || true".to_owned(),
-    ]
-    .join("\n")
+    ];
+    if let Some(upstream) = &repo.upstream {
+        lines.extend([
+            "if run_agent_args git -C \"$target\" remote get-url upstream >/dev/null 2>&1; then".to_owned(),
+            format!(
+                "  run_agent_args git -C \"$target\" remote set-url upstream {}",
+                shell::single_quote(upstream)
+            ),
+            "else".to_owned(),
+            format!(
+                "  run_agent_args git -C \"$target\" remote add upstream {}",
+                shell::single_quote(upstream)
+            ),
+            "fi".to_owned(),
+        ]);
+    }
+    lines.join("\n")
 }
 
 fn repo_name_from_url(url: &str) -> String {
@@ -582,6 +652,7 @@ mod tests {
                 name: None,
                 url: url.to_owned(),
                 path: None,
+                upstream: None,
             });
             assert_eq!(checkout.name, expected_name);
             assert_eq!(checkout.path, expected_name);
@@ -594,6 +665,7 @@ mod tests {
             name: Some("display-name".to_owned()),
             url: "https://github.com/example/repo.git".to_owned(),
             path: Some("custom/path".to_owned()),
+            upstream: None,
         });
 
         assert_eq!(checkout.name, "display-name");
@@ -613,6 +685,7 @@ mod tests {
             healthchecks: &[],
             root_shell: &[],
             agent_shell: &[],
+            post_bootstrap_root_shell: &[],
         });
 
         assert!(script.contains("set -euo pipefail"));
@@ -640,6 +713,7 @@ mod tests {
             name: "quoted".to_owned(),
             url: "https://example.com/quote's.git".to_owned(),
             path: "nested/$repo\"name".to_owned(),
+            upstream: Some("https://example.com/upstream's.git".to_owned()),
         }];
         let agent_shell = [format!("mise use --global {}", shell::single_quote("node'20"))];
 
@@ -654,6 +728,7 @@ mod tests {
             healthchecks: &[],
             root_shell: &[],
             agent_shell: &agent_shell,
+            post_bootstrap_root_shell: &[],
         });
 
         assert!(script.contains("mise use --global"));
@@ -666,6 +741,10 @@ mod tests {
         assert!(script.contains(&format!(
             "clone_repo {} \"$target\"",
             shell::single_quote("https://example.com/quote's.git")
+        )));
+        assert!(script.contains(&format!(
+            "remote add upstream {}",
+            shell::single_quote("https://example.com/upstream's.git")
         )));
     }
 }

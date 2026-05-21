@@ -22,6 +22,7 @@ bootstrap:
     - git
   repos:
     - url: https://github.com/martinothamar-agent/altinn-studio.git
+      upstream: https://github.com/Altinn/altinn-studio.git
       path: altinn-studio
   shell:
     - npm install -g playwright

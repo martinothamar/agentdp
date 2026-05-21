@@ -181,6 +181,8 @@ pub struct Network {
     pub ports: BTreeMap<String, GuestPort>,
     #[serde(default)]
     pub allow: NetworkAllow,
+    #[serde(default)]
+    pub host_aliases: Vec<HostAlias>,
 }
 
 impl Network {
@@ -199,6 +201,25 @@ impl Network {
         }
 
         self.allow.validate(errors);
+        for (index, alias) in self.host_aliases.iter().enumerate() {
+            alias.validate(index, errors);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostAlias {
+    pub address: String,
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+impl HostAlias {
+    fn validate(&self, index: usize, errors: &mut Vec<String>) {
+        let field = format!("network.host_aliases[{index}]");
+        validate_non_empty(&format!("{field}.address"), &self.address, errors);
+        validate_non_empty_values(&format!("{field}.names"), &self.names, errors);
     }
 }
 
@@ -307,6 +328,7 @@ pub struct Repo {
     pub name: Option<String>,
     pub url: String,
     pub path: Option<String>,
+    pub upstream: Option<String>,
 }
 
 impl Repo {
@@ -318,6 +340,9 @@ impl Repo {
         validate_non_empty(&format!("{field}.url"), &self.url, errors);
         if let Some(path) = &self.path {
             validate_relative_path(&format!("{field}.path"), path, errors);
+        }
+        if let Some(upstream) = &self.upstream {
+            validate_non_empty(&format!("{field}.upstream"), upstream, errors);
         }
     }
 }

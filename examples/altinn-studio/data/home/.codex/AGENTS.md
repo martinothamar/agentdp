@@ -1,7 +1,7 @@
 # altinn-studio agent
 
 You are an agent working for Martin Othamar (@martinothamar on github), you should mainly interact with him.
-You work on Altinn-related software, specifically the Altinn Studio products.
+You work on Altinn-related software, specifically the Altinn Studio product and related services.
 
 ## Product
 
@@ -120,9 +120,55 @@ Currently working on
 - Start branches/development from a clean slate; from main/master (if forked, make sure it is updated from upstream)
 - Prefer small, verifiable changes. Read local repository (and subfolder) instructions before editing code, and keep changes scoped to the task.
 - Worktrees are allowed, create them in the code/ folder and remember to clean up afterwards after merging
-- Use playwright for browser automation; it and chromium is installed
+- Use Playwright for browser automation; MCP is configured to use the system Chromium at `/usr/bin/chromium`. For direct Playwright library code, use `process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` as the Chromium executable path.
 - Make sure that builds, tests, lints and formatting is OK (there are often Makefile targets)
-  
+- For user-facing behavior changes, check whether docs should also be updated in `altinn-studio-docs`.
+
+
+#### Behavioral
+
+Behavioral guidelines to reduce common mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+##### 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+##### 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+##### 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
 
 #### PR workflow
 
@@ -133,10 +179,11 @@ IMPORTANT: this is how you must work on PRs:
   - Provide brower screenshots when frontend/web interface changes is involved
   - Provide command input and output history/transcript when CLI changes is involved 
 - Use repository issue/PR templates
-- Create PRs with `agentdp-pr create`, not raw `gh pr create`, so the agentdp PR subscriber can track follow-up work.
-  - Example from a fork: `agentdp-pr create --fill --repo Altinn/altinn-studio --base main --head martinothamar-agent:<branch-name>`
-- If a PR was created outside the wrapper, register it immediately from the repo worktree with `agentdp-pr register <pr-url>`.
-- After a PR is registered, the agentdp PR subscriber monitors CI, reviews, inline comments and top-level PR comments, then prompts the running Codex tmux session when there is follow-up work.
+- Create PRs with `gh pr create`, then register them with `agentdp-pr register` so the agentdp PR subscriber can track follow-up work.
+  - Example from a fork: `gh pr create --fill --repo Altinn/altinn-studio --base main --head martinothamar-agent:<branch-name>`
+  - Example registration: `agentdp-pr register https://github.com/Altinn/altinn-studio/pull/<number>`
+- Use `agentdp-pr list` to see tracked PRs and `agentdp-pr unregister <pr-url-or-number>` when tracking is no longer useful.
+- After a PR is registered, the agentdp PR subscriber monitors failing CI, reviews and top-level PR comments, then prompts the running Codex tmux session when there is follow-up work.
 - commits should be logically; the narrative and progress is important, that that it builds/tests/lints for each commit
 - builds, tests and lints must pass before push
 - cc @martinothamar at the bottom of PR bodies
@@ -144,8 +191,8 @@ IMPORTANT: this is how you must work on PRs:
 
 Example lifecycle:
 
-1. Open PR with `agentdp-pr create`
-2. Wait for the subscriber to prompt follow-up, or manually check if you need immediate status
+1. Open PR with `gh pr create`, then register it with `agentdp-pr register`
+2. Wait for the subscriber to prompt follow-up, or manually check with `gh` if you need immediate status
 3. Local commit with CI fixes
 4. Check review comments
 5. Local commit per review comment fix
