@@ -39,6 +39,7 @@ Lets say we believe AI is here to stay, and that AI agents are going to be part 
 In my case, I work in a team alongside software engineers and designers building a software product. So in that context agents could help with essentially 2 things:
 - Speeding up development by letting agents complete tasks
 - Improving quality by making use of the agents "intelligence"/knowledge
+
 To do that and to do it efficiently the agents would have to operate more autonomously and with the same context and tools that
 the human software engineers and designers have. So for this to work we obviously have to scale beyound individiual team members computers with manual approvals..
 One could consider local sandbox as a stepping stone, but the one should be able to ship the sandbox to the cloud eventually if so.
