@@ -1,0 +1,18 @@
+[package]
+name = "agentdp-test-support"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agentdp-core.workspace = true
+agentdp-platform.workspace = true
+agentdp-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

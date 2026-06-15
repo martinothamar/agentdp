@@ -1,0 +1,59 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: test-networking
+spec:
+  phase: Running
+  replicas: 1
+  template:
+  
+    image:
+      os: archlinux
+  
+    user:
+      name: agent
+  
+    resources:
+      cpus: 2
+      memory: 2G
+      storage: 8G
+  
+    network:
+      mode: mediated
+      allow:
+        - example.com
+        - github.com
+        - ws.postman-echo.com
+        - geo.mirror.pkgbuild.com
+        - mirror.pkgbuild.com
+        - fastly.mirror.pkgbuild.com
+      ports:
+        ssh:
+          guest: 22
+          host: 4220
+          protocol: tcp
+  
+    bootstrap:
+      packages:
+        - curl
+        - git
+        - nodejs
+  
+      shell:
+        - chmod +x /data/home/network-smoke.sh /data/home/network-stress.sh /data/home/network-websocket-smoke.js
+  
+      healthchecks:
+        - name: ssh
+          kind: tcp
+          target: 127.0.0.1:22
+          timeout: 5m
+        - name: network_smoke
+          kind: command
+          command: /data/home/network-smoke.sh
+          timeout: 2m
+        - name: network_websocket
+          kind: command
+          command: /data/home/network-websocket-smoke.js
+          timeout: 2m
+    secrets: []
+    plugins: {}

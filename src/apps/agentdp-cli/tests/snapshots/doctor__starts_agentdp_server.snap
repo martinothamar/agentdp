@@ -1,0 +1,5 @@
+--- stdout
+ok    agentdp-server           responded to server.ping on $TMP/home/.agentdp/server.sock
+socket     $TMP/home/.agentdp/server.sock
+--- stderr
+

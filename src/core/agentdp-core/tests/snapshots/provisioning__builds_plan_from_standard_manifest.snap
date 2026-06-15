@@ -1,0 +1,13 @@
+image:
+  os: archlinux
+  architecture: X86_64
+  variant: Cloud
+hostname: altinn-studio
+guest_paths:
+  spec_dir: /var/lib/agentdp/spec
+  instance_spec: /var/lib/agentdp/spec/instance.json
+  manifest: /var/lib/agentdp/spec/agent-manifest.yaml
+  bootstrap_plan: /var/lib/agentdp/spec/bootstrap-plan.json
+  bootstrap_root: /var/lib/agentdp/bootstrap
+  bootstrap_state: /var/lib/agentdp/bootstrap-state.json
+  control: /dev/virtio-ports/agentdp.control

@@ -1,0 +1,13 @@
+status: 0
+--- stdout
+Usage: agentctl shell [OPTIONS] <INSTANCE_ID>
+
+Arguments:
+  <INSTANCE_ID>
+
+Options:
+  -f, --file <PATH>
+  -v, --verbose
+  -h, --help         Print help
+--- stderr
+

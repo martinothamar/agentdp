@@ -1,0 +1,183 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: altinn-studio
+spec:
+  phase: Running
+  replicas: 2
+  template:
+  
+    image:
+      os: archlinux
+  
+    user:
+      name: agent
+  
+    resources:
+      cpus: 8
+      memory: 16G
+      storage: 40G
+  
+    network:
+      mode: mediated
+      ca:
+        extra_env_vars:
+          - STUDIO_CA_BUNDLE
+      allow: all
+      host_aliases:
+        - address: 10.0.2.2
+          names:
+            - host.docker.internal
+      ports:
+        code_server:
+          guest: 4090
+          host: 4090
+          protocol: tcp
+        ssh:
+          guest: 22
+          protocol: tcp
+  
+    bootstrap:
+      package_update: true
+      packages:
+        - base-devel
+        - shellcheck
+        - unzip
+        - unrar
+        - vim
+        - fd
+        - which
+        - make
+        - htop
+        - btop
+        - dive
+        - strace
+        - gdb
+        - perf
+        - lsof
+        - tcpdump
+        - sysstat
+        - bpftrace
+        - bcc
+        - just
+        - hyperfine
+        - step-cli
+        - git
+        - openssh
+        - curl
+        - wget
+        - jq
+        - yq
+        - ast-grep
+        - actionlint
+        - kubectl
+        - kubectx
+        - helm
+        - hugo
+        - fluxcd
+        - k9s
+        - ripgrep
+  
+      repos:
+        - url: https://github.com/martinothamar-agent/altinn-studio.git
+          upstream: https://github.com/Altinn/altinn-studio.git
+        - url: https://github.com/martinothamar-agent/altinn-studio-docs.git
+          upstream: https://github.com/Altinn/altinn-studio-docs.git
+        - url: https://github.com/martinothamar-agent/altinn-storage.git
+          upstream: https://github.com/Altinn/altinn-storage.git
+        - url: https://github.com/martinothamar-agent/app-lib-dotnet.git
+          upstream: https://github.com/Altinn/app-lib-dotnet.git
+        - url: https://github.com/martinothamar-agent/app-frontend-react.git
+          upstream: https://github.com/Altinn/app-frontend-react.git
+        - url: https://github.com/martinothamar-agent/app-localtest.git
+          upstream: https://github.com/Altinn/app-localtest.git
+        - url: https://github.com/martinothamar-agent/altinn-studio-charts.git
+          upstream: https://github.com/Altinn/altinn-studio-charts.git
+        - url: https://github.com/martinothamar-agent/altinn-file-scan.git
+          upstream: https://github.com/Altinn/altinn-file-scan.git
+        - url: https://github.com/martinothamar-agent/altinn-receipt.git
+          upstream: https://github.com/Altinn/altinn-receipt.git
+  
+      healthchecks:
+        - name: code_server
+          kind: http
+          method: GET
+          url: http://127.0.0.1:4090/
+          timeout: 30m
+  
+    secrets:
+      - env: STUDIO_DEV_API_KEY
+        allow_hosts:
+          - dev.altinn.studio
+      - env: STUDIO_STAGING_API_KEY
+        allow_hosts:
+          - staging.altinn.studio
+      - env: STUDIO_PROD_API_KEY
+        allow_hosts:
+          - altinn.studio
+  
+    plugins:
+      git:
+        user:
+          name:
+            from_env: GIT_USER_NAME
+          email:
+            from_env: GIT_USER_EMAIL
+      docker:
+        compose: true
+        buildx: true
+        healthcheck: true
+      dotnet:
+        from_mise: true
+        tools:
+          - dotnet-dump
+          - dotnet-trace
+          - dotnet-counters
+          - dotnet-gcdump
+          - dotnet-symbol
+          - dotnet-sos
+          - ilspycmd
+          - dotnet-ef
+      go:
+        from_mise: true
+        tools:
+          - sigs.k8s.io/kind@latest
+          - code.gitea.io/tea@latest
+      mise:
+        packages:
+          - node@lts
+          - python@latest
+          - go@latest
+          - dotnet@8
+          - dotnet@9
+          - dotnet@10
+      node:
+        from_mise: true
+        corepack: true
+      browser:
+        playwright:
+          install: npm-global
+      codex:
+        yolo: true
+        auth: mediated
+        auth_source: host-auth
+      github:
+        auth: mediated
+        setup_git: true
+      tailscale_serve:
+        routes:
+          - service: code_server
+      code_server:
+        settings: data/home/.local/share/code-server/User/settings.json
+        trusted_domains:
+          - github.com
+          - "*.github.com"
+          - altinn.studio
+          - "*.altinn.studio"
+        restart_after_bootstrap: true
+        remove_extensions:
+          - github.copilot
+          - github.copilot-chat
+        extensions:
+          - EditorConfig.EditorConfig
+          - redhat.vscode-yaml

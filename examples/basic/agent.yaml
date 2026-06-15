@@ -1,0 +1,36 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: basic
+spec:
+  phase: Running
+  replicas: 1
+  template:
+  
+    image:
+      os: archlinux
+  
+    user:
+      name: agent
+  
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 4G
+  
+    network:
+      mode: mediated
+      allow: all
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+  
+    bootstrap:
+      healthchecks:
+        - name: ssh
+          kind: tcp
+          target: 127.0.0.1:22
+          timeout: 5m
+    secrets: []
+    plugins: {}

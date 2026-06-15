@@ -1,0 +1,20 @@
+[package]
+name = "agentdp-base64"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "base64_compare"
+harness = false

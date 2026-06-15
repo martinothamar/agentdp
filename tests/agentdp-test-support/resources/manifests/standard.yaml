@@ -1,0 +1,71 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: altinn-studio
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 4
+      memory: 16G
+      storage: 80G
+    network:
+      mode: mediated
+      ports:
+        code_server:
+          guest: 4090
+          protocol: tcp
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap:
+      packages:
+        - git
+      repos:
+        - url: https://github.com/martinothamar-agent/altinn-studio.git
+          upstream: https://github.com/Altinn/altinn-studio.git
+          path: altinn-studio
+      healthchecks:
+        - name: code_server
+          kind: http
+          method: GET
+          url: http://127.0.0.1:4090/
+          timeout: 60s
+    plugins:
+      docker:
+        compose: true
+        buildx: true
+        healthcheck: true
+      mise:
+        packages:
+          - node@lts
+          - dotnet@10
+      browser:
+        playwright:
+          install: npm-global
+      dotnet:
+        from_mise: true
+        tools:
+          - dotnet-trace
+          - ilspycmd
+      go:
+        from_mise: true
+        tools:
+          - sigs.k8s.io/kind@latest
+          - code.gitea.io/tea@latest
+      codex:
+        yolo: true
+        auth: mediated
+      github:
+        auth: mediated
+        setup_git: true
+      code_server:
+        settings: data/home/.local/share/code-server/User/settings.json
+        extensions:
+          - redhat.vscode-yaml
+    secrets: []

@@ -1,0 +1,36 @@
+--- meta-data
+instance-id: altinn-studio
+local-hostname: altinn-studio
+--- network-config
+version: 1
+config:
+  - type: physical
+    name: eth0
+    mac_address: '52:54:00:65:43:21'
+    subnets:
+      - type: static
+        address: 10.73.0.10/24
+        gateway: 10.73.0.1
+        dns_nameservers:
+          - 10.73.0.1
+--- user-data
+#cloud-config
+bootcmd:
+- mkdir -p /etc/systemd/system/systemd-time-wait-sync.service.d && printf '[Service]\nTimeoutStartSec=30s\n' >/etc/systemd/system/systemd-time-wait-sync.service.d/agentdp-timeout.conf && systemctl daemon-reload || true
+- pacman-key --init
+- pacman-key --populate archlinux
+- |-
+  if [ -f /var/lib/agentdp/ca/ca-bundle.pem ]; then
+    install -d -m 0755 /etc/ca-certificates/trust-source/anchors
+    install -m 0644 /var/lib/agentdp/ca/ca-bundle.pem /etc/ca-certificates/trust-source/anchors/agentdp-ca-bundle.crt
+    if command -v trust >/dev/null 2>&1; then trust extract-compat || true; fi
+    if command -v update-ca-trust >/dev/null 2>&1; then update-ca-trust extract || true; fi
+  fi
+- pacman -Sy --noconfirm archlinux-keyring
+users:
+- default
+- name: agent
+  homedir: /data/home
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  shell: /bin/bash
+write_files: []

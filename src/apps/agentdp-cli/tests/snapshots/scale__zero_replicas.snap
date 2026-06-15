@@ -1,0 +1,22 @@
+status: 0
+--- stdout
+scaled altinn-studio
+desired generation: 2
+observed generation: 1
+phase: Running
+replicas: 0
+ready replicas: 0
+reconciling: true
+base: agent base ready
+0: runtime running
+0: stopping runtime
+accepted scale to 0 replicas for generation 2
+0: runtime stopped
+wait altinn-studio
+generation: 2
+condition: Stopped
+status: Satisfied
+observed generation: 2
+ready replicas: 0/0
+--- stderr
+

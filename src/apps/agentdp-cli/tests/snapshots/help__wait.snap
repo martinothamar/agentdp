@@ -1,0 +1,13 @@
+status: 0
+--- stdout
+Usage: agentctl wait [OPTIONS]
+
+Options:
+  -f, --file <PATH>
+  -v, --verbose
+      --generation <GENERATION>
+      --for <CONDITION>            [default: ready] [possible values: accepted, observed, ready, paused, stopped, deleted]
+      --timeout-seconds <SECONDS>
+  -h, --help                       Print help
+--- stderr
+

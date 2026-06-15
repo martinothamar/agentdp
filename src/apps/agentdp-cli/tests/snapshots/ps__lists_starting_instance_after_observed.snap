@@ -1,0 +1,6 @@
+status: 0
+--- stdout
+instances:
+  altinn-studio/0: running pid:$PID readiness:unknown
+--- stderr
+

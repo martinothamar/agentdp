@@ -1,0 +1,21 @@
+status: 0
+--- stdout
+Usage: agentctl logs [OPTIONS] <INSTANCE_ID>
+
+Arguments:
+  <INSTANCE_ID>
+
+Options:
+  -f, --file <PATH>
+  -v, --verbose
+      --serial...
+      --qemu...
+      --events...      Read the raw instance event log
+      --network...     Read network events from the instance event log
+      --errors         Show only network events classified as errors
+      --kind <KIND>    Show only network events of this kind [possible values: lifecycle, telemetry, transport, egress, dns, host-port, reactor]
+      --json           Print raw matching event JSON lines
+      --lines <LINES>  [default: 200] [aliases: --tail]
+  -h, --help           Print help
+--- stderr
+

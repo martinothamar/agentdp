@@ -1,0 +1,7 @@
+AllocationReport {
+    allocations: 0,
+    allocated_bytes: 0,
+    deallocations: 0,
+    deallocated_bytes: 0,
+    reallocations: 0,
+}

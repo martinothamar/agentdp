@@ -1,0 +1,73 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: test-auth
+spec:
+  phase: Running
+  replicas: 1
+  template:
+  
+    image:
+      os: archlinux
+  
+    user:
+      name: agent
+  
+    resources:
+      cpus: 2
+      memory: 3G
+      storage: 10G
+  
+    network:
+      mode: mediated
+      allow:
+        - api.github.com
+        - github.com
+        - objects.githubusercontent.com
+        - api.openai.com
+        - chatgpt.com
+        - ab.chatgpt.com
+        - registry.npmjs.org
+        - nodejs.org
+        - mise-versions.jdx.dev
+        - geo.mirror.pkgbuild.com
+        - mirror.pkgbuild.com
+        - fastly.mirror.pkgbuild.com
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+  
+    bootstrap:
+      packages:
+        - git
+        - jq
+        - curl
+        - nodejs
+        - npm
+  
+      shell:
+        - chmod +x /data/home/auth-smoke.sh
+  
+      healthchecks:
+        - name: ssh
+          kind: tcp
+          target: 127.0.0.1:22
+          timeout: 5m
+        - name: auth_smoke
+          kind: command
+          command: sudo -u agent -H bash -lc /data/home/auth-smoke.sh
+          timeout: 5m
+  
+    plugins:
+      mise:
+        packages:
+          - node@lts
+      codex:
+        yolo: true
+        auth: mediated
+        auth_source: host-auth
+      github:
+        auth: mediated
+        setup_git: true
+    secrets: []

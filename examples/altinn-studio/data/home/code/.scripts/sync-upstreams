@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: sync-upstreams [options] [repo-or-path ...]
+
+Sync direct child git repositories in the code folder from upstream main/master.
+When repo-or-path arguments are provided, sync only those repositories.
+
+Default behavior:
+  - scans only direct child directories of the code directory
+  - requires origin and upstream remotes
+  - prefers upstream/main, falls back to upstream/master
+  - fast-forwards origin/<main|master> to upstream/<main|master>
+  - fast-forwards the local branch too when it exists and the worktree is clean
+  - skips divergent forks instead of rewriting history
+
+Options:
+  --dry-run              Show what would be pushed without changing remotes
+  --force-with-lease     Allow updating divergent origin branches
+  --include-dirty-local  Allow local branch fast-forward checks in dirty worktrees
+  -h, --help             Show this help
+
+Examples:
+  sync-upstreams
+  sync-upstreams --dry-run altinn-studio
+  sync-upstreams ../code/altinn-studio-docs /data/home/code/app-lib-dotnet
+EOF
+}
+
+dry_run=false
+force_with_lease=false
+include_dirty_local=false
+repo_args=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)
+      dry_run=true
+      ;;
+    --force-with-lease)
+      force_with_lease=true
+      ;;
+    --include-dirty-local)
+      include_dirty_local=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $arg" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      repo_args+=("$arg")
+      ;;
+  esac
+done
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+code_dir="$(cd "$script_dir/.." && pwd)"
+
+ok=0
+skipped=0
+failed=0
+
+has_remote() {
+  local repo=$1
+  local remote=$2
+  git -C "$repo" remote get-url "$remote" >/dev/null 2>&1
+}
+
+ref_exists() {
+  local repo=$1
+  local ref=$2
+  git -C "$repo" show-ref --verify --quiet "$ref"
+}
+
+is_ancestor() {
+  local repo=$1
+  local older=$2
+  local newer=$3
+  git -C "$repo" merge-base --is-ancestor "$older" "$newer"
+}
+
+is_dirty() {
+  local repo=$1
+  [[ -n "$(git -C "$repo" status --porcelain)" ]]
+}
+
+current_branch() {
+  local repo=$1
+  git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true
+}
+
+is_git_worktree() {
+  local repo=$1
+  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+normalize_dir() {
+  local path=$1
+  (cd "$path" && pwd)
+}
+
+resolve_repo_arg() {
+  local arg=$1
+  local candidate
+
+  if [[ "$arg" == /* ]]; then
+    candidate=$arg
+  elif [[ -e "$PWD/$arg" ]]; then
+    candidate="$PWD/$arg"
+  else
+    candidate="$code_dir/$arg"
+  fi
+
+  if [[ ! -d "$candidate" ]]; then
+    echo "Argument is not a directory: $arg" >&2
+    return 1
+  fi
+
+  candidate="$(normalize_dir "$candidate")"
+  if ! is_git_worktree "$candidate"; then
+    echo "Argument is not a git repository: $arg" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$candidate"
+}
+
+sync_repo() {
+  local repo=$1
+  local name
+  local branch=
+  local checked_out_branch
+  local upstream_ref
+  local origin_ref
+  local local_branch_ref
+  local push_args=()
+
+  name="$(basename "$repo")"
+  echo "==> $name"
+
+  if ! has_remote "$repo" origin || ! has_remote "$repo" upstream; then
+    echo "    skip: missing origin or upstream remote"
+    skipped=$((skipped + 1))
+    return
+  fi
+
+  git -C "$repo" fetch --prune --quiet upstream || return 1
+  git -C "$repo" fetch --prune --quiet origin || return 1
+
+  if ref_exists "$repo" refs/remotes/upstream/main; then
+    branch=main
+  elif ref_exists "$repo" refs/remotes/upstream/master; then
+    branch=master
+  else
+    echo "    skip: upstream has neither main nor master"
+    skipped=$((skipped + 1))
+    return
+  fi
+
+  upstream_ref="refs/remotes/upstream/$branch"
+  origin_ref="refs/remotes/origin/$branch"
+  local_branch_ref="refs/heads/$branch"
+
+  if ref_exists "$repo" "$origin_ref"; then
+    if ! is_ancestor "$repo" "$origin_ref" "$upstream_ref"; then
+      if [[ "$force_with_lease" == true ]]; then
+        push_args+=(--force-with-lease="refs/heads/$branch:$(git -C "$repo" rev-parse "$origin_ref")")
+      else
+        echo "    skip: origin/$branch has commits not in upstream/$branch; rerun with --force-with-lease to overwrite the fork branch"
+        skipped=$((skipped + 1))
+        return
+      fi
+    fi
+  fi
+
+  if ref_exists "$repo" "$local_branch_ref"; then
+    checked_out_branch="$(current_branch "$repo")"
+    if [[ "$include_dirty_local" == true ]] || ! is_dirty "$repo"; then
+      if is_ancestor "$repo" "$local_branch_ref" "$upstream_ref"; then
+        if [[ "$dry_run" == true ]]; then
+          echo "    dry-run: local $branch -> upstream/$branch"
+        else
+          if [[ "$checked_out_branch" == "$branch" ]]; then
+            git -C "$repo" merge --ff-only "$upstream_ref" >/dev/null || return 1
+          else
+            git -C "$repo" branch --force "$branch" "$upstream_ref" >/dev/null || return 1
+          fi
+          echo "    local $branch -> upstream/$branch"
+        fi
+      else
+        echo "    local $branch not moved: it has commits not in upstream/$branch"
+      fi
+    else
+      echo "    local $branch not moved: dirty worktree"
+    fi
+  fi
+
+  if [[ "$dry_run" == true ]]; then
+    echo "    dry-run: git push origin $upstream_ref:refs/heads/$branch"
+  else
+    git -C "$repo" push "${push_args[@]}" origin "$upstream_ref:refs/heads/$branch" || return 1
+  fi
+
+  echo "    synced $branch"
+  ok=$((ok + 1))
+}
+
+if (( ${#repo_args[@]} > 0 )); then
+  for repo_arg in "${repo_args[@]}"; do
+    if candidate="$(resolve_repo_arg "$repo_arg")"; then
+      if ! sync_repo "$candidate"; then
+        echo "    failed"
+        failed=$((failed + 1))
+      fi
+    else
+      failed=$((failed + 1))
+    fi
+  done
+else
+  for candidate in "$code_dir"/*; do
+    [[ -d "$candidate/.git" ]] || continue
+    if ! sync_repo "$candidate"; then
+      echo "    failed"
+      failed=$((failed + 1))
+    fi
+  done
+fi
+
+if (( ok == 0 && skipped == 0 && failed == 0 )); then
+  echo "No repositories found."
+  failed=1
+fi
+
+echo
+echo "Summary: synced=$ok skipped=$skipped failed=$failed"
+
+if (( failed > 0 )); then
+  exit 1
+fi

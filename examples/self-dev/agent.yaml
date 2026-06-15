@@ -1,0 +1,122 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: self-dev
+spec:
+  phase: Running
+  replicas: 1
+  template:
+  
+    image:
+      os: archlinux
+  
+    user:
+      name: agent
+      linux:
+        groups:
+          - kvm
+  
+    resources:
+      cpus: 8
+      memory: 16G
+      storage: 40G
+  
+    network:
+      mode: mediated
+      allow: all
+      host_aliases:
+        - address: 10.0.2.2
+          names:
+            - host.docker.internal
+      ports:
+        code_server:
+          guest: 3090
+          host: 3090
+          protocol: tcp
+        ssh:
+          guest: 22
+          protocol: tcp
+  
+    bootstrap:
+      packages:
+        - base-devel
+        - git
+        - openssh
+        - curl
+        - wget
+        - jq
+        - yq
+        - ast-grep
+        - ripgrep
+        - fd
+        - just
+        - make
+        - shellcheck
+        - vim
+        - htop
+        - btop
+        - strace
+        - gdb
+        - lsof
+        - hyperfine
+        - qemu-img
+        - qemu-system-x86
+        - cargo-nextest
+        - rust-analyzer
+        - chromium
+        - noto-fonts
+  
+      repos:
+        - url: https://github.com/martinothamar/agentdp.git
+        - url: https://github.com/earendil-works/gondolin.git
+        - url: https://github.com/superradcompany/microsandbox.git
+  
+      healthchecks:
+        - name: code_server
+          kind: http
+          method: GET
+          url: http://127.0.0.1:3090/
+          timeout: 30m
+  
+    plugins:
+      git:
+        user:
+          name:
+            from_env: GIT_USER_NAME
+          email:
+            from_env: GIT_USER_EMAIL
+        defaults:
+          init_default_branch: main
+          autocrlf: false
+      docker:
+        compose: true
+        buildx: true
+        healthcheck: true
+      mise:
+        packages:
+          - node@lts
+          - rust@latest
+          - python@latest
+          - go@latest
+      codex:
+        yolo: true
+        auth: mediated
+        auth_source: host-auth
+      github:
+        auth: mediated
+        setup_git: true
+      tailscale_serve:
+        routes:
+          - service: code_server
+      code_server:
+        settings: data/home/.local/share/code-server/User/settings.json
+        trusted_domains:
+          - github.com
+          - "*.github.com"
+        restart_after_bootstrap: true
+        extensions:
+          - EditorConfig.EditorConfig
+          - redhat.vscode-yaml
+          - tamasfe.even-better-toml
+          - rust-lang.rust-analyzer
+    secrets: []

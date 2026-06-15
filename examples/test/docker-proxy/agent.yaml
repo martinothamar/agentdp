@@ -1,0 +1,53 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: test-docker-proxy
+spec:
+  phase: Running
+  replicas: 1
+  template:
+  
+    image:
+      os: archlinux
+  
+    user:
+      name: agent
+  
+    resources:
+      cpus: 2
+      memory: 2G
+      storage: 10G
+  
+    network:
+      mode: mediated
+      allow: all
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+  
+    bootstrap:
+      packages:
+        - curl
+        - python
+  
+      shell:
+        - chmod +x /data/home/docker-proxy-smoke.py
+  
+      healthchecks:
+        - name: ssh
+          kind: tcp
+          target: 127.0.0.1:22
+          timeout: 5m
+        - name: docker_proxy_smoke
+          kind: command
+          command: /data/home/docker-proxy-smoke.py
+          timeout: 60s
+  
+    plugins:
+      docker:
+        compose: true
+        buildx: true
+        healthcheck: true
+      podman: {}
+    secrets: []

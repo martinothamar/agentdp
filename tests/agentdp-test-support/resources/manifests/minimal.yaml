@@ -1,0 +1,25 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: altinn-studio
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 8G
+    network:
+      mode: mediated
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    secrets: []
+    plugins: {}

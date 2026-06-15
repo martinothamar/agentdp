@@ -1,0 +1,39 @@
+status: 0
+--- stdout
+applied altinn-studio
+desired generation: 1
+observed generation: 0
+phase: Running
+replicas: 1
+ready replicas: 0
+reconciling: true
+base: building agent base
+accepted desired generation 1
+base: preparing agent base files
+base: creating agent base disk
+base: starting agent base bootstrap VM
+base: waiting for agent base bootstrap
+base: guest control channel connected
+base: guestd system connected for altinn-studio/agent-base
+base: bootstrap passed completed:0 pending:0
+base: bootstrap finished passed
+base: stopping agent base bootstrap VM
+base: agent base ready
+0: instance materialized
+0: starting runtime
+0: runtime running
+0: waiting for bootstrap
+0: guest control channel connected
+0: guestd system connected for altinn-studio/replica-0
+0: bootstrap passed completed:0 pending:0
+0: bootstrap finished passed
+0: checking guest access
+0: ready code_server=$PORT ssh=$PORT
+wait altinn-studio
+generation: 1
+condition: Ready
+status: Satisfied
+observed generation: 1
+ready replicas: 1/1
+--- stderr
+

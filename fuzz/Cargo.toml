@@ -1,0 +1,60 @@
+[package]
+name = "agentdp-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+agentdp-base64 = { path = "../src/libs/agentdp-base64" }
+agentdp-core = { path = "../src/core/agentdp-core" }
+agentdp-network = { path = "../src/libs/agentdp-network" }
+agentdp-protocol = { path = "../src/core/agentdp-protocol" }
+arbitrary = { version = "1.4.2", features = ["derive"] }
+base64 = "0.22.1"
+libfuzzer-sys = "0.4.12"
+serde_yaml = "0.9.34"
+
+[[bin]]
+name = "base64_encode"
+path = "fuzz_targets/base64_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_guest_line_decode"
+path = "fuzz_targets/server_guest_line_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_parse_validate"
+path = "fuzz_targets/manifest_parse_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cloud_init_render"
+path = "fuzz_targets/cloud_init_render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "network_secret_bindings"
+path = "fuzz_targets/network_secret_bindings.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,20 @@
+[package]
+name = "agentdp-crypto"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+default = []
+fixtures = []
+
+[dependencies]
+rcgen.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+time.workspace = true
+webpki-roots.workspace = true
+
+[lints]
+workspace = true

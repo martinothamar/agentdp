@@ -1,0 +1,1021 @@
+base:
+  packages:
+  - git
+  - sudo
+  - cloud-utils-growpart
+  - gdisk
+  - gzip
+  - hostname
+  - tmux
+  - policycoreutils
+  - policycoreutils-python-utils
+  - docker
+  - docker-compose
+  - docker-buildx
+  - curl
+  repos: []
+  shell: []
+  healthchecks: []
+  steps:
+  - id: system.prep
+    label: Prepare system
+    phase: system
+    depends_on: []
+    resources:
+    - systemd
+    script: steps/system.prep.sh
+    working_directory: /
+    timeout_seconds: 300
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+
+      mkdir -p '/data/home' '/data/home/code'
+      chown -R 'agent':'agent' '/data/home'
+
+      install -d -m 0755 '/usr/local/bin' '/usr/local/lib/agentdp' /etc/profile.d
+      cat >'/usr/local/lib/agentdp/env.sh' <<'EOF'
+      PATH="${PATH:-/usr/bin:/bin}"
+
+      agentdp_prepend_path() {
+        agentdp_path_value=
+        agentdp_old_ifs=$IFS
+        IFS=:
+        for agentdp_path_entry in ${PATH:-}; do
+          if [ -n "$agentdp_path_entry" ] && [ "$agentdp_path_entry" != "$1" ]; then
+            agentdp_path_value="${agentdp_path_value:+$agentdp_path_value:}$agentdp_path_entry"
+          fi
+        done
+        IFS=$agentdp_old_ifs
+        PATH="$1${agentdp_path_value:+:$agentdp_path_value}"
+      }
+
+      agentdp_prepend_path "/bin"
+      agentdp_prepend_path "/usr/bin"
+      agentdp_prepend_path "/usr/local/bin"
+      export PATH
+
+      export AGENTDP_CODE_DIR='/data/home/code'
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      if [ -r '/run/agentdp/.env' ]; then
+        set -a
+        # shellcheck source=/dev/null
+        . '/run/agentdp/.env'
+        set +a
+      fi
+      if [ -r /var/lib/agentdp/ca/ca-bundle.pem ]; then
+        export AGENTDP_CA_ENV_VARS='NODE_EXTRA_CA_CERTS,NPM_CONFIG_CAFILE,SSL_CERT_FILE,GIT_SSL_CAINFO,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE'
+        export NODE_EXTRA_CA_CERTS=/var/lib/agentdp/ca/ca-bundle.pem
+        export NPM_CONFIG_CAFILE=/var/lib/agentdp/ca/ca-bundle.pem
+        export SSL_CERT_FILE=/var/lib/agentdp/ca/ca-bundle.pem
+        export GIT_SSL_CAINFO=/var/lib/agentdp/ca/ca-bundle.pem
+        export CURL_CA_BUNDLE=/var/lib/agentdp/ca/ca-bundle.pem
+        export REQUESTS_CA_BUNDLE=/var/lib/agentdp/ca/ca-bundle.pem
+      fi
+
+      if [ "${HOME:-}" = "/data/home" ] || [ "${USER:-}" = "agent" ]; then
+        agentdp_prepend_path "/data/home/.dotnet/tools"
+        agentdp_prepend_path "/data/home/.cargo/bin"
+        agentdp_prepend_path "/data/home/go/bin"
+        agentdp_prepend_path "/data/home/.local/bin"
+        export PLAYWRIGHT_MCP_EXECUTABLE_PATH='/usr/bin/chromium'
+        export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH='/usr/bin/chromium'
+        export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+        agentdp_prepend_path '/data/home/.local/share/mise/shims'
+
+        if [ -d '/data/home/.local/share/mise/installs/dotnet' ]; then
+          agentdp_dotnet_root="$(find '/data/home/.local/share/mise/installs/dotnet' -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          if [ -n "$agentdp_dotnet_root" ]; then
+            export DOTNET_ROOT="$agentdp_dotnet_root"
+            export DOTNET_ROOT_X64="$DOTNET_ROOT"
+          fi
+          unset agentdp_dotnet_root
+        fi
+        export PATH
+      fi
+
+      unset agentdp_path_entry agentdp_path_value agentdp_old_ifs
+      unset -f agentdp_prepend_path
+      EOF
+      chmod 0644 '/usr/local/lib/agentdp/env.sh'
+      cat >'/usr/local/bin/agentdp-agent-env' <<'EOF'
+      #!/usr/bin/env sh
+      export HOME='/data/home'
+      . '/usr/local/lib/agentdp/env.sh'
+      exec "$@"
+      EOF
+      chmod 0755 '/usr/local/bin/agentdp-agent-env'
+      cat >"/etc/profile.d/agentdp-agent.sh" <<'EOF'
+      . '/usr/local/lib/agentdp/env.sh'
+      EOF
+      chmod 0644 "/etc/profile.d/agentdp-agent.sh"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      grow_agentdp_root() {
+        local root_source root_fstype parent partnum grow_output
+        root_source="$(findmnt -no SOURCE / || true)"
+        root_fstype="$(findmnt -no FSTYPE / || true)"
+        if [ -z "$root_source" ] || [ ! -b "$root_source" ]; then
+          echo "agentdp grow-root skipped: root source is not a block device: $root_source"
+          return 0
+        fi
+        parent="$(lsblk -no PKNAME "$root_source" | head -n1 || true)"
+        partnum="$(lsblk -no PARTN "$root_source" | head -n1 || true)"
+        if [ -z "$parent" ] || [ -z "$partnum" ]; then
+          echo "agentdp grow-root skipped: root source is not a partition: $root_source"
+          return 0
+        fi
+        echo "Growing root partition $root_source on /dev/$parent"
+        if ! grow_output="$(growpart "/dev/$parent" "$partnum" 2>&1)"; then
+          if ! printf '%s\n' "$grow_output" | grep -qi 'NOCHANGE'; then
+            printf '%s\n' "$grow_output" >&2
+            return 1
+          fi
+        fi
+        if [ -n "$grow_output" ]; then
+          printf '%s\n' "$grow_output"
+        fi
+        udevadm settle || true
+        case "$root_fstype" in
+          ext2|ext3|ext4)
+            resize2fs "$root_source"
+            ;;
+          xfs)
+            if command -v xfs_growfs >/dev/null 2>&1; then
+              xfs_growfs /
+            else
+              echo "agentdp grow-root skipped: xfs_growfs is not installed"
+            fi
+            ;;
+          btrfs)
+            if command -v btrfs >/dev/null 2>&1; then
+              btrfs filesystem resize max /
+            else
+              echo "agentdp grow-root skipped: btrfs is not installed"
+            fi
+            ;;
+          *)
+            echo "agentdp grow-root skipped: unsupported root filesystem: $root_fstype"
+            ;;
+        esac
+      }
+      grow_agentdp_root
+      unset -f grow_agentdp_root
+
+      install -d -o 'agent' -g 'agent' -m 0700 '/data/home'
+      if [ ! -e '/data/home/.tmux.conf' ]; then
+        cat >'/data/home/.tmux.conf' <<'EOF'
+      set -g mouse on
+      set -g history-limit 100000
+      setw -g mode-keys vi
+      EOF
+        chown 'agent':'agent' '/data/home/.tmux.conf'
+        chmod 0600 '/data/home/.tmux.conf'
+      fi
+
+      install -d -m 0755 /usr/local/lib/agentdp
+      cat >/usr/local/lib/agentdp/sync-hostname-from-seed.sh <<'EOF'
+      #!/usr/bin/env sh
+      set -eu
+      device="$(blkid -L CIDATA 2>/dev/null || blkid -L cidata 2>/dev/null || true)"
+      [ -n "$device" ] || exit 0
+      mount_dir="$(mktemp -d)"
+      cleanup() {
+        umount "$mount_dir" >/dev/null 2>&1 || true
+        rmdir "$mount_dir" >/dev/null 2>&1 || true
+      }
+      trap cleanup EXIT
+      mount -o ro "$device" "$mount_dir" >/dev/null 2>&1 || exit 0
+      hostname="$(sed -n 's/^local-hostname:[[:space:]]*//p' "$mount_dir/meta-data" 2>/dev/null | head -n1 | tr -d "\"'")"
+      case "$hostname" in
+        ""|.*|-*|*-|*[!A-Za-z0-9.-]*) exit 0 ;;
+      esac
+      hostnamectl set-hostname "$hostname" || printf '%s\n' "$hostname" >/etc/hostname
+      EOF
+      chmod 0755 /usr/local/lib/agentdp/sync-hostname-from-seed.sh
+      cat >/etc/systemd/system/agentdp-hostname.service <<'EOF'
+      [Unit]
+      Description=Sync agentdp guest hostname from cloud-init seed
+      After=local-fs.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/lib/agentdp/sync-hostname-from-seed.sh
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable agentdp-hostname.service
+      /usr/local/lib/agentdp/sync-hostname-from-seed.sh || true
+  - id: system.packages
+    label: Install system packages
+    phase: system
+    depends_on:
+    - system.prep
+    resources:
+    - package_manager
+    script: steps/system.packages.sh
+    working_directory: /
+    timeout_seconds: 1800
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      dnf -y install 'git' 'sudo' 'cloud-utils-growpart' 'gdisk' 'gzip' 'hostname' 'tmux' 'policycoreutils' 'policycoreutils-python-utils' 'docker' 'docker-compose' 'docker-buildx' 'curl'
+  - id: system.agent_user
+    label: Prepare agent user
+    phase: system
+    depends_on:
+    - system.packages
+    resources:
+    - user_db
+    script: steps/system.agent_user.sh
+    working_directory: /
+    timeout_seconds: 300
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if command -v sudo >/dev/null 2>&1; then
+        install -d -m 0750 /etc/sudoers.d
+        printf '%s ALL=(ALL) NOPASSWD:ALL\n' 'agent' >/etc/sudoers.d/agentdp-agent
+        chmod 0440 /etc/sudoers.d/agentdp-agent
+      fi
+
+      chown -R 'agent':'agent' '/data/home' '/data/home/code'
+
+      if [ -d '/data/home/.ssh' ]; then
+        chown -R 'agent':'agent' '/data/home/.ssh'
+        chmod 0700 '/data/home/.ssh'
+        if [ -f '/data/home/.ssh/authorized_keys' ]; then
+          chmod 0600 '/data/home/.ssh/authorized_keys'
+        fi
+      fi
+      if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null || true)" != Disabled ]; then
+        if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then
+          semanage fcontext -a -t user_home_dir_t '/data/home' 2>/dev/null || semanage fcontext -m -t user_home_dir_t '/data/home' || true
+          semanage fcontext -a -t user_home_t '/data/home/.*' 2>/dev/null || semanage fcontext -m -t user_home_t '/data/home/.*' || true
+          semanage fcontext -a -t ssh_home_t '/data/home/\.ssh(/.*)?' 2>/dev/null || semanage fcontext -m -t ssh_home_t '/data/home/\.ssh(/.*)?' || true
+          restorecon -RF '/data/home'
+        elif command -v chcon >/dev/null 2>&1; then
+          chcon -R -t user_home_t '/data/home' || true
+          chcon -t user_home_dir_t '/data/home' || true
+          if [ -d '/data/home/.ssh' ]; then chcon -R -t ssh_home_t '/data/home/.ssh' || true; fi
+        fi
+      fi
+
+      if getent group 'docker' >/dev/null 2>&1 && id 'agent' >/dev/null 2>&1; then
+        usermod -aG 'docker' 'agent'
+      fi
+  - id: system.guest_tooling
+    label: Install guest tooling
+    phase: system
+    depends_on:
+    - system.packages
+    - system.agent_user
+    resources:
+    - guest_tooling
+    - systemd
+    script: steps/system.guest_tooling.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 '/usr/local/bin' /etc/systemd/user
+      test -x '/usr/local/bin/guestd'
+      gzip -dc '/run/agentdp/bin/guestctl.gz' >'/usr/local/bin/guestctl'
+      chmod 0755 '/usr/local/bin/guestctl'
+      cat >/etc/systemd/user/guestd.service <<'EOF'
+      [Unit]
+      Description=agentdp guest helper daemon
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      Environment=AGENTDP_STATE_DIR=%h/.local/state/agentdp
+      Environment=AGENTDP_PR_REGISTRY=%h/.local/state/agentdp/pr-watch.json
+      Environment=AGENTDP_CODEX_PANE_FILE=%h/.local/state/agentdp/codex-pane-id
+      ExecStart=/usr/local/bin/agentdp-agent-env /usr/local/bin/guestd
+      Restart=always
+      RestartSec=20
+
+      [Install]
+      WantedBy=default.target
+      EOF
+      if command -v loginctl >/dev/null 2>&1; then
+        loginctl enable-linger 'agent' || true
+      fi
+  - id: plugin.browser.rocky
+    label: Install Rocky browser packages
+    phase: system
+    depends_on:
+    - system.packages
+    resources:
+    - package_manager
+    script: steps/plugin.browser.rocky.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      dnf -y install epel-release || dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+      dnf -y install 'chromium' google-noto-sans-fonts
+      if [ ! -x /usr/bin/chromium ] && [ -x /usr/bin/chromium-browser ]; then ln -sf /usr/bin/chromium-browser /usr/bin/chromium; fi
+  - id: plugin.codex.session
+    label: Configure Codex session service
+    phase: system
+    depends_on:
+    - system.guest_tooling
+    resources:
+    - systemd
+    script: steps/plugin.codex.session.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 /etc/systemd/user/guestd.service.d
+      cat >/etc/systemd/user/guestd.service.d/codex.conf <<'EOF'
+      [Service]
+      Environment=AGENTDP_CODEX_SESSION=1
+      EOF
+  - id: plugin.github.cli
+    label: Install GitHub CLI
+    phase: system
+    depends_on:
+    - system.packages
+    resources:
+    - package_manager
+    script: steps/plugin.github.cli.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if ! command -v gh >/dev/null 2>&1; then
+        dnf -y install dnf-plugins-core
+        dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo || true
+        dnf -y install gh
+      fi
+  - id: plugin.code_server.setup
+    label: Install code-server
+    phase: system
+    depends_on:
+    - system.agent_user
+    resources:
+    - systemd
+    script: steps/plugin.code_server.setup.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if ! command -v code-server >/dev/null 2>&1; then
+        curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix='/usr/local'
+      fi
+      cat >/etc/systemd/system/code-server.service <<'EOF'
+      [Unit]
+      Description=agentdp code-server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=agent
+      Group=agent
+      WorkingDirectory=/data/home/code
+      ExecStart=/usr/local/bin/agentdp-agent-env /usr/local/bin/code-server --bind-addr 0.0.0.0:4090 --auth none /data/home/code
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable --now code-server.service
+  - id: plugin.browser.playwright_npm
+    label: Install Playwright npm tools
+    phase: user
+    depends_on:
+    - plugin.browser.rocky
+    - plugin.mise
+    resources:
+    - agent_home
+    - npm_global
+    script: steps/plugin.browser.playwright_npm.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ ! -x '/usr/bin/chromium' ]; then
+        echo '/usr/bin/chromium is missing; Playwright requires plugins.browser.playwright.browser_package' >&2
+        exit 1
+      fi
+      npm config set prefix "$HOME/.local"
+      npm install -g \
+        'playwright@latest' '@playwright/test@latest' '@playwright/mcp@latest'
+      node -e "const fs = require('fs'); const browser = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH; if (!browser || !fs.existsSync(browser)) { process.exit(1); }"
+      playwright-mcp --help >/dev/null
+  - id: plugin.dotnet.tools
+    label: Install .NET tools
+    phase: user
+    depends_on:
+    - plugin.mise
+    resources:
+    - agent_home
+    script: steps/plugin.dotnet.tools.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      dotnet tool install --global 'dotnet-trace' || dotnet tool update --global 'dotnet-trace'
+      dotnet tool install --global 'ilspycmd' || dotnet tool update --global 'ilspycmd'
+  - id: plugin.go.tools
+    label: Install Go tools
+    phase: user
+    depends_on:
+    - plugin.mise
+    resources:
+    - agent_home
+    script: steps/plugin.go.tools.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      go install 'sigs.k8s.io/kind@latest'
+      go install 'code.gitea.io/tea@latest'
+  - id: plugin.codex.install
+    label: Install Codex
+    phase: user
+    depends_on:
+    - plugin.mise
+    resources:
+    - agent_home
+    - npm_global
+    script: steps/plugin.codex.install.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 "$HOME/.local/bin" "$HOME/.local/share/agentdp/codex"
+      npm install -g --prefix "$HOME/.local/share/agentdp/codex" @openai/codex@latest
+      cat >"$HOME/.local/bin/codex" <<'EOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      codex_real="$HOME/.local/share/agentdp/codex/bin/codex"
+      if [ ! -x "$codex_real" ]; then
+        echo "agentdp codex wrapper could not find $codex_real" >&2
+        exit 127
+      fi
+      exec "$codex_real" --sandbox danger-full-access --ask-for-approval never "$@"
+      EOF
+      chmod 0755 "$HOME/.local/bin/codex"
+  - id: plugin.code_server.extensions
+    label: Install code-server extensions
+    phase: user
+    depends_on:
+    - plugin.code_server.setup
+    resources:
+    - agent_home
+    script: steps/plugin.code_server.extensions.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      code-server --install-extension 'redhat.vscode-yaml' || true
+  - id: plugin.mise
+    label: Install mise runtimes
+    phase: user
+    depends_on:
+    - system.agent_user
+    resources:
+    - agent_home
+    - mise
+    script: steps/plugin.mise.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if ! command -v mise >/dev/null 2>&1; then
+        curl https://mise.run | sh
+      fi
+      if command -v mise >/dev/null 2>&1; then
+        mise use --global 'node@lts'
+        mise use --global 'dotnet@10'
+        mise reshim
+      fi
+instance:
+  packages: []
+  repos:
+  - name: altinn-studio
+    url: https://github.com/martinothamar-agent/altinn-studio.git
+    path: altinn-studio
+    upstream: https://github.com/Altinn/altinn-studio.git
+  shell: []
+  healthchecks:
+  - name: code_server
+    kind: http
+    method: GET
+    url: http://127.0.0.1:4090/
+    timeout: 60s
+  - name: docker
+    kind: command
+    command: docker ps
+    timeout: 60s
+  steps:
+  - id: system.runtime_env
+    label: Materialize runtime environment
+    phase: system
+    depends_on: []
+    resources:
+    - systemd
+    script: steps/system.runtime_env.sh
+    working_directory: /
+    timeout_seconds: 120
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ -f '/etc/agentdp/.env' ]; then
+        install -d -m 0755 '/run/agentdp'
+        install -m 0644 -o root -g root '/etc/agentdp/.env' '/run/agentdp/.env'
+        cat >/etc/systemd/system/agentdp-runtime-env.service <<'AGENTDP_RUNTIME_ENV_SERVICE'
+      [Unit]
+      Description=Materialize agentdp runtime env
+      After=local-fs.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/install -D -m 0644 -o root -g root /etc/agentdp/.env /run/agentdp/.env
+
+      [Install]
+      WantedBy=multi-user.target
+      AGENTDP_RUNTIME_ENV_SERVICE
+        systemctl daemon-reload
+        systemctl enable --now agentdp-runtime-env.service
+      fi
+  - id: system.ca_bundle
+    label: Install CA bundle
+    phase: system
+    depends_on: []
+    resources:
+    - package_manager
+    script: steps/system.ca_bundle.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ -f /var/lib/agentdp/ca/ca-bundle.pem ]; then
+        install -d -m 0755 /etc/pki/ca-trust/source/anchors
+        install -m 0644 /var/lib/agentdp/ca/ca-bundle.pem /etc/pki/ca-trust/source/anchors/agentdp-ca-bundle.crt
+        if command -v update-ca-trust >/dev/null 2>&1; then update-ca-trust extract || true; fi
+      fi
+  - id: plugin.docker.proxy
+    label: Configure Docker CA proxy
+    phase: system
+    depends_on:
+    - system.ca_bundle
+    resources:
+    - systemd
+    script: steps/plugin.docker.proxy.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      run_docker_proxy_setup() {
+        echo "+ $*" >&2
+        timeout 30s "$@"
+      }
+      diagnose_docker_proxy_setup() {
+        echo '--- docker proxy diagnostics: units ---' >&2
+        systemctl --no-pager --full status docker.socket docker.service agentdp-docker-proxy.socket agentdp-docker-proxy.service >&2 || true
+        echo '--- docker proxy diagnostics: proxy journal ---' >&2
+        journalctl --no-pager -u agentdp-docker-proxy.service -n 80 >&2 || true
+        echo '--- docker proxy diagnostics: docker journal ---' >&2
+        journalctl --no-pager -u docker.service -n 80 >&2 || true
+      }
+      install -d -m 0755 /etc/docker /etc/systemd/system/docker.socket.d /etc/systemd/system /run/agentdp/docker
+      ln -sf '/usr/local/bin/guestctl' '/usr/local/bin/docker'
+      rm -f /etc/systemd/system/docker.service.d/agentdp-proxy.conf
+      if [ -f /etc/systemd/system/docker.service ] && grep -q 'RuntimeDirectory=agentdp/docker' /etc/systemd/system/docker.service; then
+        rm -f /etc/systemd/system/docker.service
+      fi
+      if [ -f /etc/docker/daemon.json ] && [ "$(tr -d '[:space:]' </etc/docker/daemon.json)" = '{"hosts":["unix:///run/agentdp/docker/docker.sock"]}' ]; then
+        rm -f /etc/docker/daemon.json
+      fi
+      cat >/etc/systemd/system/docker.socket.d/agentdp-private.conf <<'EOF'
+      [Socket]
+      ListenStream=
+      ListenStream=/run/agentdp/docker/docker.sock
+      SocketUser=root
+      SocketMode=0600
+
+      EOF
+      cat >/etc/systemd/system/agentdp-docker-proxy.service <<'EOF'
+      [Unit]
+      Description=agentdp Docker CA bundle socket proxy
+      Wants=docker.service
+      After=docker.service
+
+      [Service]
+      Type=simple
+      Environment=AGENTDP_CA_ENV_VARS=NODE_EXTRA_CA_CERTS,NPM_CONFIG_CAFILE,SSL_CERT_FILE,GIT_SSL_CAINFO,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE
+      ExecStart=/usr/local/bin/guestd docker-proxy --upstream /run/agentdp/docker/docker.sock --ca /var/lib/agentdp/ca/ca-bundle.pem
+      Restart=always
+      RestartSec=2
+      StandardOutput=journal
+      StandardError=journal
+      EOF
+      cat >/etc/systemd/system/agentdp-docker-proxy.socket <<'EOF'
+      [Unit]
+      Description=agentdp Docker CA bundle socket
+
+      [Socket]
+      ListenStream=/run/docker.sock
+      SocketUser=root
+      SocketGroup=docker
+      SocketMode=0660
+
+      [Install]
+      WantedBy=sockets.target
+      EOF
+      run_docker_proxy_setup systemctl daemon-reload
+      timeout 60s systemctl stop agentdp-docker-proxy.service agentdp-docker-proxy.socket docker.service docker.socket >/dev/null 2>&1 || true
+      if [ -S /run/docker.sock ]; then rm -f /run/docker.sock; fi
+      if [ -S /run/agentdp/docker/docker.sock ]; then rm -f /run/agentdp/docker/docker.sock; fi
+      run_docker_proxy_setup systemctl reset-failed || true
+      run_docker_proxy_setup systemctl enable --now docker.socket
+      run_docker_proxy_setup systemctl enable --now docker.service
+      run_docker_proxy_setup systemctl enable --now agentdp-docker-proxy.socket
+      test -S /run/docker.sock
+      test -S /run/agentdp/docker/docker.sock
+      if [ "$(stat -c '%a:%U:%G' /run/docker.sock)" != '660:root:docker' ]; then
+        echo "unexpected /run/docker.sock ownership/mode: $(stat -c '%a:%U:%G' /run/docker.sock)" >&2
+        exit 1
+      fi
+      if ! run_docker_proxy_setup '/usr/local/bin/docker' ps >/dev/null; then
+        diagnose_docker_proxy_setup
+        exit 1
+      fi
+  - id: plugin.docker.service
+    label: Start Docker service
+    phase: system
+    depends_on:
+    - plugin.docker.proxy
+    resources:
+    - systemd
+    script: steps/plugin.docker.service.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files docker.service >/dev/null 2>&1; then
+        systemctl enable --now docker.service
+      fi
+  - id: plugin.code_server.settings_owner
+    label: Prepare code-server settings
+    phase: system
+    depends_on: []
+    resources:
+    - agent_home
+    script: steps/plugin.code_server.settings_owner.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ -f '/data/home/.local/share/code-server/User/settings.json' ]; then
+        chown 'agent':'agent' '/data/home/.local/share/code-server/User/settings.json'
+        chmod 0600 '/data/home/.local/share/code-server/User/settings.json'
+      fi
+  - id: system.user_handoff
+    label: Finalize agent home ownership
+    phase: system
+    depends_on:
+    - system.runtime_env
+    - system.ca_bundle
+    - plugin.docker.proxy
+    - plugin.docker.service
+    - plugin.code_server.settings_owner
+    resources:
+    - agent_home
+    script: steps/system.user_handoff.sh
+    working_directory: /
+    timeout_seconds: 300
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      chown -R 'agent':'agent' '/data/home' '/data/home/code'
+  - id: plugin.codex.config
+    label: Configure Codex
+    phase: user
+    depends_on:
+    - system.user_handoff
+    resources:
+    - agent_home
+    script: steps/plugin.codex.config.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 "$HOME/.codex"
+      config="$HOME/.codex/config.toml"
+      touch "$config"
+      if ! grep -Fqx '[projects."/data/home/code"]' "$config"; then
+        {
+          printf '\n'
+          printf '%s\n' '[projects."/data/home/code"]'
+          printf '%s\n' 'trust_level = "trusted"'
+        } >>"$config"
+      fi
+      install -d -m 0755 "$HOME/.codex/skills/agentdp-guestctl"
+      cat >"$HOME/.codex/skills/agentdp-guestctl/SKILL.md" <<'EOF'
+      ---
+      name: agentdp-guestctl
+      description: Use inside agentdp guests to manage GitHub PR event notification registrations/subscriptions and inspect guest helper health.
+      ---
+
+      # agentdp guestctl
+
+      `guestctl` is available inside this agent VM and talks to the user-owned `guestd` daemon.
+
+      Use `guestctl ping` to verify the guest helper daemon is reachable.
+
+      Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the Codex tmux pane.
+
+      Use `guestctl pr list` to show registered PRs.
+
+      Use `guestctl pr unregister [pr-url-or-number]` to stop watching a PR.
+
+      EOF
+  - id: plugin.browser.codex_mcp
+    label: Configure Codex Playwright MCP
+    phase: user
+    depends_on:
+    - plugin.codex.config
+    - system.user_handoff
+    resources:
+    - agent_home
+    script: steps/plugin.browser.codex_mcp.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 "$HOME/.codex"
+      config="$HOME/.codex/config.toml"
+      touch "$config"
+      tmp="$(mktemp)"
+      awk '
+        /^\[mcp_servers\.playwright\]$/ { skip = 1; next }
+        skip && /^\[/ { skip = 0 }
+        !skip { print }
+      ' "$config" >"$tmp"
+      cat "$tmp" >"$config"
+      rm -f "$tmp"
+      cat >>"$config" <<'EOF'
+
+      [mcp_servers.playwright]
+      command = "playwright-mcp"
+      startup_timeout_sec = 120
+      args = ["--browser=chromium", "--executable-path=/usr/bin/chromium", "--viewport-size=1440x900"]
+      env = { PLAYWRIGHT_MCP_EXECUTABLE_PATH = "/usr/bin/chromium", PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "/usr/bin/chromium", PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1", PLAYWRIGHT_MCP_VIEWPORT_SIZE = "1440x900" }
+      EOF
+  - id: plugin.github.setup_git
+    label: Configure GitHub git credentials
+    phase: user
+    depends_on:
+    - system.user_handoff
+    resources:
+    - agent_home
+    script: steps/plugin.github.setup_git.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      custom_env='/run/agentdp/.env'
+      if [ -f "$custom_env" ]; then
+        set -a
+        # shellcheck source=/dev/null
+        . "$custom_env"
+        set +a
+      fi
+      install -d -m 0700 "$HOME/.config/gh"
+      agentdp_gh_token="${GITHUB_PAT:-}"
+      if [ -n "${GH_TOKEN:-}" ]; then agentdp_gh_token="$GH_TOKEN"; fi
+      if [ -n "${GITHUB_TOKEN:-}" ]; then agentdp_gh_token="$GITHUB_TOKEN"; fi
+      if [ -n "$agentdp_gh_token" ] && ! gh auth status -h github.com >/dev/null 2>&1; then
+        printf '%s\n' "$agentdp_gh_token" | gh auth login --with-token
+      fi
+      if [ -f "$HOME/.config/gh/hosts.yml" ]; then
+        gh auth setup-git >/dev/null || true
+      fi
+      git config --global credential.https://github.com.username x-access-token || true
+      git config --global credential.https://github.com.helper '!f() { test "$1" = get || exit 0; token="$GITHUB_TOKEN"; if [ -z "$token" ]; then token="$GH_TOKEN"; fi; if [ -z "$token" ]; then token="$GITHUB_PAT"; fi; test -n "$token" || exit 0; printf "%s\n" "username=x-access-token" "password=$token"; }; f' || true
+      git config --global url.https://github.com/.insteadOf git@github.com: || true
+      unset agentdp_gh_token
+      unset GITHUB_TOKEN GH_TOKEN GITHUB_PAT
+      unset custom_env
+  - id: user.repository.0.altinn_studio
+    label: Materialize repository altinn-studio
+    phase: user
+    depends_on:
+    - system.user_handoff
+    - plugin.codex.config
+    - plugin.browser.codex_mcp
+    - plugin.github.setup_git
+    resources: []
+    script: steps/user.repository.0.altinn_studio.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      target="$AGENTDP_CODE_DIR/altinn-studio"
+      install -d -m 0755 "$(dirname "$target")"
+      if [ -d "$target/.git" ]; then
+        git -C "$target" fetch --all --prune
+      else
+        git clone 'https://github.com/martinothamar-agent/altinn-studio.git' "$target"
+      fi
+      if ! git -C "$target" remote get-url upstream >/dev/null 2>&1; then
+        git -C "$target" remote add upstream 'https://github.com/Altinn/altinn-studio.git'
+      fi
+  - id: user.custom_bootstrap
+    label: Run custom bootstrap hook
+    phase: user
+    depends_on:
+    - user.repository.0.altinn_studio
+    resources:
+    - agent_home
+    - code_dir
+    - mise
+    - npm_global
+    script: steps/user.custom_bootstrap.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ -f '/var/lib/agentdp/bootstrap/custom-bootstrap.sh' ]; then
+        . '/var/lib/agentdp/bootstrap/custom-bootstrap.sh'
+      fi
+  - id: user.manifest_shell
+    label: Run manifest shell commands
+    phase: user
+    depends_on:
+    - user.custom_bootstrap
+    resources:
+    - agent_home
+    - code_dir
+    - mise
+    - npm_global
+    script: steps/user.manifest_shell.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      :
+  - id: user.disable_cloud_init
+    label: Disable cloud-init for subsequent boots
+    phase: user
+    depends_on:
+    - user.manifest_shell
+    resources:
+    - systemd
+    script: steps/user.disable_cloud_init.sh
+    working_directory: /
+    timeout_seconds: 120
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      sudo -n install -d -m 0755 /etc/cloud
+      sudo -n touch /etc/cloud/cloud-init.disabled
+      if command -v systemctl >/dev/null 2>&1; then
+        for unit in cloud-init-local.service cloud-init.service cloud-init-network.service cloud-config.service cloud-final.service cloud-init.target; do
+          sudo -n systemctl disable "$unit" >/dev/null 2>&1 || true
+        done
+      fi
+  - id: user.guestd
+    label: Start user guest daemon
+    phase: user
+    depends_on:
+    - user.disable_cloud_init
+    resources:
+    - systemd
+    script: steps/user.guestd.sh
+    working_directory: /
+    timeout_seconds: 120
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      if command -v loginctl >/dev/null 2>&1; then
+        sudo -n loginctl enable-linger "$USER" || true
+      fi
+      if command -v systemctl >/dev/null 2>&1; then
+        sudo -n systemctl start "user@$(id -u).service" || true
+      fi
+      for _ in $(seq 1 30); do
+        [ -S "$XDG_RUNTIME_DIR/bus" ] && break
+        sleep 1
+      done
+      test -S "$XDG_RUNTIME_DIR/bus"
+      systemctl --user daemon-reload
+      systemctl --user stop guestd.service >/dev/null 2>&1 || true
+      systemctl --user enable --now guestd.service
+      systemctl --user is-active --quiet guestd.service

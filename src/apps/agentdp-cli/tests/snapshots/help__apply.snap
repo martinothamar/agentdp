@@ -1,0 +1,11 @@
+status: 0
+--- stdout
+Usage: agentctl apply [OPTIONS]
+
+Options:
+  -f, --file <PATH>
+  -v, --verbose
+      --wait
+  -h, --help         Print help
+--- stderr
+

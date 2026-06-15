@@ -1,0 +1,32 @@
+{
+  "workbench.colorTheme": "Dark 2026",
+  "workbench.startupEditor": "none",
+  "security.workspace.trust.enabled": false,
+  "chat.disableAIFeatures": true,
+  "extensions.ignoreRecommendations": true,
+  "keyboard.dispatch": "keyCode",
+  "editor.renderWhitespace": "all",
+  "editor.minimap.enabled": false,
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/.hg/store/**": true,
+    "**/node_modules/**": true,
+    "**/target/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/coverage/**": true,
+    "**/test-results/**": true
+  },
+  "search.exclude": {
+    "**/node_modules/**": true,
+    "**/target/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/coverage/**": true,
+    "**/test-results/**": true
+  },
+  "rust-analyzer.inlayHints.typeHints.enable": false,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.checkOnSave": true
+}

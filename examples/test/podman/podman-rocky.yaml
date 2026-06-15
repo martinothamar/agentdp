@@ -1,0 +1,48 @@
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: test-podman-rocky
+spec:
+  phase: Running
+  replicas: 1
+  template:
+  
+    image:
+      os: rocky9
+  
+    user:
+      name: agent
+  
+    resources:
+      cpus: 2
+      memory: 2G
+      storage: 10G
+  
+    network:
+      mode: mediated
+      allow: all
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+  
+    bootstrap:
+      packages:
+        - python3
+  
+      shell:
+        - chmod +x /data/home/podman-smoke.py
+  
+      healthchecks:
+        - name: ssh
+          kind: tcp
+          target: 127.0.0.1:22
+          timeout: 5m
+        - name: podman_smoke
+          kind: command
+          command: /data/home/podman-smoke.py
+          timeout: 60s
+  
+    plugins:
+      podman: {}
+    secrets: []

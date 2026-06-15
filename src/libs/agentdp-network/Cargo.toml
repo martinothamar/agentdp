@@ -1,0 +1,39 @@
+[package]
+name = "agentdp-network"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+default = []
+simulation = []
+
+[dependencies]
+agentdp-base64.workspace = true
+agentdp-crypto.workspace = true
+agentdp-ds.workspace = true
+agentdp-platform.workspace = true
+mio.workspace = true
+serde.workspace = true
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+agentdp-crypto = { workspace = true, features = ["fixtures"] }
+agentdp-network-tests.workspace = true
+agentdp-test-support.workspace = true
+proptest.workspace = true
+sha1.workspace = true
+
+[[bench]]
+name = "dataplane"
+harness = false
+
+[[bench]]
+name = "agent_workflow"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+status: 0
+--- stdout
+applied altinn-studio
+desired generation: 2
+observed generation: 0
+phase: Paused
+replicas: 1
+ready replicas: 0
+reconciling: true
+--- stderr
+

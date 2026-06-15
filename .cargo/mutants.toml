@@ -1,0 +1,15 @@
+test_tool = "nextest"
+test_workspace = true
+timeout_multiplier = 2.0
+build_timeout_multiplier = 2.0
+examine_globs = [
+    "src/core/agentdp-core/src/**/*.rs",
+    "src/core/agentdp-protocol/src/**/*.rs",
+    "src/libs/agentdp-base64/src/**/*.rs",
+]
+exclude_globs = []
+exclude_re = [
+    # The base64 bit fields are disjoint, so OR and XOR produce identical
+    # output for these two packing operations.
+    "replace \\| with \\^ in encode",
+]

@@ -1,0 +1,11 @@
+status: 0
+--- stdout
+manifest ok: $TMP/valid.yaml
+name: altinn-studio
+image.os: Archlinux
+--- stderr
+verbose: resolving explicit manifest path $TMP/valid.yaml
+verbose: resolved explicit manifest path $TMP/valid.yaml
+verbose: reading manifest $TMP/valid.yaml
+verbose: parsing manifest $TMP/valid.yaml
+verbose: manifest $TMP/valid.yaml parsed and validated

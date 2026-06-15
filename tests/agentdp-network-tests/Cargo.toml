@@ -1,0 +1,37 @@
+[package]
+name = "agentdp-network-tests"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agentdp-base64.workspace = true
+agentdp-core.workspace = true
+agentdp-crypto = { workspace = true, features = ["fixtures"] }
+agentdp-network = { workspace = true, features = ["simulation"] }
+agentdp-platform.workspace = true
+agentdp-rand.workspace = true
+rcgen.workspace = true
+sha1.workspace = true
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+agentdp-test-support.workspace = true
+
+[[test]]
+name = "simulation"
+path = "src/simulation/mod.rs"
+
+[[test]]
+name = "allocation"
+path = "src/allocation/mod.rs"
+
+[[bin]]
+name = "generate-network-test-tls-fixtures"
+path = "src/bin/generate_tls_fixtures.rs"
+
+[lints]
+workspace = true

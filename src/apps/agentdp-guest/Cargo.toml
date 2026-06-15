@@ -1,0 +1,29 @@
+[package]
+name = "agentdp-guest"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agentdp-platform.workspace = true
+agentdp-protocol.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "guestd"
+path = "src/bin/guestd.rs"
+
+[[bin]]
+name = "guestctl"
+path = "src/bin/guestctl.rs"
+
+[lints]
+workspace = true

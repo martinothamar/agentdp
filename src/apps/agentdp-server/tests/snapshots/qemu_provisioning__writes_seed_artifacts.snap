@@ -1,0 +1,623 @@
+image:
+  os: archlinux
+  architecture: x86_64
+  variant: cloud
+  source_url: https://fastly.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+  format: qcow2
+work_dir: $TMP/agentdp/agents/altinn-studio/instances/0
+seed_dir: $TMP/agentdp/agents/altinn-studio/instances/0/seed
+seed_meta_data: |
+  instance-id: altinn-studio-pr-0
+  local-hostname: pr-0
+seed_network_config: |
+  version: 1
+  config:
+    - type: physical
+      name: eth0
+      mac_address: '52:54:00:65:43:21'
+      subnets:
+        - type: static
+          address: 10.73.0.10/24
+          gateway: 10.73.0.1
+          dns_nameservers:
+            - 10.73.0.1
+seed_user_data: |
+  #cloud-config
+  bootcmd:
+  - mkdir -p /etc/systemd/system/systemd-time-wait-sync.service.d && printf '[Service]\nTimeoutStartSec=30s\n' >/etc/systemd/system/systemd-time-wait-sync.service.d/agentdp-timeout.conf && systemctl daemon-reload || true
+  - pacman-key --init
+  - pacman-key --populate archlinux
+  - |-
+    install -d -m 0755 /var/lib/agentdp/ca
+    cat >/var/lib/agentdp/ca/ca-bundle.pem <<'AGENTDP_CA_BUNDLE'
+    $GENERATED_MEDIATED_CA_CERTIFICATE
+    AGENTDP_CA_BUNDLE
+    chmod 0644 /var/lib/agentdp/ca/ca-bundle.pem
+    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+      if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then
+        semanage fcontext -a -t container_file_t '/var/lib/agentdp/ca/ca-bundle\.pem' 2>/dev/null || semanage fcontext -m -t container_file_t '/var/lib/agentdp/ca/ca-bundle\.pem' || true
+        restorecon /var/lib/agentdp/ca/ca-bundle.pem || true
+      elif command -v chcon >/dev/null 2>&1; then
+        chcon -t container_file_t /var/lib/agentdp/ca/ca-bundle.pem || true
+      fi
+    fi
+    if [ -f /var/lib/agentdp/ca/ca-bundle.pem ]; then
+      install -d -m 0755 /etc/ca-certificates/trust-source/anchors
+      install -m 0644 /var/lib/agentdp/ca/ca-bundle.pem /etc/ca-certificates/trust-source/anchors/agentdp-ca-bundle.crt
+      if command -v trust >/dev/null 2>&1; then trust extract-compat || true; fi
+      if command -v update-ca-trust >/dev/null 2>&1; then update-ca-trust extract || true; fi
+    fi
+  - pacman -Sy --noconfirm archlinux-keyring
+  users:
+  - default
+  - name: agent
+    homedir: /data/home
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+    - ssh-ed25519 AAAATEST agentdp
+  write_files:
+  - path: /data/home/.codex/auth.json
+    permissions: '0600'
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /run/agentdp/bin/guestctl.gz
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /usr/local/bin/guestd
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/ca/ca-bundle.pem
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/spec/agent-manifest.yaml
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/spec/bootstrap-plan.json
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/spec/instance.json
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /etc/systemd/system/guestd-system.service
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/system.runtime_env.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/system.ca_bundle.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/plugin.docker.proxy.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/plugin.docker.service.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/plugin.code_server.settings_owner.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/system.user_handoff.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/plugin.codex.config.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/plugin.browser.codex_mcp.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/plugin.github.setup_git.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.repository.0.altinn_studio.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.custom_bootstrap.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.manifest_shell.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.disable_cloud_init.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.guestd.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  runcmd:
+  - systemctl daemon-reload && systemctl enable --now guestd-system.service
+bootstrap_steps:
+- id: system.runtime_env
+  label: Materialize runtime environment
+  phase: system
+  depends_on: []
+  resources:
+  - systemd
+  script: steps/system.runtime_env.sh
+  working_directory: /
+  timeout_seconds: 120
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    if [ -f '/etc/agentdp/.env' ]; then
+      install -d -m 0755 '/run/agentdp'
+      install -m 0644 -o root -g root '/etc/agentdp/.env' '/run/agentdp/.env'
+      cat >/etc/systemd/system/agentdp-runtime-env.service <<'AGENTDP_RUNTIME_ENV_SERVICE'
+    [Unit]
+    Description=Materialize agentdp runtime env
+    After=local-fs.target
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/bin/install -D -m 0644 -o root -g root /etc/agentdp/.env /run/agentdp/.env
+
+    [Install]
+    WantedBy=multi-user.target
+    AGENTDP_RUNTIME_ENV_SERVICE
+      systemctl daemon-reload
+      systemctl enable --now agentdp-runtime-env.service
+    fi
+- id: system.ca_bundle
+  label: Install CA bundle
+  phase: system
+  depends_on: []
+  resources:
+  - package_manager
+  script: steps/system.ca_bundle.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    if [ -f /var/lib/agentdp/ca/ca-bundle.pem ]; then
+      install -d -m 0755 /etc/ca-certificates/trust-source/anchors
+      install -m 0644 /var/lib/agentdp/ca/ca-bundle.pem /etc/ca-certificates/trust-source/anchors/agentdp-ca-bundle.crt
+      if command -v trust >/dev/null 2>&1; then trust extract-compat || true; fi
+      if command -v update-ca-trust >/dev/null 2>&1; then update-ca-trust extract || true; fi
+    fi
+- id: plugin.docker.proxy
+  label: Configure Docker CA proxy
+  phase: system
+  depends_on:
+  - system.ca_bundle
+  resources:
+  - systemd
+  script: steps/plugin.docker.proxy.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    run_docker_proxy_setup() {
+      echo "+ $*" >&2
+      timeout 30s "$@"
+    }
+    diagnose_docker_proxy_setup() {
+      echo '--- docker proxy diagnostics: units ---' >&2
+      systemctl --no-pager --full status docker.socket docker.service agentdp-docker-proxy.socket agentdp-docker-proxy.service >&2 || true
+      echo '--- docker proxy diagnostics: proxy journal ---' >&2
+      journalctl --no-pager -u agentdp-docker-proxy.service -n 80 >&2 || true
+      echo '--- docker proxy diagnostics: docker journal ---' >&2
+      journalctl --no-pager -u docker.service -n 80 >&2 || true
+    }
+    install -d -m 0755 /etc/docker /etc/systemd/system/docker.socket.d /etc/systemd/system /run/agentdp/docker
+    ln -sf '/usr/local/bin/guestctl' '/usr/local/bin/docker'
+    rm -f /etc/systemd/system/docker.service.d/agentdp-proxy.conf
+    if [ -f /etc/systemd/system/docker.service ] && grep -q 'RuntimeDirectory=agentdp/docker' /etc/systemd/system/docker.service; then
+      rm -f /etc/systemd/system/docker.service
+    fi
+    if [ -f /etc/docker/daemon.json ] && [ "$(tr -d '[:space:]' </etc/docker/daemon.json)" = '{"hosts":["unix:///run/agentdp/docker/docker.sock"]}' ]; then
+      rm -f /etc/docker/daemon.json
+    fi
+    cat >/etc/systemd/system/docker.socket.d/agentdp-private.conf <<'EOF'
+    [Socket]
+    ListenStream=
+    ListenStream=/run/agentdp/docker/docker.sock
+    SocketUser=root
+    SocketMode=0600
+
+    EOF
+    cat >/etc/systemd/system/agentdp-docker-proxy.service <<'EOF'
+    [Unit]
+    Description=agentdp Docker CA bundle socket proxy
+    Wants=docker.service
+    After=docker.service
+
+    [Service]
+    Type=simple
+    Environment=AGENTDP_CA_ENV_VARS=NODE_EXTRA_CA_CERTS,NPM_CONFIG_CAFILE,SSL_CERT_FILE,GIT_SSL_CAINFO,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE
+    ExecStart=/usr/local/bin/guestd docker-proxy --upstream /run/agentdp/docker/docker.sock --ca /var/lib/agentdp/ca/ca-bundle.pem
+    Restart=always
+    RestartSec=2
+    StandardOutput=journal
+    StandardError=journal
+    EOF
+    cat >/etc/systemd/system/agentdp-docker-proxy.socket <<'EOF'
+    [Unit]
+    Description=agentdp Docker CA bundle socket
+
+    [Socket]
+    ListenStream=/run/docker.sock
+    SocketUser=root
+    SocketGroup=docker
+    SocketMode=0660
+
+    [Install]
+    WantedBy=sockets.target
+    EOF
+    run_docker_proxy_setup systemctl daemon-reload
+    timeout 60s systemctl stop agentdp-docker-proxy.service agentdp-docker-proxy.socket docker.service docker.socket >/dev/null 2>&1 || true
+    if [ -S /run/docker.sock ]; then rm -f /run/docker.sock; fi
+    if [ -S /run/agentdp/docker/docker.sock ]; then rm -f /run/agentdp/docker/docker.sock; fi
+    run_docker_proxy_setup systemctl reset-failed || true
+    run_docker_proxy_setup systemctl enable --now docker.socket
+    run_docker_proxy_setup systemctl enable --now docker.service
+    run_docker_proxy_setup systemctl enable --now agentdp-docker-proxy.socket
+    test -S /run/docker.sock
+    test -S /run/agentdp/docker/docker.sock
+    if [ "$(stat -c '%a:%U:%G' /run/docker.sock)" != '660:root:docker' ]; then
+      echo "unexpected /run/docker.sock ownership/mode: $(stat -c '%a:%U:%G' /run/docker.sock)" >&2
+      exit 1
+    fi
+    if ! run_docker_proxy_setup '/usr/local/bin/docker' ps >/dev/null; then
+      diagnose_docker_proxy_setup
+      exit 1
+    fi
+- id: plugin.docker.service
+  label: Start Docker service
+  phase: system
+  depends_on:
+  - plugin.docker.proxy
+  resources:
+  - systemd
+  script: steps/plugin.docker.service.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files docker.service >/dev/null 2>&1; then
+      systemctl enable --now docker.service
+    fi
+- id: plugin.code_server.settings_owner
+  label: Prepare code-server settings
+  phase: system
+  depends_on: []
+  resources:
+  - agent_home
+  script: steps/plugin.code_server.settings_owner.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    if [ -f '/data/home/.local/share/code-server/User/settings.json' ]; then
+      chown 'agent':'agent' '/data/home/.local/share/code-server/User/settings.json'
+      chmod 0600 '/data/home/.local/share/code-server/User/settings.json'
+    fi
+- id: system.user_handoff
+  label: Finalize agent home ownership
+  phase: system
+  depends_on:
+  - system.runtime_env
+  - system.ca_bundle
+  - plugin.docker.proxy
+  - plugin.docker.service
+  - plugin.code_server.settings_owner
+  resources:
+  - agent_home
+  script: steps/system.user_handoff.sh
+  working_directory: /
+  timeout_seconds: 300
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    chown -R 'agent':'agent' '/data/home' '/data/home/code'
+- id: plugin.codex.config
+  label: Configure Codex
+  phase: user
+  depends_on:
+  - system.user_handoff
+  resources:
+  - agent_home
+  script: steps/plugin.codex.config.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    install -d -m 0755 "$HOME/.codex"
+    config="$HOME/.codex/config.toml"
+    touch "$config"
+    if ! grep -Fqx '[projects."/data/home/code"]' "$config"; then
+      {
+        printf '\n'
+        printf '%s\n' '[projects."/data/home/code"]'
+        printf '%s\n' 'trust_level = "trusted"'
+      } >>"$config"
+    fi
+    install -d -m 0755 "$HOME/.codex/skills/agentdp-guestctl"
+    cat >"$HOME/.codex/skills/agentdp-guestctl/SKILL.md" <<'EOF'
+    ---
+    name: agentdp-guestctl
+    description: Use inside agentdp guests to manage GitHub PR event notification registrations/subscriptions and inspect guest helper health.
+    ---
+
+    # agentdp guestctl
+
+    `guestctl` is available inside this agent VM and talks to the user-owned `guestd` daemon.
+
+    Use `guestctl ping` to verify the guest helper daemon is reachable.
+
+    Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the Codex tmux pane.
+
+    Use `guestctl pr list` to show registered PRs.
+
+    Use `guestctl pr unregister [pr-url-or-number]` to stop watching a PR.
+
+    EOF
+- id: plugin.browser.codex_mcp
+  label: Configure Codex Playwright MCP
+  phase: user
+  depends_on:
+  - plugin.codex.config
+  - system.user_handoff
+  resources:
+  - agent_home
+  script: steps/plugin.browser.codex_mcp.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    install -d -m 0755 "$HOME/.codex"
+    config="$HOME/.codex/config.toml"
+    touch "$config"
+    tmp="$(mktemp)"
+    awk '
+      /^\[mcp_servers\.playwright\]$/ { skip = 1; next }
+      skip && /^\[/ { skip = 0 }
+      !skip { print }
+    ' "$config" >"$tmp"
+    cat "$tmp" >"$config"
+    rm -f "$tmp"
+    cat >>"$config" <<'EOF'
+
+    [mcp_servers.playwright]
+    command = "playwright-mcp"
+    startup_timeout_sec = 120
+    args = ["--browser=chromium", "--executable-path=/usr/bin/chromium", "--viewport-size=1440x900"]
+    env = { PLAYWRIGHT_MCP_EXECUTABLE_PATH = "/usr/bin/chromium", PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "/usr/bin/chromium", PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1", PLAYWRIGHT_MCP_VIEWPORT_SIZE = "1440x900" }
+    EOF
+- id: plugin.github.setup_git
+  label: Configure GitHub git credentials
+  phase: user
+  depends_on:
+  - system.user_handoff
+  resources:
+  - agent_home
+  script: steps/plugin.github.setup_git.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    custom_env='/run/agentdp/.env'
+    if [ -f "$custom_env" ]; then
+      set -a
+      # shellcheck source=/dev/null
+      . "$custom_env"
+      set +a
+    fi
+    install -d -m 0700 "$HOME/.config/gh"
+    agentdp_gh_token="${GITHUB_PAT:-}"
+    if [ -n "${GH_TOKEN:-}" ]; then agentdp_gh_token="$GH_TOKEN"; fi
+    if [ -n "${GITHUB_TOKEN:-}" ]; then agentdp_gh_token="$GITHUB_TOKEN"; fi
+    if [ -n "$agentdp_gh_token" ] && ! gh auth status -h github.com >/dev/null 2>&1; then
+      printf '%s\n' "$agentdp_gh_token" | gh auth login --with-token
+    fi
+    if [ -f "$HOME/.config/gh/hosts.yml" ]; then
+      gh auth setup-git >/dev/null || true
+    fi
+    git config --global credential.https://github.com.username x-access-token || true
+    git config --global credential.https://github.com.helper '!f() { test "$1" = get || exit 0; token="$GITHUB_TOKEN"; if [ -z "$token" ]; then token="$GH_TOKEN"; fi; if [ -z "$token" ]; then token="$GITHUB_PAT"; fi; test -n "$token" || exit 0; printf "%s\n" "username=x-access-token" "password=$token"; }; f' || true
+    git config --global url.https://github.com/.insteadOf git@github.com: || true
+    unset agentdp_gh_token
+    unset GITHUB_TOKEN GH_TOKEN GITHUB_PAT
+    unset custom_env
+- id: user.repository.0.altinn_studio
+  label: Materialize repository altinn-studio
+  phase: user
+  depends_on:
+  - system.user_handoff
+  - plugin.codex.config
+  - plugin.browser.codex_mcp
+  - plugin.github.setup_git
+  resources: []
+  script: steps/user.repository.0.altinn_studio.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    target="$AGENTDP_CODE_DIR/altinn-studio"
+    install -d -m 0755 "$(dirname "$target")"
+    if [ -d "$target/.git" ]; then
+      git -C "$target" fetch --all --prune
+    else
+      git clone 'https://github.com/martinothamar-agent/altinn-studio.git' "$target"
+    fi
+    if ! git -C "$target" remote get-url upstream >/dev/null 2>&1; then
+      git -C "$target" remote add upstream 'https://github.com/Altinn/altinn-studio.git'
+    fi
+- id: user.custom_bootstrap
+  label: Run custom bootstrap hook
+  phase: user
+  depends_on:
+  - user.repository.0.altinn_studio
+  resources:
+  - agent_home
+  - code_dir
+  - mise
+  - npm_global
+  script: steps/user.custom_bootstrap.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    if [ -f '/var/lib/agentdp/bootstrap/custom-bootstrap.sh' ]; then
+      . '/var/lib/agentdp/bootstrap/custom-bootstrap.sh'
+    fi
+- id: user.manifest_shell
+  label: Run manifest shell commands
+  phase: user
+  depends_on:
+  - user.custom_bootstrap
+  resources:
+  - agent_home
+  - code_dir
+  - mise
+  - npm_global
+  script: steps/user.manifest_shell.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    :
+- id: user.disable_cloud_init
+  label: Disable cloud-init for subsequent boots
+  phase: user
+  depends_on:
+  - user.manifest_shell
+  resources:
+  - systemd
+  script: steps/user.disable_cloud_init.sh
+  working_directory: /
+  timeout_seconds: 120
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    sudo -n install -d -m 0755 /etc/cloud
+    sudo -n touch /etc/cloud/cloud-init.disabled
+    if command -v systemctl >/dev/null 2>&1; then
+      for unit in cloud-init-local.service cloud-init.service cloud-init-network.service cloud-config.service cloud-final.service cloud-init.target; do
+        sudo -n systemctl disable "$unit" >/dev/null 2>&1 || true
+      done
+    fi
+- id: user.guestd
+  label: Start user guest daemon
+  phase: user
+  depends_on:
+  - user.disable_cloud_init
+  resources:
+  - systemd
+  script: steps/user.guestd.sh
+  working_directory: /
+  timeout_seconds: 120
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if command -v loginctl >/dev/null 2>&1; then
+      sudo -n loginctl enable-linger "$USER" || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      sudo -n systemctl start "user@$(id -u).service" || true
+    fi
+    for _ in $(seq 1 30); do
+      [ -S "$XDG_RUNTIME_DIR/bus" ] && break
+      sleep 1
+    done
+    test -S "$XDG_RUNTIME_DIR/bus"
+    systemctl --user daemon-reload
+    systemctl --user stop guestd.service >/dev/null 2>&1 || true
+    systemctl --user enable --now guestd.service
+    systemctl --user is-active --quiet guestd.service
+generated_mediated_ca_cert_seeded: true
+generated_mediated_ca_key_file_written: true

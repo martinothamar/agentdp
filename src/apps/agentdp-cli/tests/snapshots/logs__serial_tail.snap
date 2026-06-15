@@ -1,0 +1,6 @@
+status: 0
+--- stdout
+second boot line
+third boot line
+--- stderr
+

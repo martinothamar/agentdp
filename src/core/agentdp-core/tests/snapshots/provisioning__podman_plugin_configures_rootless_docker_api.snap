@@ -1,0 +1,532 @@
+base:
+  packages:
+  - sudo
+  - cloud-utils-growpart
+  - gdisk
+  - gzip
+  - hostname
+  - tmux
+  - policycoreutils
+  - policycoreutils-python-utils
+  - podman
+  - crun
+  - fuse-overlayfs
+  - slirp4netns
+  - shadow-utils
+  - podman-docker
+  repos: []
+  shell: []
+  healthchecks: []
+  steps:
+  - id: system.prep
+    label: Prepare system
+    phase: system
+    depends_on: []
+    resources:
+    - systemd
+    script: steps/system.prep.sh
+    working_directory: /
+    timeout_seconds: 300
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+
+      mkdir -p '/data/home' '/data/home/code'
+      chown -R 'agent':'agent' '/data/home'
+
+      install -d -m 0755 '/usr/local/bin' '/usr/local/lib/agentdp' /etc/profile.d
+      cat >'/usr/local/lib/agentdp/env.sh' <<'EOF'
+      PATH="${PATH:-/usr/bin:/bin}"
+
+      agentdp_prepend_path() {
+        agentdp_path_value=
+        agentdp_old_ifs=$IFS
+        IFS=:
+        for agentdp_path_entry in ${PATH:-}; do
+          if [ -n "$agentdp_path_entry" ] && [ "$agentdp_path_entry" != "$1" ]; then
+            agentdp_path_value="${agentdp_path_value:+$agentdp_path_value:}$agentdp_path_entry"
+          fi
+        done
+        IFS=$agentdp_old_ifs
+        PATH="$1${agentdp_path_value:+:$agentdp_path_value}"
+      }
+
+      agentdp_prepend_path "/bin"
+      agentdp_prepend_path "/usr/bin"
+      agentdp_prepend_path "/usr/local/bin"
+      export PATH
+
+      export AGENTDP_CODE_DIR='/data/home/code'
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      if [ -r '/run/agentdp/.env' ]; then
+        set -a
+        # shellcheck source=/dev/null
+        . '/run/agentdp/.env'
+        set +a
+      fi
+      if [ -r /var/lib/agentdp/ca/ca-bundle.pem ]; then
+        export AGENTDP_CA_ENV_VARS='NODE_EXTRA_CA_CERTS,NPM_CONFIG_CAFILE,SSL_CERT_FILE,GIT_SSL_CAINFO,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE'
+        export NODE_EXTRA_CA_CERTS=/var/lib/agentdp/ca/ca-bundle.pem
+        export NPM_CONFIG_CAFILE=/var/lib/agentdp/ca/ca-bundle.pem
+        export SSL_CERT_FILE=/var/lib/agentdp/ca/ca-bundle.pem
+        export GIT_SSL_CAINFO=/var/lib/agentdp/ca/ca-bundle.pem
+        export CURL_CA_BUNDLE=/var/lib/agentdp/ca/ca-bundle.pem
+        export REQUESTS_CA_BUNDLE=/var/lib/agentdp/ca/ca-bundle.pem
+      fi
+
+      if [ "${HOME:-}" = "/data/home" ] || [ "${USER:-}" = "agent" ]; then
+        agentdp_prepend_path "/data/home/.dotnet/tools"
+        agentdp_prepend_path "/data/home/.cargo/bin"
+        agentdp_prepend_path "/data/home/go/bin"
+        agentdp_prepend_path "/data/home/.local/bin"
+        if [ "${HOME:-}" = '/data/home' ] || [ "${USER:-}" = 'agent' ]; then
+          export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+        fi
+        export PATH
+      fi
+
+      unset agentdp_path_entry agentdp_path_value agentdp_old_ifs
+      unset -f agentdp_prepend_path
+      EOF
+      chmod 0644 '/usr/local/lib/agentdp/env.sh'
+      cat >'/usr/local/bin/agentdp-agent-env' <<'EOF'
+      #!/usr/bin/env sh
+      export HOME='/data/home'
+      . '/usr/local/lib/agentdp/env.sh'
+      exec "$@"
+      EOF
+      chmod 0755 '/usr/local/bin/agentdp-agent-env'
+      cat >"/etc/profile.d/agentdp-agent.sh" <<'EOF'
+      . '/usr/local/lib/agentdp/env.sh'
+      EOF
+      chmod 0644 "/etc/profile.d/agentdp-agent.sh"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      grow_agentdp_root() {
+        local root_source root_fstype parent partnum grow_output
+        root_source="$(findmnt -no SOURCE / || true)"
+        root_fstype="$(findmnt -no FSTYPE / || true)"
+        if [ -z "$root_source" ] || [ ! -b "$root_source" ]; then
+          echo "agentdp grow-root skipped: root source is not a block device: $root_source"
+          return 0
+        fi
+        parent="$(lsblk -no PKNAME "$root_source" | head -n1 || true)"
+        partnum="$(lsblk -no PARTN "$root_source" | head -n1 || true)"
+        if [ -z "$parent" ] || [ -z "$partnum" ]; then
+          echo "agentdp grow-root skipped: root source is not a partition: $root_source"
+          return 0
+        fi
+        echo "Growing root partition $root_source on /dev/$parent"
+        if ! grow_output="$(growpart "/dev/$parent" "$partnum" 2>&1)"; then
+          if ! printf '%s\n' "$grow_output" | grep -qi 'NOCHANGE'; then
+            printf '%s\n' "$grow_output" >&2
+            return 1
+          fi
+        fi
+        if [ -n "$grow_output" ]; then
+          printf '%s\n' "$grow_output"
+        fi
+        udevadm settle || true
+        case "$root_fstype" in
+          ext2|ext3|ext4)
+            resize2fs "$root_source"
+            ;;
+          xfs)
+            if command -v xfs_growfs >/dev/null 2>&1; then
+              xfs_growfs /
+            else
+              echo "agentdp grow-root skipped: xfs_growfs is not installed"
+            fi
+            ;;
+          btrfs)
+            if command -v btrfs >/dev/null 2>&1; then
+              btrfs filesystem resize max /
+            else
+              echo "agentdp grow-root skipped: btrfs is not installed"
+            fi
+            ;;
+          *)
+            echo "agentdp grow-root skipped: unsupported root filesystem: $root_fstype"
+            ;;
+        esac
+      }
+      grow_agentdp_root
+      unset -f grow_agentdp_root
+
+      install -d -o 'agent' -g 'agent' -m 0700 '/data/home'
+      if [ ! -e '/data/home/.tmux.conf' ]; then
+        cat >'/data/home/.tmux.conf' <<'EOF'
+      set -g mouse on
+      set -g history-limit 100000
+      setw -g mode-keys vi
+      EOF
+        chown 'agent':'agent' '/data/home/.tmux.conf'
+        chmod 0600 '/data/home/.tmux.conf'
+      fi
+
+      install -d -m 0755 /usr/local/lib/agentdp
+      cat >/usr/local/lib/agentdp/sync-hostname-from-seed.sh <<'EOF'
+      #!/usr/bin/env sh
+      set -eu
+      device="$(blkid -L CIDATA 2>/dev/null || blkid -L cidata 2>/dev/null || true)"
+      [ -n "$device" ] || exit 0
+      mount_dir="$(mktemp -d)"
+      cleanup() {
+        umount "$mount_dir" >/dev/null 2>&1 || true
+        rmdir "$mount_dir" >/dev/null 2>&1 || true
+      }
+      trap cleanup EXIT
+      mount -o ro "$device" "$mount_dir" >/dev/null 2>&1 || exit 0
+      hostname="$(sed -n 's/^local-hostname:[[:space:]]*//p' "$mount_dir/meta-data" 2>/dev/null | head -n1 | tr -d "\"'")"
+      case "$hostname" in
+        ""|.*|-*|*-|*[!A-Za-z0-9.-]*) exit 0 ;;
+      esac
+      hostnamectl set-hostname "$hostname" || printf '%s\n' "$hostname" >/etc/hostname
+      EOF
+      chmod 0755 /usr/local/lib/agentdp/sync-hostname-from-seed.sh
+      cat >/etc/systemd/system/agentdp-hostname.service <<'EOF'
+      [Unit]
+      Description=Sync agentdp guest hostname from cloud-init seed
+      After=local-fs.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/lib/agentdp/sync-hostname-from-seed.sh
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable agentdp-hostname.service
+      /usr/local/lib/agentdp/sync-hostname-from-seed.sh || true
+  - id: system.packages
+    label: Install system packages
+    phase: system
+    depends_on:
+    - system.prep
+    resources:
+    - package_manager
+    script: steps/system.packages.sh
+    working_directory: /
+    timeout_seconds: 1800
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      dnf -y install 'sudo' 'cloud-utils-growpart' 'gdisk' 'gzip' 'hostname' 'tmux' 'policycoreutils' 'policycoreutils-python-utils' 'podman' 'crun' 'fuse-overlayfs' 'slirp4netns' 'shadow-utils' 'podman-docker'
+  - id: system.agent_user
+    label: Prepare agent user
+    phase: system
+    depends_on:
+    - system.packages
+    resources:
+    - user_db
+    script: steps/system.agent_user.sh
+    working_directory: /
+    timeout_seconds: 300
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if command -v sudo >/dev/null 2>&1; then
+        install -d -m 0750 /etc/sudoers.d
+        printf '%s ALL=(ALL) NOPASSWD:ALL\n' 'agent' >/etc/sudoers.d/agentdp-agent
+        chmod 0440 /etc/sudoers.d/agentdp-agent
+      fi
+
+      chown -R 'agent':'agent' '/data/home' '/data/home/code'
+
+      if [ -d '/data/home/.ssh' ]; then
+        chown -R 'agent':'agent' '/data/home/.ssh'
+        chmod 0700 '/data/home/.ssh'
+        if [ -f '/data/home/.ssh/authorized_keys' ]; then
+          chmod 0600 '/data/home/.ssh/authorized_keys'
+        fi
+      fi
+      if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null || true)" != Disabled ]; then
+        if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then
+          semanage fcontext -a -t user_home_dir_t '/data/home' 2>/dev/null || semanage fcontext -m -t user_home_dir_t '/data/home' || true
+          semanage fcontext -a -t user_home_t '/data/home/.*' 2>/dev/null || semanage fcontext -m -t user_home_t '/data/home/.*' || true
+          semanage fcontext -a -t ssh_home_t '/data/home/\.ssh(/.*)?' 2>/dev/null || semanage fcontext -m -t ssh_home_t '/data/home/\.ssh(/.*)?' || true
+          restorecon -RF '/data/home'
+        elif command -v chcon >/dev/null 2>&1; then
+          chcon -R -t user_home_t '/data/home' || true
+          chcon -t user_home_dir_t '/data/home' || true
+          if [ -d '/data/home/.ssh' ]; then chcon -R -t ssh_home_t '/data/home/.ssh' || true; fi
+        fi
+      fi
+  - id: system.guest_tooling
+    label: Install guest tooling
+    phase: system
+    depends_on:
+    - system.packages
+    - system.agent_user
+    resources:
+    - guest_tooling
+    - systemd
+    script: steps/system.guest_tooling.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 '/usr/local/bin' /etc/systemd/user
+      test -x '/usr/local/bin/guestd'
+      gzip -dc '/run/agentdp/bin/guestctl.gz' >'/usr/local/bin/guestctl'
+      chmod 0755 '/usr/local/bin/guestctl'
+      cat >/etc/systemd/user/guestd.service <<'EOF'
+      [Unit]
+      Description=agentdp guest helper daemon
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      Environment=AGENTDP_STATE_DIR=%h/.local/state/agentdp
+      Environment=AGENTDP_PR_REGISTRY=%h/.local/state/agentdp/pr-watch.json
+      Environment=AGENTDP_CODEX_PANE_FILE=%h/.local/state/agentdp/codex-pane-id
+      ExecStart=/usr/local/bin/agentdp-agent-env /usr/local/bin/guestd
+      Restart=always
+      RestartSec=20
+
+      [Install]
+      WantedBy=default.target
+      EOF
+      if command -v loginctl >/dev/null 2>&1; then
+        loginctl enable-linger 'agent' || true
+      fi
+instance:
+  packages: []
+  repos: []
+  shell: []
+  healthchecks: []
+  steps:
+  - id: system.runtime_env
+    label: Materialize runtime environment
+    phase: system
+    depends_on: []
+    resources:
+    - systemd
+    script: steps/system.runtime_env.sh
+    working_directory: /
+    timeout_seconds: 120
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ -f '/etc/agentdp/.env' ]; then
+        install -d -m 0755 '/run/agentdp'
+        install -m 0644 -o root -g root '/etc/agentdp/.env' '/run/agentdp/.env'
+        cat >/etc/systemd/system/agentdp-runtime-env.service <<'AGENTDP_RUNTIME_ENV_SERVICE'
+      [Unit]
+      Description=Materialize agentdp runtime env
+      After=local-fs.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/install -D -m 0644 -o root -g root /etc/agentdp/.env /run/agentdp/.env
+
+      [Install]
+      WantedBy=multi-user.target
+      AGENTDP_RUNTIME_ENV_SERVICE
+        systemctl daemon-reload
+        systemctl enable --now agentdp-runtime-env.service
+      fi
+  - id: system.ca_bundle
+    label: Install CA bundle
+    phase: system
+    depends_on: []
+    resources:
+    - package_manager
+    script: steps/system.ca_bundle.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ -f /var/lib/agentdp/ca/ca-bundle.pem ]; then
+        install -d -m 0755 /etc/pki/ca-trust/source/anchors
+        install -m 0644 /var/lib/agentdp/ca/ca-bundle.pem /etc/pki/ca-trust/source/anchors/agentdp-ca-bundle.crt
+        if command -v update-ca-trust >/dev/null 2>&1; then update-ca-trust extract || true; fi
+      fi
+  - id: system.user_handoff
+    label: Finalize agent home ownership
+    phase: system
+    depends_on:
+    - system.runtime_env
+    - system.ca_bundle
+    resources:
+    - agent_home
+    script: steps/system.user_handoff.sh
+    working_directory: /
+    timeout_seconds: 300
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      chown -R 'agent':'agent' '/data/home' '/data/home/code'
+  - id: plugin.podman.ca_bundle
+    label: Configure Podman CA defaults
+    phase: user
+    depends_on:
+    - system.ca_bundle
+    - system.user_handoff
+    resources: []
+    script: steps/plugin.podman.ca_bundle.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      sudo ln -sf '/usr/local/bin/guestctl' '/usr/local/bin/podman'
+
+      install -d -m 0755 "$HOME/.config/containers/containers.conf.d"
+      cat >"$HOME/.config/containers/containers.conf.d/agentdp-ca-bundle.conf" <<'EOF'
+      [containers]
+      env=["NODE_EXTRA_CA_CERTS=/run/agentdp/ca/ca-bundle.pem", "NPM_CONFIG_CAFILE=/run/agentdp/ca/ca-bundle.pem", "SSL_CERT_FILE=/run/agentdp/ca/ca-bundle.pem", "GIT_SSL_CAINFO=/run/agentdp/ca/ca-bundle.pem", "CURL_CA_BUNDLE=/run/agentdp/ca/ca-bundle.pem", "REQUESTS_CA_BUNDLE=/run/agentdp/ca/ca-bundle.pem", "AGENTDP_CA_ENV_VARS=NODE_EXTRA_CA_CERTS,NPM_CONFIG_CAFILE,SSL_CERT_FILE,GIT_SSL_CAINFO,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE"]
+      volumes=["/var/lib/agentdp/ca/ca-bundle.pem:/run/agentdp/ca/ca-bundle.pem:ro"]
+      EOF
+  - id: plugin.podman.docker_api
+    label: Configure rootless Podman Docker API
+    phase: user
+    depends_on:
+    - plugin.podman.ca_bundle
+    - system.user_handoff
+    resources:
+    - systemd
+    script: steps/plugin.podman.docker_api.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if command -v loginctl >/dev/null 2>&1; then
+        sudo loginctl enable-linger "$USER" || true
+      fi
+
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
+      systemctl --user daemon-reload || true
+      systemctl --user enable --now podman.socket
+      /usr/bin/podman info >/dev/null
+      docker ps >/dev/null
+  - id: user.custom_bootstrap
+    label: Run custom bootstrap hook
+    phase: user
+    depends_on:
+    - system.user_handoff
+    - plugin.podman.ca_bundle
+    - plugin.podman.docker_api
+    resources:
+    - agent_home
+    - code_dir
+    - mise
+    - npm_global
+    script: steps/user.custom_bootstrap.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      if [ -f '/var/lib/agentdp/bootstrap/custom-bootstrap.sh' ]; then
+        . '/var/lib/agentdp/bootstrap/custom-bootstrap.sh'
+      fi
+  - id: user.manifest_shell
+    label: Run manifest shell commands
+    phase: user
+    depends_on:
+    - user.custom_bootstrap
+    resources:
+    - agent_home
+    - code_dir
+    - mise
+    - npm_global
+    script: steps/user.manifest_shell.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      :
+  - id: user.disable_cloud_init
+    label: Disable cloud-init for subsequent boots
+    phase: user
+    depends_on:
+    - user.manifest_shell
+    resources:
+    - systemd
+    script: steps/user.disable_cloud_init.sh
+    working_directory: /
+    timeout_seconds: 120
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      sudo -n install -d -m 0755 /etc/cloud
+      sudo -n touch /etc/cloud/cloud-init.disabled
+      if command -v systemctl >/dev/null 2>&1; then
+        for unit in cloud-init-local.service cloud-init.service cloud-init-network.service cloud-config.service cloud-final.service cloud-init.target; do
+          sudo -n systemctl disable "$unit" >/dev/null 2>&1 || true
+        done
+      fi
+  - id: user.guestd
+    label: Start user guest daemon
+    phase: user
+    depends_on:
+    - user.disable_cloud_init
+    resources:
+    - systemd
+    script: steps/user.guestd.sh
+    working_directory: /
+    timeout_seconds: 120
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      if command -v loginctl >/dev/null 2>&1; then
+        sudo -n loginctl enable-linger "$USER" || true
+      fi
+      if command -v systemctl >/dev/null 2>&1; then
+        sudo -n systemctl start "user@$(id -u).service" || true
+      fi
+      for _ in $(seq 1 30); do
+        [ -S "$XDG_RUNTIME_DIR/bus" ] && break
+        sleep 1
+      done
+      test -S "$XDG_RUNTIME_DIR/bus"
+      systemctl --user daemon-reload
+      systemctl --user stop guestd.service >/dev/null 2>&1 || true
+      systemctl --user enable --now guestd.service
+      systemctl --user is-active --quiet guestd.service

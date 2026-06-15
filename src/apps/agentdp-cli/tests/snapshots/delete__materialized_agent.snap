@@ -1,0 +1,17 @@
+status: 0
+--- stdout
+status altinn-studio
+desired generation: 2
+observed generation: 2
+phase: Deleted
+replicas: 1
+ready replicas: 0
+active replicas: 0
+stopped replicas: 0
+deleting replicas: 0
+reconciling: false
+deleted: true
+agent base: Ready desired:sha256-7a3522a54c997833bc7e6d73002cae68c4652dcbbb2266707dcc82d568895d9e ready:sha256-7a3522a54c997833bc7e6d73002cae68c4652dcbbb2266707dcc82d568895d9e
+instances: none
+--- stderr
+

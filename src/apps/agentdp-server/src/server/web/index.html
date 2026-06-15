@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentdp</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { margin: 0; background: #f6f7f9; color: #17202a; }
+    header { height: 56px; display: flex; align-items: center; gap: 16px; padding: 0 24px; border-bottom: 1px solid #d8dee8; background: #ffffff; }
+    main { max-width: 1120px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 20px; margin: 0; font-weight: 650; }
+    table { width: 100%; table-layout: fixed; border-collapse: collapse; background: #ffffff; border: 1px solid #d8dee8; }
+    th, td { text-align: left; vertical-align: top; padding: 10px 12px; border-bottom: 1px solid #e7ebf0; font-size: 14px; overflow-wrap: anywhere; }
+    th { color: #4c5a67; font-weight: 600; background: #f9fafb; }
+    th:nth-child(1), td:nth-child(1) { width: 18%; }
+    th:nth-child(2), td:nth-child(2) { width: 12%; }
+    th:nth-child(3), td:nth-child(3) { width: 10%; }
+    th:nth-child(4), td:nth-child(4) { width: 14%; }
+    button { border: 1px solid #b9c2cf; background: #fff; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .muted { color: #64717f; }
+    .stale { color: #a23f24; }
+    @media (max-width: 640px) {
+      header { padding: 0 16px; }
+      main { padding: 20px 16px; }
+      th, td { padding: 8px; font-size: 12px; }
+      th:nth-child(1), td:nth-child(1) { width: 28%; }
+      th:nth-child(2), td:nth-child(2) { width: 18%; }
+      th:nth-child(3), td:nth-child(3) { width: 14%; }
+      th:nth-child(4), td:nth-child(4) { width: 20%; }
+      th:nth-child(5), td:nth-child(5) { display: none; }
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #111418; color: #e9edf2; }
+      header, table, th, button { background: #181d23; }
+      header, table, th, td, button { border-color: #303844; }
+      th, .muted { color: #a9b4c0; }
+      .stale { color: #ff9a7a; }
+    }
+  </style>
+</head>
+<body>
+  <header><h1>agentdp</h1><span class="muted">control plane</span></header>
+  <main>
+    <div class="toolbar"><strong>Instances</strong><button type="button" onclick="load()">Refresh</button></div>
+    <table>
+      <thead><tr><th>Name</th><th>Status</th><th>PID</th><th>Readiness</th><th>State</th></tr></thead>
+      <tbody id="instances"><tr><td colspan="5" class="muted">Loading</td></tr></tbody>
+    </table>
+  </main>
+  <script>
+    function render(data) {
+      const body = document.getElementById('instances');
+      body.innerHTML = '';
+      if (!data.instances.length) {
+        body.innerHTML = '<tr><td colspan="5" class="muted">No instances</td></tr>';
+        return;
+      }
+      for (const item of data.instances) {
+        const row = document.createElement('tr');
+        row.innerHTML = `<td>${item.name}</td><td class="${item.stale ? 'stale' : ''}">${item.status}</td><td>${item.pid ?? 'none'}</td><td>${item.ready === undefined ? 'unknown' : item.ready ? 'ready' : 'not-ready'}</td><td>${item.state}</td>`;
+        body.appendChild(row);
+      }
+    }
+    async function load() {
+      const body = document.getElementById('instances');
+      try {
+        const response = await fetch('/api/instances', { cache: 'no-store' });
+        const data = await response.json();
+        render(data);
+      } catch (error) {
+        body.innerHTML = `<tr><td colspan="5" class="stale">${error}</td></tr>`;
+      }
+    }
+    if (window.EventSource) {
+      const events = new EventSource('/api/events');
+      events.addEventListener('instances', (event) => render(JSON.parse(event.data)));
+    }
+    load();
+  </script>
+</body>
+</html>

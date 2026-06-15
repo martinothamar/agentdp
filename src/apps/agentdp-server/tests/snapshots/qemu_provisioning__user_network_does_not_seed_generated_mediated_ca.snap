@@ -1,0 +1,298 @@
+image:
+  os: archlinux
+  architecture: x86_64
+  variant: cloud
+  source_url: https://fastly.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+  format: qcow2
+work_dir: $TMP/agentdp/agents/user-network/instances/0
+seed_dir: $TMP/agentdp/agents/user-network/instances/0/seed
+seed_meta_data: |
+  instance-id: user-network-dev-0
+  local-hostname: dev-0
+seed_network_config: |
+  version: 1
+  config:
+    - type: physical
+      name: eth0
+      subnets:
+        - type: dhcp
+seed_user_data: |
+  #cloud-config
+  bootcmd:
+  - mkdir -p /etc/systemd/system/systemd-time-wait-sync.service.d && printf '[Service]\nTimeoutStartSec=30s\n' >/etc/systemd/system/systemd-time-wait-sync.service.d/agentdp-timeout.conf && systemctl daemon-reload || true
+  - pacman-key --init
+  - pacman-key --populate archlinux
+  - pacman -Sy --noconfirm archlinux-keyring
+  users:
+  - default
+  - name: agent
+    homedir: /data/home
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+    - ssh-ed25519 AAAATEST agentdp
+  write_files:
+  - path: /run/agentdp/bin/guestctl.gz
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /usr/local/bin/guestd
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/spec/agent-manifest.yaml
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/spec/bootstrap-plan.json
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/spec/instance.json
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /etc/systemd/system/guestd-system.service
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/system.runtime_env.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/system.user_handoff.sh
+    permissions: '0700'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/plugin.codex.config.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.custom_bootstrap.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.manifest_shell.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.disable_cloud_init.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  - path: /var/lib/agentdp/bootstrap/steps/user.guestd.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
+  runcmd:
+  - systemctl daemon-reload && systemctl enable --now guestd-system.service
+bootstrap_steps:
+- id: system.runtime_env
+  label: Materialize runtime environment
+  phase: system
+  depends_on: []
+  resources:
+  - systemd
+  script: steps/system.runtime_env.sh
+  working_directory: /
+  timeout_seconds: 120
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    if [ -f '/etc/agentdp/.env' ]; then
+      install -d -m 0755 '/run/agentdp'
+      install -m 0644 -o root -g root '/etc/agentdp/.env' '/run/agentdp/.env'
+      cat >/etc/systemd/system/agentdp-runtime-env.service <<'AGENTDP_RUNTIME_ENV_SERVICE'
+    [Unit]
+    Description=Materialize agentdp runtime env
+    After=local-fs.target
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/bin/install -D -m 0644 -o root -g root /etc/agentdp/.env /run/agentdp/.env
+
+    [Install]
+    WantedBy=multi-user.target
+    AGENTDP_RUNTIME_ENV_SERVICE
+      systemctl daemon-reload
+      systemctl enable --now agentdp-runtime-env.service
+    fi
+- id: system.user_handoff
+  label: Finalize agent home ownership
+  phase: system
+  depends_on:
+  - system.runtime_env
+  resources:
+  - agent_home
+  script: steps/system.user_handoff.sh
+  working_directory: /
+  timeout_seconds: 300
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/root}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    chown -R 'agent':'agent' '/data/home' '/data/home/code'
+- id: plugin.codex.config
+  label: Configure Codex
+  phase: user
+  depends_on:
+  - system.user_handoff
+  resources:
+  - agent_home
+  script: steps/plugin.codex.config.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    install -d -m 0755 "$HOME/.codex"
+    config="$HOME/.codex/config.toml"
+    touch "$config"
+    if ! grep -Fqx '[projects."/data/home/code"]' "$config"; then
+      {
+        printf '\n'
+        printf '%s\n' '[projects."/data/home/code"]'
+        printf '%s\n' 'trust_level = "trusted"'
+      } >>"$config"
+    fi
+    install -d -m 0755 "$HOME/.codex/skills/agentdp-guestctl"
+    cat >"$HOME/.codex/skills/agentdp-guestctl/SKILL.md" <<'EOF'
+    ---
+    name: agentdp-guestctl
+    description: Use inside agentdp guests to manage GitHub PR event notification registrations/subscriptions and inspect guest helper health.
+    ---
+
+    # agentdp guestctl
+
+    `guestctl` is available inside this agent VM and talks to the user-owned `guestd` daemon.
+
+    Use `guestctl ping` to verify the guest helper daemon is reachable.
+
+    Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the Codex tmux pane.
+
+    Use `guestctl pr list` to show registered PRs.
+
+    Use `guestctl pr unregister [pr-url-or-number]` to stop watching a PR.
+
+    EOF
+- id: user.custom_bootstrap
+  label: Run custom bootstrap hook
+  phase: user
+  depends_on:
+  - system.user_handoff
+  - plugin.codex.config
+  resources:
+  - agent_home
+  - code_dir
+  - mise
+  - npm_global
+  script: steps/user.custom_bootstrap.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    if [ -f '/var/lib/agentdp/bootstrap/custom-bootstrap.sh' ]; then
+      . '/var/lib/agentdp/bootstrap/custom-bootstrap.sh'
+    fi
+- id: user.manifest_shell
+  label: Run manifest shell commands
+  phase: user
+  depends_on:
+  - user.custom_bootstrap
+  resources:
+  - agent_home
+  - code_dir
+  - mise
+  - npm_global
+  script: steps/user.manifest_shell.sh
+  working_directory: /
+  timeout_seconds: 900
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    :
+- id: user.disable_cloud_init
+  label: Disable cloud-init for subsequent boots
+  phase: user
+  depends_on:
+  - user.manifest_shell
+  resources:
+  - systemd
+  script: steps/user.disable_cloud_init.sh
+  working_directory: /
+  timeout_seconds: 120
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    sudo -n install -d -m 0755 /etc/cloud
+    sudo -n touch /etc/cloud/cloud-init.disabled
+    if command -v systemctl >/dev/null 2>&1; then
+      for unit in cloud-init-local.service cloud-init.service cloud-init-network.service cloud-config.service cloud-final.service cloud-init.target; do
+        sudo -n systemctl disable "$unit" >/dev/null 2>&1 || true
+      done
+    fi
+- id: user.guestd
+  label: Start user guest daemon
+  phase: user
+  depends_on:
+  - user.disable_cloud_init
+  resources:
+  - systemd
+  script: steps/user.guestd.sh
+  working_directory: /
+  timeout_seconds: 120
+  contents: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HOME="${HOME:-/data/home}"
+    . '/usr/local/lib/agentdp/env.sh'
+
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if command -v loginctl >/dev/null 2>&1; then
+      sudo -n loginctl enable-linger "$USER" || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      sudo -n systemctl start "user@$(id -u).service" || true
+    fi
+    for _ in $(seq 1 30); do
+      [ -S "$XDG_RUNTIME_DIR/bus" ] && break
+      sleep 1
+    done
+    test -S "$XDG_RUNTIME_DIR/bus"
+    systemctl --user daemon-reload
+    systemctl --user stop guestd.service >/dev/null 2>&1 || true
+    systemctl --user enable --now guestd.service
+    systemctl --user is-active --quiet guestd.service
+generated_mediated_ca_cert_seeded: false
+generated_mediated_ca_key_file_written: false

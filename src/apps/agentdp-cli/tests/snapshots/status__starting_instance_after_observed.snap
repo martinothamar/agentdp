@@ -1,0 +1,36 @@
+status: 0
+--- stdout
+status altinn-studio/0
+status: running
+instance: altinn-studio/replica-0
+desired generation: 1
+observed generation: 1
+target: active
+process: running
+pid: $PID
+work: bootstrap
+readiness: unknown
+disk: $TMP/home/.agentdp/agents/altinn-studio/instances/0/disk.qcow2
+seed: $TMP/home/.agentdp/agents/altinn-studio/instances/0/seed.img
+monitor: $TMP/home/.agentdp/agents/altinn-studio/instances/0/run/monitor.sock
+qmp: $TMP/home/.agentdp/agents/altinn-studio/instances/0/run/qmp.sock
+instance_network:
+  stream_socket: /tmp/agentdp-net/$ID/stream.sock
+  guest_ipv4: Ipv4AddressText(10.73.0.10)/24
+  gateway_ipv4: Ipv4AddressText(10.73.0.1)
+ports:
+  code_server: tcp $PORT->4090
+  ssh: tcp $PORT->22
+network_runtime:
+  state: traffic-observed
+  ready: true
+  generation: 1
+  host_ports: 2
+  guest_rx: 1 frames, 1 bytes
+  host_tx: 0 frames, 0 bytes
+  disconnects: 0
+  connect_errors: 0
+  egress_errors: 0
+  event_drops: 0
+--- stderr
+

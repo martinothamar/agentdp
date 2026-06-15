@@ -1,0 +1,30 @@
+[package]
+name = "agentdp-server"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agentdp-core.workspace = true
+agentdp-crypto.workspace = true
+agentdp-ds = { workspace = true, features = ["serde"] }
+agentdp-network.workspace = true
+agentdp-platform.workspace = true
+agentdp-protocol.workspace = true
+agentdp-qemu.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+agentdp-test-support.workspace = true
+smoltcp.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+status: 0
+--- stdout
+status altinn-studio/0
+status: stopped
+instance: altinn-studio/replica-0
+desired generation: 1
+observed generation: 1
+target: active
+process: missing
+pid: $PID
+stale: runtime status is running but QEMU pid $PID is not running
+work: idle
+readiness: unknown
+disk: $TMP/home/.agentdp/agents/altinn-studio/instances/0/disk.qcow2
+seed: $TMP/home/.agentdp/agents/altinn-studio/instances/0/seed.img
+monitor: $TMP/home/.agentdp/agents/altinn-studio/instances/0/run/monitor.sock
+qmp: $TMP/home/.agentdp/agents/altinn-studio/instances/0/run/qmp.sock
+instance_network:
+  stream_socket: /tmp/agentdp-net/$ID/stream.sock
+  guest_ipv4: Ipv4AddressText(10.73.0.10)/24
+  gateway_ipv4: Ipv4AddressText(10.73.0.1)
+ports:
+  code_server: tcp $PORT->4090
+  ssh: tcp $PORT->22
+--- stderr
+

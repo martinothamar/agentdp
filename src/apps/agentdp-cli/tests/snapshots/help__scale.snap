@@ -1,0 +1,16 @@
+status: 0
+--- stdout
+Set desired replica count
+
+Usage: agentctl scale [OPTIONS] <REPLICAS>
+
+Arguments:
+  <REPLICAS>  Desired replica count
+
+Options:
+  -f, --file <PATH>  Agent manifest path
+  -v, --verbose
+      --wait         Wait until scaled replicas are stopped or ready
+  -h, --help         Print help
+--- stderr
+

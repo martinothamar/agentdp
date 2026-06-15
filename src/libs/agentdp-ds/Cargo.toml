@@ -1,0 +1,42 @@
+[package]
+name = "agentdp-ds"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+loom = ["dep:loom"]
+serde = ["dep:serde"]
+
+[dependencies]
+loom = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "sync_spsc"
+harness = false
+
+[[bench]]
+name = "local_spsc"
+harness = false
+
+[[bench]]
+name = "sync_ring"
+harness = false
+
+[[test]]
+name = "local"
+path = "tests/local/mod.rs"
+
+[[test]]
+name = "sync"
+path = "tests/sync/mod.rs"

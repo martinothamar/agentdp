@@ -1,0 +1,15 @@
+status: 0
+--- stdout
+#1 $UNIX_MS lifecycle.state_changed state=starting
+#2 $UNIX_MS telemetry.snapshot guest_rx=0/0 host_tx=0/0 disconnects=0 connect_errors=0 egress_errors=0
+#3 $UNIX_MS host_port.bound name=code_server protocol=tcp host=$PORT guest=4090
+#4 $UNIX_MS host_port.bound name=ssh protocol=tcp host=$PORT guest=22
+#5 $UNIX_MS lifecycle.state_changed state=connecting
+#6 $UNIX_MS telemetry.snapshot guest_rx=0/0 host_tx=0/0 disconnects=0 connect_errors=0 egress_errors=0
+#7 $UNIX_MS lifecycle.state_changed state=connected
+#8 $UNIX_MS telemetry.snapshot guest_rx=0/0 host_tx=0/0 disconnects=0 connect_errors=0 egress_errors=0
+#9 $UNIX_MS transport.guest_connected transport=QEMU stream socket /tmp/agentdp-net/$ID/stream.sock generation=1
+#10 $UNIX_MS lifecycle.state_changed state=traffic-observed
+#11 $UNIX_MS telemetry.snapshot guest_rx=1/1 host_tx=0/0 disconnects=0 connect_errors=0 egress_errors=0
+--- stderr
+
