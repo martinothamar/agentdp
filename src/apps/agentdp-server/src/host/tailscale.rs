@@ -122,6 +122,63 @@ pub(crate) async fn remove(context: &Context, state: &mut AgentInstanceDocument)
     Ok(())
 }
 
+pub(crate) fn needs_reconcile(manifest: &AgentManifest, state: &AgentInstanceDocument) -> bool {
+    let desired = manifest.spec.plugins.tailscale_serve.as_ref();
+    match (desired, state.status.tailscale_serve.as_ref()) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (Some(plugin), Some(existing)) => routes_changed(plugin, state, existing),
+    }
+}
+
+fn routes_changed(plugin: &TailscaleServe, state: &AgentInstanceDocument, existing: &TailscaleServeState) -> bool {
+    if plugin.routes.len() != existing.routes.len() {
+        return true;
+    }
+    plugin.routes.iter().any(|route| {
+        let Some(port) = state.status.network.ports.get(&route.service) else {
+            return true;
+        };
+        let Some(host_port) = port.host else {
+            return true;
+        };
+        let mode = route.mode.to_string();
+        let expected_target = format!("http://127.0.0.1:{host_port}");
+        let expected_host = match route.mode {
+            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Direct => None,
+            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Proxy => Some(render_host(
+                route.host_template.as_deref(),
+                &route.service,
+                state.metadata.name.as_str(),
+                state.metadata.agent.as_str(),
+            )),
+        };
+        let expected_path = match route.mode {
+            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Direct => "/".to_owned(),
+            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Proxy => render_path(
+                route.path.as_deref(),
+                &route.service,
+                state.metadata.name.as_str(),
+                state.metadata.agent.as_str(),
+            ),
+        };
+        !existing.routes.iter().any(|existing| {
+            existing.service == route.service
+                && existing.mode == mode
+                && existing.path == expected_path
+                && existing.target == expected_target
+                && match route.mode {
+                    agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Direct => {
+                        existing.https_port == Some(host_port)
+                    }
+                    agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Proxy => {
+                        existing.https_port.is_none() && expected_host.as_deref() == Some(existing.host.as_str())
+                    }
+                }
+        })
+    })
+}
+
 fn ensure_ready(config_dir: &Path, config: &control_plane::ServerConfig, detection: &Detection) -> Result<(), Error> {
     let path = control_plane::config_path(config_dir);
     if !config.tailscale.enabled {

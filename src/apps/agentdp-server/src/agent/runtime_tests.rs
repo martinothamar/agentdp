@@ -13,7 +13,7 @@ use agentdp_core::agent::{
     QemuState, assign_port_mappings,
 };
 use agentdp_core::doctor::DoctorReport;
-use agentdp_core::manifest::{AgentManifest, AgentPhase};
+use agentdp_core::manifest::{AgentManifest, AgentPhase, GuestPort, NetworkProtocol};
 use agentdp_core::provisioning::image::CatalogImage;
 use agentdp_core::provisioning::secrets::SecretBindings;
 use agentdp_ds::local::{oneshot, spsc};
@@ -132,6 +132,26 @@ async fn apply_changed_manifest_rebuilds_base_and_reconciles_instances() {
     assert_eq!(reconciled.generation(), initial.generation() + 1);
     assert_ne!(reconciled.ready_agent_base_key(), initial.ready_agent_base_key());
     assert_eq!(reconciled.ready_agent_base_key(), reconciled.desired_agent_base_key());
+}
+
+#[tokio::test(flavor = "local")]
+async fn generation_reconcile_preserves_configured_host_ports() {
+    let (agent, mut stream) = start_agent(&manifest_with_code_server_host(1, 4090)).await;
+    let initial = wait_for_ready(&mut stream, 1).await;
+    assert_eq!(
+        initial.status.instances[&AgentInstanceId::new(0)].network.ports["code_server"].host,
+        Some(4090)
+    );
+
+    let mut changed = manifest_with_code_server_host(1, 4090);
+    changed.spec.bootstrap.packages.push("htop".to_owned());
+    apply(&agent, manifest_context(changed)).await;
+
+    let reconciled = wait_for_ready(&mut stream, 1).await;
+    assert_eq!(
+        reconciled.status.instances[&AgentInstanceId::new(0)].network.ports["code_server"].host,
+        Some(4090)
+    );
 }
 
 #[tokio::test(flavor = "local")]
@@ -696,6 +716,19 @@ fn manifest_with(replicas: u16) -> AgentManifest {
     let mut manifest: AgentManifest = serde_yaml::from_str(agentdp_test_support::manifest::minimal()).unwrap();
     manifest.spec.replicas = replicas;
     manifest.spec.phase = AgentPhase::Running;
+    manifest
+}
+
+fn manifest_with_code_server_host(replicas: u16, host: u16) -> AgentManifest {
+    let mut manifest = manifest_with(replicas);
+    manifest.spec.network.ports.insert(
+        "code_server".to_owned(),
+        GuestPort {
+            guest: 4090,
+            host: Some(host),
+            protocol: NetworkProtocol::Tcp,
+        },
+    );
     manifest
 }
 

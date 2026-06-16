@@ -1779,6 +1779,7 @@ impl RunningAgentState {
         let Some(agent_base) = document.ready_agent_base_key().cloned() else {
             return;
         };
+        let manifest = document.manifest();
         for slot in 0..document.replicas() {
             let id = AgentInstanceId::new(u32::from(slot));
             if self.instances.contains_key(&id) {
@@ -1807,35 +1808,48 @@ impl RunningAgentState {
         }
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
-            let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
-                continue;
-            };
-            let target = if id.as_u32() < u32::from(document.replicas()) {
-                AgentInstanceTarget::Active
-            } else {
-                AgentInstanceTarget::Inactive
-            };
-            if instance.documents.private.spec.desired_generation != document.generation()
-                || instance.documents.private.spec.agent_base != agent_base
-                || instance.documents.private.spec.target != target
-            {
-                instance.documents.private.spec.desired_generation = document.generation();
-                instance.documents.private.spec.agent_base = agent_base.clone();
-                instance.documents.private.spec.target = target;
-                instance.documents.private.status.clear_readiness();
-                instance.documents.private.status.reconciliation = None;
-                instance.documents.private.status.network.runtime = None;
-                instance.documents.private.status.tailscale_serve = None;
-                if let Some(code_server) = instance.documents.private.status.network.ports.get_mut("code_server") {
-                    code_server.host = None;
+            let warning = {
+                let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+                    continue;
+                };
+                let target = if id.as_u32() < u32::from(document.replicas()) {
+                    AgentInstanceTarget::Active
+                } else {
+                    AgentInstanceTarget::Inactive
+                };
+                let mut warning = None;
+                if instance.documents.private.spec.desired_generation != document.generation()
+                    || instance.documents.private.spec.agent_base != agent_base
+                    || instance.documents.private.spec.target != target
+                {
+                    instance.documents.private.spec.desired_generation = document.generation();
+                    instance.documents.private.spec.agent_base = agent_base.clone();
+                    instance.documents.private.spec.target = target;
+                    instance.documents.private.status.clear_readiness();
+                    instance.documents.private.status.reconciliation = None;
+                    instance.documents.private.status.network.runtime = None;
+                    match assign_port_mappings(&manifest, id) {
+                        Ok(ports) => instance.documents.private.status.network.ports = ports,
+                        Err(error) => warning = Some(format!("{id}: failed to assign host ports: {error}")),
+                    }
+                    instance.documents.private.status.observed_generation = instance
+                        .documents
+                        .private
+                        .status
+                        .observed_generation
+                        .min(document.generation().saturating_sub(1));
+                    instance.bootstrap_retry = None;
                 }
-                instance.documents.private.status.observed_generation = instance
-                    .documents
-                    .private
-                    .status
-                    .observed_generation
-                    .min(document.generation().saturating_sub(1));
-                instance.bootstrap_retry = None;
+                warning
+            };
+            if let Some(message) = warning {
+                self.emit(
+                    AgentEventSource::Instance { id },
+                    AgentEvent::Diagnostic {
+                        level: EventLevel::Warn,
+                        message,
+                    },
+                );
             }
             self.reconcile_instance(id);
         }
@@ -1860,6 +1874,7 @@ impl RunningAgentState {
 
     fn reconcile_active_instance(&mut self, id: AgentInstanceId) {
         let document = self.documents.private.clone();
+        let manifest = document.manifest();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
@@ -1908,7 +1923,7 @@ impl RunningAgentState {
             .is_none_or(|state| !state.ready)
         {
             self.reconcile_instance_bootstrap(id);
-        } else if tailscale_serve_needs_reconcile(&document, &instance.documents.private) {
+        } else if host::tailscale::needs_reconcile(&manifest, &instance.documents.private) {
             admit_instance_work(instance, AgentInstanceWork::Reconciling);
             spawn_reconcile_tailscale_serve(
                 self.input.clone(),
@@ -2734,10 +2749,6 @@ fn queue_bootstrap_event(
         generation,
         event,
     })));
-}
-
-fn tailscale_serve_needs_reconcile(agent: &AgentDocument, instance: &AgentInstanceDocument) -> bool {
-    agent.manifest().spec.plugins.tailscale_serve.is_some() != instance.status.tailscale_serve.is_some()
 }
 
 fn manifest_context(document: &AgentDocument) -> Result<AgentManifestContext, Error> {
