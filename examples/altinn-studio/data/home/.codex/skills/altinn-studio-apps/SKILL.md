@@ -53,7 +53,6 @@ Important notes:
 - `studioctl` is meant to support
   - Windows, macOS and Linux
   - Docker, podman, colima (and their "Desktop" counterparts)
-- Do not use `rtk` or similar for `studioctl`, it is not supported
 
 ## Clone or locate apps
 

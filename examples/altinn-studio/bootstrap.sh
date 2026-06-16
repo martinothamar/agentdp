@@ -50,15 +50,6 @@ clone_apps() {
   popd
 }
 
-install_tools() {
-  section "Installing tools:"
-
-  curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
-
-  rtk --version
-  rtk init -g --codex
-}
-
 altinn_studio_bootstrap() {
   set -euo pipefail
 
@@ -66,7 +57,6 @@ altinn_studio_bootstrap() {
   prepare_workspace
   install_studioctl
   clone_apps
-  install_tools
 }
 
 altinn_studio_bootstrap

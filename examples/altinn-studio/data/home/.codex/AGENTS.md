@@ -172,6 +172,8 @@ IMPORTANT: this is how you must work on PRs:
   - After a PR is registered, you will receive PR event notifications regarding failing CI, reviews and top-level PR comments
   - Do not manually poll or watch PR status after registration
 - Builds, tests and lints must pass before push
+- Once review comments have been received, make further changes in follow up commits only, so it is simple to keep track for reviewer
+- PRs should be focused on a single topic/item. If unrelated problems/items are discovered and need fixes, fix in separate PRs to main branch
 - When PRs get merged, start cleanup procedure
   - Unregister the PR
   - Sync forks to upstream
