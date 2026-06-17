@@ -55,25 +55,25 @@ My chief complaint with all these cloud agent and sandbox companies relate to th
 - Agents will be a core part of the modern "AI native" organization
 
 Then buying makes a lot less sense because the software is both a lot easier to build oneself and agents might be
-important value-drivers in organizations, in that they represent increasinly large parts of production.
+important value-drivers in organizations, in that they represent increasingly large parts of production.
 So if AI agents amplify the human output, it makes a lot of sense to own it, control it and make sure it gets integrated
 in such a way that there is maximum flexibility and utility both in the short term and long term.
 
-Think thinking brought me to creating this repo. My theory of course was that no.
-I think a lot of these companies are composing building blocks out of already open source software.
+To try to answer the second question I started working on this repo.
+I think a lot of sandbox and cloud agent companies are composing building blocks out of already open source software.
 There may be gaps, but then I believe and hope that the open source ecosystem can fill it.
-So the question became:
+So the initial question for this repo was:
 
 > How little code is needed to get my personal little cloud agent going?
 
-I thought that these were the essential, reusable building blocks for which there might be good open source software:
+Started with this thinking of what the building blocks of an agent were:
 - Compute orchestration (Kubernetes, Nomad, ...)
 - VM/VMM/sandboxing tech (QEMU, cloud-hypervisor, libkrun, firecracker, containers,  ...)
 - Harness (Claude Code, Codex CLI or their SDK/app-server counterparts with essentially `--yolo` mode)
 - Custom networking with policy engine and secret injection (?)
-  - OK this was maybe not an existing thing, but thinking about it now it seems like it would be useful in other domains as well.. like CI systems
 
-So the code in this repo tries to compose these building blocks into "cloud agents" in the form of "virtual softwar engineers" to run on
+
+So the code in this repo tries to compose some custom implementation and some existing OS software to be able to run what looks like "cloud agents", specifically "virtual softwar engineers" to run on both:
 - My local dev machine (32 cores, 128GB RAM)
 - Kubernetes in the cloud (just need the controller on top)
 
