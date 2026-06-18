@@ -9,7 +9,7 @@ description: Use inside agentdp guests to manage GitHub PR event notification re
 
 Use `guestctl ping` to verify the guest helper daemon is reachable.
 
-Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the Codex tmux pane.
+Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the agent tmux pane.
 
 Use `guestctl pr list` to show registered PRs.
 

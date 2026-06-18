@@ -86,6 +86,27 @@ pub(super) fn apply_codex_integration(
     }
 }
 
+pub(super) fn apply_claude_integration(
+    plugins: &crate::manifest::plugins::Plugins,
+    builder: &mut ProvisioningBuilder<'_>,
+) {
+    let Some(browser) = &plugins.browser else {
+        return;
+    };
+    let Some(playwright) = &browser.playwright else {
+        return;
+    };
+    if playwright.claude_mcp && plugins.claude.is_some() {
+        builder.add_instance_user_step(
+            "plugin.browser.claude_mcp",
+            "Configure Claude Code Playwright MCP",
+            ["plugin.claude.config", "plugin.browser.playwright_npm"],
+            [BootstrapStepResource::AgentHome],
+            render_claude_mcp_config(playwright),
+        );
+    }
+}
+
 fn render_playwright_env(playwright: &Playwright) -> String {
     let mut script = shell::ShellScript::new();
     script.line(format!(
@@ -166,6 +187,41 @@ fn render_codex_mcp_config(playwright: &Playwright) -> String {
     script.line("EOF");
     script.render()
 }
+
+fn render_claude_mcp_config(playwright: &Playwright) -> String {
+    let server = serde_json::json!({
+        "type": "stdio",
+        "command": PLAYWRIGHT_MCP_COMMAND,
+        "args": [
+            "--browser=chromium",
+            format!("--executable-path={}", playwright.executable_path),
+            format!("--viewport-size={}", playwright.viewport),
+        ],
+        "env": {
+            "PLAYWRIGHT_MCP_EXECUTABLE_PATH": playwright.executable_path,
+            "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH": playwright.executable_path,
+            "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
+            "PLAYWRIGHT_MCP_VIEWPORT_SIZE": playwright.viewport,
+        },
+    });
+    let mut script = shell::ShellScript::new();
+    script.line("mcp_js=\"$(mktemp)\"");
+    script.line("cat >\"$mcp_js\" <<'EOF'");
+    script.block(CLAUDE_MCP_JS);
+    script.line("EOF");
+    script.line(format!("node \"$mcp_js\" {}", shell::single_quote(&server.to_string())));
+    script.line("rm -f \"$mcp_js\"");
+    script.render()
+}
+
+const CLAUDE_MCP_JS: &str = r#"const fs = require("fs");
+const os = require("os");
+const path = os.homedir() + "/.claude.json";
+let config = {};
+try { config = JSON.parse(fs.readFileSync(path, "utf8")); } catch {}
+config.mcpServers = config.mcpServers || {};
+config.mcpServers.playwright = JSON.parse(process.argv[2]);
+fs.writeFileSync(path, JSON.stringify(config, null, 2) + "\n");"#;
 
 fn toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))

@@ -4,7 +4,9 @@ use std::time::Duration;
 use agentdp_platform::fs::{ensure_private_dir, set_private_file};
 use agentdp_platform::socket;
 
-use crate::user::{CodexSessionService, ControlHandler, GithubPrService, RuntimePaths};
+use crate::user::{
+    AgentSessionService, CLAUDE_SESSION_COMMAND, CODEX_SESSION_COMMAND, ControlHandler, GithubPrService, RuntimePaths,
+};
 use crate::user::{local_socket_io_error, remove_stale_socket};
 use crate::{Error, Result};
 
@@ -25,17 +27,19 @@ pub(crate) async fn run() -> Result<()> {
         })?;
     set_private_file(&paths.socket).await?;
 
-    let codex_session = Arc::new(CodexSessionService::new(
+    let agent_launch_command = agent_launch_command();
+    let agent_session = Arc::new(AgentSessionService::new(
         &paths,
+        agent_launch_command.unwrap_or_default(),
         env_u64("AGENTDP_PR_IDLE_SECONDS").unwrap_or(DEFAULT_IDLE_SECONDS),
     ));
     let github_pr = Arc::new(GithubPrService::new(
         &paths,
-        Arc::clone(&codex_session),
+        Arc::clone(&agent_session),
         env_u64("AGENTDP_PR_POLL_SECONDS").unwrap_or(DEFAULT_POLL_SECONDS),
     ));
-    if env_bool("AGENTDP_CODEX_SESSION") {
-        tokio::spawn(codex_session_loop(Arc::clone(&codex_session)));
+    if agent_launch_command.is_some() {
+        tokio::spawn(agent_session_loop(Arc::clone(&agent_session)));
     }
     let control = Arc::new(ControlHandler::new(Arc::clone(&github_pr)));
     tokio::spawn(poll_loop(Arc::clone(&github_pr)));
@@ -61,12 +65,22 @@ async fn poll_loop(service: Arc<GithubPrService>) {
     }
 }
 
-async fn codex_session_loop(service: Arc<CodexSessionService>) {
+async fn agent_session_loop(service: Arc<AgentSessionService>) {
     loop {
         if let Err(error) = service.ensure_session().await {
-            eprintln!("guestd: Codex session startup failed: {error}");
+            eprintln!("guestd: agent session startup failed: {error}");
         }
         tokio::time::sleep(Duration::from_mins(1)).await;
+    }
+}
+
+fn agent_launch_command() -> Option<&'static str> {
+    if env_bool("AGENTDP_CLAUDE_SESSION") {
+        Some(CLAUDE_SESSION_COMMAND)
+    } else if env_bool("AGENTDP_CODEX_SESSION") {
+        Some(CODEX_SESSION_COMMAND)
+    } else {
+        None
     }
 }
 

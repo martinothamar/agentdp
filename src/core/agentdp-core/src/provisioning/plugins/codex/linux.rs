@@ -3,7 +3,7 @@ use crate::provisioning::bootstrap::ProvisioningBuilder;
 use crate::provisioning::guest_os::linux::shell;
 use agentdp_protocol::server_guest::BootstrapStepResource;
 
-const GUESTCTL_SKILL: &str = include_str!("resources/guestctl-skill.md");
+const GUESTCTL_SKILL: &str = include_str!("../resources/guestctl-skill.md");
 
 pub(super) fn apply(plugin: &Codex, builder: &mut ProvisioningBuilder<'_>) {
     builder.require_mise_package("node@lts");

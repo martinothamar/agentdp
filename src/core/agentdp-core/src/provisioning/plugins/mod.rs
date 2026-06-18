@@ -1,4 +1,5 @@
 mod browser;
+mod claude;
 mod code_server;
 mod codex;
 mod docker;
@@ -39,6 +40,10 @@ pub(super) fn apply(plugins: &Plugins, builder: &mut ProvisioningBuilder<'_>) {
     if let Some(go) = &plugins.go {
         go.apply(builder);
     }
+    if let Some(claude) = &plugins.claude {
+        claude.apply(builder);
+    }
+    browser::apply_claude_integration(plugins, builder);
     if let Some(codex) = &plugins.codex {
         codex.apply(builder);
     }

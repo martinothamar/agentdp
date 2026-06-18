@@ -1,11 +1,11 @@
-mod codex_session;
+mod agent_session;
 mod control;
 mod github_pr;
 mod local_protocol;
 mod local_rpc;
 mod paths;
 
-pub(crate) use codex_session::CodexSessionService;
+pub(crate) use agent_session::{AgentSessionService, CLAUDE_SESSION_COMMAND, CODEX_SESSION_COMMAND};
 pub(crate) use control::ControlHandler;
 pub(crate) use github_pr::GithubPrService;
 pub(crate) use local_protocol::Request;

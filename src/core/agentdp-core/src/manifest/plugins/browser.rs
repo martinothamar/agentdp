@@ -31,6 +31,8 @@ pub struct Playwright {
     pub viewport: String,
     #[serde(default = "default_codex_mcp")]
     pub codex_mcp: bool,
+    #[serde(default = "default_claude_mcp")]
+    pub claude_mcp: bool,
 }
 
 impl Playwright {
@@ -79,5 +81,9 @@ fn default_viewport() -> String {
 }
 
 const fn default_codex_mcp() -> bool {
+    true
+}
+
+const fn default_claude_mcp() -> bool {
     true
 }

@@ -307,7 +307,7 @@ base:
       Type=simple
       Environment=AGENTDP_STATE_DIR=%h/.local/state/agentdp
       Environment=AGENTDP_PR_REGISTRY=%h/.local/state/agentdp/pr-watch.json
-      Environment=AGENTDP_CODEX_PANE_FILE=%h/.local/state/agentdp/codex-pane-id
+      Environment=AGENTDP_AGENT_PANE_FILE=%h/.local/state/agentdp/agent-pane-id
       ExecStart=/usr/local/bin/agentdp-agent-env /usr/local/bin/guestd
       Restart=always
       RestartSec=20
@@ -772,7 +772,7 @@ instance:
 
       Use `guestctl ping` to verify the guest helper daemon is reachable.
 
-      Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the Codex tmux pane.
+      Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the agent tmux pane.
 
       Use `guestctl pr list` to show registered PRs.
 

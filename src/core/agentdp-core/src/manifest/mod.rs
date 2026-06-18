@@ -2103,6 +2103,166 @@ spec:
     }
 
     #[test]
+    fn claude_plugin_declares_host_input_secret_destinations() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: mediated-claude-auth
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      claude:
+        auth: mediated
+        auth_source: host-auth
+    secrets: []
+",
+        )
+        .unwrap();
+
+        let requirements = manifest.host_input_requirements();
+
+        let file = requirements.files().first().unwrap();
+        assert_eq!(file.label(), "Claude auth");
+        assert_eq!(file.permissions(), "0600");
+        let materialized = file
+            .materialize(
+                br#"{"claudeAiOauth":{"accessToken":"access-secret","refreshToken":"refresh-secret","expiresAt":123,"scopes":["user:inference"],"subscriptionType":"max"}}"#,
+                crate::provisioning::host_input::MaterializationContext::default(),
+            )
+            .unwrap();
+        let auth_json = String::from_utf8(materialized.contents).unwrap();
+        assert!(auth_json.contains("\"subscriptionType\": \"max\""));
+        assert!(auth_json.contains("\"expiresAt\": 123"));
+        assert!(!auth_json.contains("access-secret"));
+        assert!(!auth_json.contains("refresh-secret"));
+        assert!(!materialized.secrets.is_empty());
+        for binding in materialized.secrets.iter() {
+            assert!(binding.allows_host("api.anthropic.com"));
+            assert!(binding.allows_host("console.anthropic.com"));
+            assert!(binding.allows_host("claude.ai"));
+            assert!(!binding.allows_host("example.com"));
+        }
+    }
+
+    #[test]
+    fn claude_plugin_env_auth_scopes_anthropic_hosts() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: mediated-claude-env
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      claude:
+        auth: mediated
+        auth_source: env
+    secrets: []
+",
+        )
+        .unwrap();
+
+        let requirements = manifest.host_input_requirements();
+
+        assert!(requirements.files().is_empty());
+        let anthropic_hosts = vec![
+            "api.anthropic.com".to_owned(),
+            "claude.ai".to_owned(),
+            "console.anthropic.com".to_owned(),
+        ];
+        assert_eq!(
+            requirements.mediated_secret_allowed_hosts_for("ANTHROPIC_API_KEY"),
+            anthropic_hosts
+        );
+        assert_eq!(
+            requirements.mediated_secret_allowed_hosts_for("CLAUDE_CODE_OAUTH_TOKEN"),
+            anthropic_hosts
+        );
+    }
+
+    #[test]
+    fn rejects_claude_and_codex_together() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: claude-and-codex
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      claude:
+        auth: mediated
+      codex:
+        auth: mediated
+    secrets: []
+",
+        )
+        .unwrap();
+
+        let errors = manifest.validate().unwrap_err();
+
+        assert!(errors.messages().iter().any(|message| {
+            message
+                == "spec.plugins.claude and plugins.codex cannot both be enabled: both manage the agent tmux session"
+        }));
+    }
+
+    #[test]
     fn top_level_secrets_declare_host_input_secret_destinations() {
         let manifest = serde_yaml::from_str::<AgentManifest>(
             r"

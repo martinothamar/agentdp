@@ -10,7 +10,7 @@ use agentdp_platform::fs::{files_with_extension, remove_file, write_atomic};
 
 use super::local_protocol::PrListItem;
 use super::paths::RuntimePaths;
-use crate::user::CodexSessionService;
+use crate::user::AgentSessionService;
 use crate::{Error, Result};
 
 const MAX_PREVIEW_LENGTH: usize = 220;
@@ -60,17 +60,17 @@ pub(crate) struct GithubPrService {
     registry: PathBuf,
     seen: PathBuf,
     queue_dir: PathBuf,
-    codex_session: Arc<CodexSessionService>,
+    agent_session: Arc<AgentSessionService>,
     poll_seconds: u64,
 }
 
 impl GithubPrService {
-    pub(crate) fn new(paths: &RuntimePaths, codex_session: Arc<CodexSessionService>, poll_seconds: u64) -> Self {
+    pub(crate) fn new(paths: &RuntimePaths, agent_session: Arc<AgentSessionService>, poll_seconds: u64) -> Self {
         Self {
             registry: paths.registry.clone(),
             seen: paths.seen.clone(),
             queue_dir: paths.queue_dir.clone(),
-            codex_session,
+            agent_session,
             poll_seconds,
         }
     }
@@ -204,7 +204,7 @@ impl GithubPrService {
                 events.extend(queue.events);
             }
         }
-        if events.is_empty() || !self.codex_session.inject_pr_events_if_idle(&events).await? {
+        if events.is_empty() || !self.agent_session.inject_pr_events_if_idle(&events).await? {
             return Ok(());
         }
         for file in files {

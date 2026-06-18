@@ -120,6 +120,51 @@ mod tests {
     }
 
     #[test]
+    fn claude_manifest_installs_guest_tooling() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: claude-agent
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      browser:
+        playwright:
+          install: npm-global
+      claude:
+        yolo: true
+        auth: mediated
+        auth_source: host-auth
+    secrets: []
+",
+        )
+        .unwrap();
+
+        let plan = ProvisioningPlan::from_manifest(&manifest, &ProvisioningOptions::default());
+
+        assert_bootstrap_split_snapshot("claude_manifest_installs_guest_tooling", &manifest, &plan);
+    }
+
+    #[test]
     fn user_network_plan_without_ca_does_not_install_ca_bundle() {
         let manifest = serde_yaml::from_str::<AgentManifest>(
             r"

@@ -11,27 +11,29 @@ use agentdp_platform::command::{run_capture, run_status};
 use agentdp_platform::fs::{read_optional_text, remove_file, write_atomic};
 
 #[derive(Debug)]
-pub(crate) struct CodexSessionService {
+pub(crate) struct AgentSessionService {
     code_dir: PathBuf,
     pane_file: PathBuf,
     state_dir: PathBuf,
     last_pane_capture: Mutex<Option<PaneCapture>>,
+    launch_command: String,
     idle_seconds: u64,
 }
 
-impl CodexSessionService {
-    pub(crate) fn new(paths: &RuntimePaths, idle_seconds: u64) -> Self {
+impl AgentSessionService {
+    pub(crate) fn new(paths: &RuntimePaths, launch_command: impl Into<String>, idle_seconds: u64) -> Self {
         Self {
             code_dir: paths.code_dir.clone(),
             pane_file: paths.pane_file.clone(),
             state_dir: paths.state_dir.clone(),
             last_pane_capture: Mutex::new(None),
+            launch_command: launch_command.into(),
             idle_seconds,
         }
     }
 
     pub(crate) async fn ensure_session(&self) -> Result<String> {
-        ensure_session(&self.code_dir, &self.pane_file).await
+        ensure_session(&self.code_dir, &self.pane_file, &self.launch_command).await
     }
 
     pub(super) async fn inject_pr_events_if_idle(&self, events: &[PrEvent]) -> Result<bool> {
@@ -54,13 +56,15 @@ struct PaneCapture {
     since: std::time::Instant,
 }
 
-async fn ensure_session(code_dir: &Path, pane_file: &Path) -> Result<String> {
+async fn ensure_session(code_dir: &Path, pane_file: &Path, command: &str) -> Result<String> {
     let session = std::env::var("AGENTDP_TMUX_SESSION").unwrap_or_else(|_| "agentdp".to_owned());
     if run_status("tmux", &["has-session", "-t", &session], None)
         .await
         .is_err()
     {
-        dismiss_known_codex_update_prompt().await?;
+        if command == CODEX_SESSION_COMMAND {
+            dismiss_known_codex_update_prompt().await?;
+        }
         run_capture(
             "tmux",
             &[
@@ -72,7 +76,7 @@ async fn ensure_session(code_dir: &Path, pane_file: &Path) -> Result<String> {
                 code_dir
                     .to_str()
                     .ok_or_else(|| Error::Message("AGENTDP_CODE_DIR is not valid UTF-8".to_owned()))?,
-                CODEX_SESSION_COMMAND,
+                command,
             ],
             None,
         )
@@ -88,7 +92,8 @@ async fn ensure_session(code_dir: &Path, pane_file: &Path) -> Result<String> {
     Ok(pane.trim().to_owned())
 }
 
-const CODEX_SESSION_COMMAND: &str = r#"if find "$HOME/.codex/sessions" -type f -name '*.jsonl' -print -quit 2>/dev/null | grep -q .; then exec codex resume --last; else exec codex; fi"#;
+pub(crate) const CLAUDE_SESSION_COMMAND: &str = "claude --continue || claude";
+pub(crate) const CODEX_SESSION_COMMAND: &str = r#"if find "$HOME/.codex/sessions" -type f -name '*.jsonl' -print -quit 2>/dev/null | grep -q .; then exec codex resume --last; else exec codex; fi"#;
 
 async fn dismiss_known_codex_update_prompt() -> Result<()> {
     let path = codex_version_file()?;
