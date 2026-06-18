@@ -39,6 +39,7 @@ use crate::agent::{AgentContextError, AgentManifestContext, AgentdpLayout, Agent
 use crate::backend;
 use crate::host;
 use crate::host::HostSeedError;
+use crate::host::tailscale::{TailscaleServeDesired, TailscaleService};
 use crate::services::InstanceNetwork;
 
 use super::base::{AgentBaseDiskPhase, AgentBasePreparation, ensure_agent_base_ready};
@@ -197,6 +198,7 @@ impl Agent {
         agent: AgentName,
         layout: AgentdpLayout,
         backend: backend::BackendRef,
+        tailscale: Rc<TailscaleService>,
     ) -> Self {
         let (input, receiver) = inbox::bounded(INPUT_CAPACITY);
         let task = spawn_agent_loop(
@@ -205,6 +207,7 @@ impl Agent {
                 context,
                 layout,
                 backend,
+                tailscale,
                 pending_streams: Vec::new(),
                 input: input.clone(),
             }),
@@ -384,11 +387,19 @@ enum AgentState {
     Running(Box<RunningAgentState>),
 }
 
+#[derive(Clone)]
+struct AgentWorkServices {
+    input: inbox::Sender<AgentInput>,
+    backend: backend::BackendRef,
+    tailscale: Rc<TailscaleService>,
+}
+
 struct StartingAgentState {
     agent: AgentName,
     context: Context,
     layout: AgentdpLayout,
     backend: backend::BackendRef,
+    tailscale: Rc<TailscaleService>,
     pending_streams: Vec<PendingOpenStream>,
     input: inbox::Sender<AgentInput>,
 }
@@ -403,6 +414,7 @@ struct RunningAgentState {
     events: EventLogWriter<AgentEventEnvelope>,
     layout: AgentdpLayout,
     backend: backend::BackendRef,
+    tailscale: Rc<TailscaleService>,
     base: AgentBaseState,
     instances: BTreeMap<AgentInstanceId, AgentInstanceState>,
     streams: Vec<spsc::Sender<AgentStreamItem>>,
@@ -744,6 +756,7 @@ impl StartingAgentState {
             events,
             layout: self.layout.clone(),
             backend: self.backend.clone(),
+            tailscale: Rc::clone(&self.tailscale),
             base,
             instances,
             streams: Vec::new(),
@@ -754,6 +767,14 @@ impl StartingAgentState {
 }
 
 impl RunningAgentState {
+    fn work_services(&self) -> AgentWorkServices {
+        AgentWorkServices {
+            input: self.input.clone(),
+            backend: self.backend.clone(),
+            tailscale: Rc::clone(&self.tailscale),
+        }
+    }
+
     fn next_wake(&self) -> Option<Instant> {
         let mut deadline = Some(self.next_reconcile);
         for instance in self.instances.values().filter_map(AgentInstanceState::running_ref) {
@@ -1248,14 +1269,20 @@ impl RunningAgentState {
                 generation,
                 document,
             } => {
-                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Starting, document, true);
+                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Starting, document, false);
             }
             WorkCompletion::InstanceReconciled {
                 id,
                 generation,
                 document,
             } => {
-                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Reconciling, document, true);
+                self.apply_instance_document_completion(
+                    id,
+                    generation,
+                    AgentInstanceWork::Reconciling,
+                    document,
+                    false,
+                );
             }
             WorkCompletion::InstanceStopped {
                 id,
@@ -1472,7 +1499,6 @@ impl RunningAgentState {
                     last_success_unix_seconds: time::unix_seconds(),
                     result: readiness_result,
                 });
-                instance.documents.private.status.mark_observed_generation(*generation);
                 instance.bootstrap_retry = None;
                 clear_instance_work(instance);
                 self.emit_instance_event(
@@ -1521,6 +1547,7 @@ impl RunningAgentState {
             match document {
                 Ok(document) => {
                     instance.documents.private = document.clone();
+                    instance.documents.private.status.mark_observed_generation(*generation);
                 }
                 Err(error) => {
                     warning = Some(format!("{id}: failed to reconcile Tailscale serve: {error}"));
@@ -1680,6 +1707,7 @@ impl RunningAgentState {
     fn reconcile_deletion(&mut self) {
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
+            let services = self.work_services();
             if let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut)
                 && instance.work.is_none()
                 && instance.session.is_none()
@@ -1687,8 +1715,7 @@ impl RunningAgentState {
                 instance.documents.private.spec.target = AgentInstanceTarget::Deleting;
                 admit_instance_work(instance, AgentInstanceWork::Deleting);
                 spawn_delete_instance(
-                    self.input.clone(),
-                    self.backend.clone(),
+                    services,
                     Rc::clone(&instance.network_runtime),
                     self.layout.clone(),
                     instance.documents.private.clone(),
@@ -1725,6 +1752,7 @@ impl RunningAgentState {
         let agent = self.documents.private.agent().clone();
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
+            let services = self.work_services();
             let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
                 continue;
             };
@@ -1738,8 +1766,7 @@ impl RunningAgentState {
                 instance.documents.private.status.clear_readiness();
                 admit_instance_work(instance, AgentInstanceWork::Stopping);
                 spawn_stop_instance(
-                    self.input.clone(),
-                    self.backend.clone(),
+                    services,
                     Rc::clone(&instance.network_runtime),
                     agent.clone(),
                     instance.documents.private.clone(),
@@ -1874,7 +1901,7 @@ impl RunningAgentState {
 
     fn reconcile_active_instance(&mut self, id: AgentInstanceId) {
         let document = self.documents.private.clone();
-        let manifest = document.manifest();
+        let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
@@ -1923,10 +1950,10 @@ impl RunningAgentState {
             .is_none_or(|state| !state.ready)
         {
             self.reconcile_instance_bootstrap(id);
-        } else if host::tailscale::needs_reconcile(&manifest, &instance.documents.private) {
+        } else if instance.documents.private.status.observed_generation != generation {
             admit_instance_work(instance, AgentInstanceWork::Reconciling);
             spawn_reconcile_tailscale_serve(
-                self.input.clone(),
+                services,
                 self.context.clone(),
                 self.layout.clone(),
                 document,
@@ -1941,6 +1968,7 @@ impl RunningAgentState {
     }
 
     fn reconcile_instance_bootstrap(&mut self, id: AgentInstanceId) {
+        let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
@@ -1964,8 +1992,7 @@ impl RunningAgentState {
         let generation = instance.documents.private.spec.desired_generation;
         admit_instance_work(instance, AgentInstanceWork::Bootstrapping);
         spawn_bootstrap_instance(
-            self.input.clone(),
-            self.backend.clone(),
+            services,
             self.layout.clone(),
             self.documents.private.clone(),
             instance.documents.private.clone(),
@@ -1976,6 +2003,7 @@ impl RunningAgentState {
 
     fn reconcile_inactive_instance(&mut self, id: AgentInstanceId) {
         let document = self.documents.private.clone();
+        let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
@@ -1986,8 +2014,7 @@ impl RunningAgentState {
         } else {
             admit_instance_work(instance, AgentInstanceWork::Stopping);
             spawn_stop_instance(
-                self.input.clone(),
-                self.backend.clone(),
+                services,
                 Rc::clone(&instance.network_runtime),
                 document.agent().clone(),
                 instance.documents.private.clone(),
@@ -1998,14 +2025,14 @@ impl RunningAgentState {
     }
 
     fn reconcile_deleting_instance(&mut self, id: AgentInstanceId) {
+        let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
         let generation = instance.documents.private.spec.desired_generation;
         admit_instance_work(instance, AgentInstanceWork::Deleting);
         spawn_delete_instance(
-            self.input.clone(),
-            self.backend.clone(),
+            services,
             Rc::clone(&instance.network_runtime),
             self.layout.clone(),
             instance.documents.private.clone(),
@@ -2477,8 +2504,7 @@ fn spawn_reconcile_instance(
 }
 
 fn spawn_stop_instance(
-    input: inbox::Sender<AgentInput>,
-    backend: backend::BackendRef,
+    services: AgentWorkServices,
     network: Rc<InstanceNetwork>,
     agent: AgentName,
     mut document: AgentInstanceDocument,
@@ -2486,12 +2512,23 @@ fn spawn_stop_instance(
     generation: u64,
 ) {
     tokio::task::spawn_local(async move {
+        let AgentWorkServices {
+            input,
+            backend,
+            tailscale,
+        } = services;
         let context = Context::quiet();
         let name = document.name();
         let instance = document.metadata.name.clone();
         let status = document.status.phase;
         let result = async {
-            host::tailscale::remove(&context, &mut document)
+            document.status.tailscale_serve = tailscale
+                .reconcile(
+                    &context,
+                    TailscaleServeDesired::Absent {
+                        observed: document.status.tailscale_serve.as_ref(),
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             let stopped = backend
@@ -2534,8 +2571,7 @@ fn spawn_stop_instance(
 }
 
 fn spawn_delete_instance(
-    input: inbox::Sender<AgentInput>,
-    backend: backend::BackendRef,
+    services: AgentWorkServices,
     network: Rc<InstanceNetwork>,
     layout: AgentdpLayout,
     mut document: AgentInstanceDocument,
@@ -2543,6 +2579,11 @@ fn spawn_delete_instance(
     generation: u64,
 ) {
     tokio::task::spawn_local(async move {
+        let AgentWorkServices {
+            input,
+            backend,
+            tailscale,
+        } = services;
         let files = layout.instance(&document.metadata.agent, id).files();
         let name = document.name();
         let agent = document.metadata.agent.clone();
@@ -2550,7 +2591,13 @@ fn spawn_delete_instance(
         let status = document.status.phase;
         let context = Context::quiet();
         let stop = async {
-            host::tailscale::remove(&context, &mut document)
+            document.status.tailscale_serve = tailscale
+                .reconcile(
+                    &context,
+                    TailscaleServeDesired::Absent {
+                        observed: document.status.tailscale_serve.as_ref(),
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             backend
@@ -2588,8 +2635,7 @@ fn spawn_delete_instance(
 }
 
 fn spawn_bootstrap_instance(
-    input: inbox::Sender<AgentInput>,
-    backend: backend::BackendRef,
+    services: AgentWorkServices,
     layout: AgentdpLayout,
     agent_document: AgentDocument,
     mut document: AgentInstanceDocument,
@@ -2597,6 +2643,11 @@ fn spawn_bootstrap_instance(
     generation: u64,
 ) {
     tokio::task::spawn_local(async move {
+        let AgentWorkServices {
+            input,
+            backend,
+            tailscale,
+        } = services;
         let context = Context::quiet();
         queue_completion(&input, WorkCompletion::BootstrapStarted { id, generation }).await;
         queue_bootstrap_event(
@@ -2626,7 +2677,17 @@ fn spawn_bootstrap_instance(
             );
             probe_guest_access(&context, &backend, &document).await?;
             let manifest = manifest_context(&agent_document)?;
-            host::tailscale::apply(&context, &layout.config_dir(), manifest.value(), &mut document).await?;
+            let config_dir = layout.config_dir();
+            document.status.tailscale_serve = tailscale
+                .reconcile(
+                    &context,
+                    TailscaleServeDesired::Instance {
+                        config_dir: &config_dir,
+                        manifest: manifest.value(),
+                        document: &document,
+                    },
+                )
+                .await?;
             Ok::<_, Error>(document)
         }
         .await
@@ -2644,7 +2705,7 @@ fn spawn_bootstrap_instance(
 }
 
 fn spawn_reconcile_tailscale_serve(
-    input: inbox::Sender<AgentInput>,
+    services: AgentWorkServices,
     context: Context,
     layout: AgentdpLayout,
     agent_document: AgentDocument,
@@ -2653,9 +2714,20 @@ fn spawn_reconcile_tailscale_serve(
     generation: u64,
 ) {
     tokio::task::spawn_local(async move {
+        let AgentWorkServices { input, tailscale, .. } = services;
         let result = async {
             let manifest = manifest_context(&agent_document)?;
-            host::tailscale::apply(&context, &layout.config_dir(), manifest.value(), &mut document).await?;
+            let config_dir = layout.config_dir();
+            document.status.tailscale_serve = tailscale
+                .reconcile(
+                    &context,
+                    TailscaleServeDesired::Instance {
+                        config_dir: &config_dir,
+                        manifest: manifest.value(),
+                        document: &document,
+                    },
+                )
+                .await?;
             Ok::<_, Error>(document)
         }
         .await

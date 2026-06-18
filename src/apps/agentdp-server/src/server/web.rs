@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentCommand, AgentError, AgentInstanceId, AgentName, AgentRegistry, AgentdpLayout};
+use crate::host::tailscale::{TailscaleServeDesired, TailscaleService};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const EVENT_STREAM_INTERVAL: Duration = Duration::from_secs(2);
@@ -44,8 +45,13 @@ pub(crate) struct WebControlPlane {
 }
 
 impl WebControlPlane {
-    pub(crate) async fn new(context: &Context, agents: Rc<AgentRegistry>, layout: AgentdpLayout) -> Self {
-        match spawn_control_plane(context, agents, layout).await {
+    pub(crate) async fn new(
+        context: &Context,
+        agents: Rc<AgentRegistry>,
+        layout: AgentdpLayout,
+        tailscale: Rc<TailscaleService>,
+    ) -> Self {
+        match spawn_control_plane(context, agents, layout, tailscale).await {
             Ok(task) => Self { task },
             Err(error) => {
                 context
@@ -77,6 +83,7 @@ async fn spawn_control_plane(
     context: &Context,
     agents: Rc<AgentRegistry>,
     layout: AgentdpLayout,
+    tailscale: Rc<TailscaleService>,
 ) -> Result<Option<JoinHandle<()>>, Error> {
     let config = control_plane::load_or_default(&layout.config_dir()).await?;
     if !config.web.enabled {
@@ -98,7 +105,7 @@ async fn spawn_control_plane(
         .logger()
         .verbose_with(|| format!("web control plane listening at http://{local_addr}"));
     if config.tailscale.expose_web {
-        apply_tailscale_serve(context, config.web.port).await;
+        apply_tailscale_serve(context, &tailscale, config.web.port).await;
     }
     let context = context.clone();
     let agents = Rc::clone(&agents);
@@ -136,27 +143,18 @@ async fn spawn_control_plane(
     })))
 }
 
-async fn apply_tailscale_serve(context: &Context, port: u16) {
-    let target = format!("http://127.0.0.1:{port}");
-    let mut command = tokio::process::Command::new("tailscale");
-    command.args(["serve", "--bg", "--yes", "--https=443", &target]);
-    match platform::command::hide_child_window(&mut command).output().await {
-        Ok(output) if output.status.success() => {
-            context
-                .logger()
-                .verbose_with(|| format!("configured Tailscale Serve root HTTPS route to {target}"));
-        }
-        Ok(output) => {
-            context.logger().warn(format!(
-                "failed to configure Tailscale Serve for web control plane; status: {}; stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+async fn apply_tailscale_serve(context: &Context, tailscale: &TailscaleService, port: u16) {
+    match tailscale
+        .reconcile(context, TailscaleServeDesired::ControlPlane { port })
+        .await
+    {
+        Ok(_) => context
+            .logger()
+            .verbose_with(|| format!("configured Tailscale Serve root HTTPS route to http://127.0.0.1:{port}")),
         Err(error) => {
-            context
-                .logger()
-                .warn(format!("failed to run tailscale serve for web control plane: {error}"));
+            context.logger().warn(format!(
+                "failed to configure Tailscale Serve for web control plane: {error}"
+            ));
         }
     }
 }

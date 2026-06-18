@@ -7,6 +7,7 @@ use agentdp_protocol::client_server as protocol;
 use thiserror::Error;
 
 use crate::agent::{AgentRegistry, AgentdpLayout};
+use crate::host::tailscale::TailscaleService;
 mod dispatch;
 mod lock;
 mod request;
@@ -72,14 +73,15 @@ pub(crate) async fn serve(context: &Context, layout: AgentdpLayout, socket_path:
         }
     };
     let shutdown = Rc::new(Notify::new());
-    let agents = match AgentRegistry::load(context.clone(), layout.clone()).await {
+    let tailscale = Rc::new(TailscaleService::new());
+    let agents = match AgentRegistry::load(context.clone(), layout.clone(), Rc::clone(&tailscale)).await {
         Ok(agents) => Rc::new(agents),
         Err(error) => {
             let _result = lock.release().await;
             return Err(Error::AgentRegistry(error));
         }
     };
-    let mut web = WebControlPlane::new(context, Rc::clone(&agents), layout).await;
+    let mut web = WebControlPlane::new(context, Rc::clone(&agents), layout, tailscale).await;
 
     let result = loop {
         tokio::select! {

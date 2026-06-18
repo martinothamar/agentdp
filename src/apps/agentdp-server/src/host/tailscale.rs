@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use agentdp_core::Context;
 use agentdp_core::agent::{
@@ -7,14 +8,17 @@ use agentdp_core::agent::{
 };
 use agentdp_core::control_plane;
 use agentdp_core::manifest::AgentManifest;
-use agentdp_core::manifest::plugins::tailscale_serve::TailscaleServe;
+use agentdp_core::manifest::plugins::tailscale_serve::TailscaleServe as TailscaleServePlugin;
 use agentdp_platform as platform;
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 const SERVICE_TOKEN: &str = concat!("{", "service", "}");
 const INSTANCE_TOKEN: &str = concat!("{", "instance", "}");
 const AGENT_TOKEN: &str = concat!("{", "agent", "}");
+const SERVE_MUTATION_ATTEMPTS: usize = 4;
+const SERVE_MUTATION_RETRY_DELAY: Duration = Duration::from_millis(150);
 const DEFAULT_HOST_TEMPLATE: &str = concat!("{", "service", "}-", "{", "instance", "}-", "{", "agent", "}");
 const DEFAULT_PATH_TEMPLATE: &str = concat!(
     "/agents/",
@@ -71,112 +75,140 @@ pub(crate) enum Error {
     DuplicatePort { port: u16 },
 }
 
-pub(crate) async fn apply(
-    context: &Context,
-    config_dir: &Path,
-    manifest: &AgentManifest,
-    state: &mut AgentInstanceDocument,
-) -> Result<(), Error> {
-    let Some(plugin) = &manifest.spec.plugins.tailscale_serve else {
-        return remove(context, state).await;
-    };
-    let config = control_plane::load_or_default(config_dir).await?;
-    let detection = detect().await?;
-    ensure_ready(config_dir, &config, &detection)?;
-    let root_host = config
-        .tailscale
-        .root_host
-        .clone()
-        .or(detection.dns_name)
-        .ok_or(Error::HttpsUnavailable)?;
-    remove(context, state).await?;
-    let routes = resolved_routes(plugin, manifest, state, &root_host)?;
-    for route in &routes {
-        match route.mode.as_str() {
-            "direct" => serve_port(context, route.https_port.unwrap_or(443), &route.target).await?,
-            "proxy" => serve_path(context, &route.path, &local_web_target(&config)).await?,
-            _ => {}
-        }
-    }
-    state.status.tailscale_serve = Some(TailscaleServeState { routes });
-    Ok(())
+#[derive(Debug, Default)]
+pub(crate) struct TailscaleService {
+    serve_mutations: Mutex<()>,
 }
 
-pub(crate) async fn remove(context: &Context, state: &mut AgentInstanceDocument) -> Result<(), Error> {
-    let Some(existing) = state.status.tailscale_serve.take() else {
-        return Ok(());
-    };
-    for route in existing.routes {
+pub(crate) enum TailscaleServeDesired<'a> {
+    ControlPlane {
+        port: u16,
+    },
+    Instance {
+        config_dir: &'a Path,
+        manifest: &'a AgentManifest,
+        document: &'a AgentInstanceDocument,
+    },
+    Absent {
+        observed: Option<&'a TailscaleServeState>,
+    },
+}
+
+impl TailscaleService {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) async fn reconcile(
+        &self,
+        context: &Context,
+        desired: TailscaleServeDesired<'_>,
+    ) -> Result<Option<TailscaleServeState>, Error> {
+        match desired {
+            TailscaleServeDesired::ControlPlane { port } => {
+                let _guard = self.serve_mutations.lock().await;
+                let target = format!("http://127.0.0.1:{port}");
+                run_tailscale_serve_command(context, &["serve", "--bg", "--yes", "--https=443", &target], false)
+                    .await?;
+                Ok(None)
+            }
+            TailscaleServeDesired::Instance {
+                config_dir,
+                manifest,
+                document,
+            } => self.reconcile_instance(context, config_dir, manifest, document).await,
+            TailscaleServeDesired::Absent { observed } => self.reconcile_absent(context, observed).await,
+        }
+    }
+
+    async fn reconcile_instance(
+        &self,
+        context: &Context,
+        config_dir: &Path,
+        manifest: &AgentManifest,
+        document: &AgentInstanceDocument,
+    ) -> Result<Option<TailscaleServeState>, Error> {
+        let Some(plugin) = &manifest.spec.plugins.tailscale_serve else {
+            return self
+                .reconcile_absent(context, document.status.tailscale_serve.as_ref())
+                .await;
+        };
+        let config = control_plane::load_or_default(config_dir).await?;
+        let detection = detect().await?;
+        ensure_ready(config_dir, &config, &detection)?;
+        let root_host = config
+            .tailscale
+            .root_host
+            .clone()
+            .or(detection.dns_name)
+            .ok_or(Error::HttpsUnavailable)?;
+        let desired = TailscaleServeState {
+            routes: resolved_routes(plugin, manifest, document, &root_host)?,
+        };
+        if document.status.tailscale_serve.as_ref() == Some(&desired) {
+            return Ok(Some(desired));
+        }
+        let _guard = self.serve_mutations.lock().await;
+        if let Some(observed) = &document.status.tailscale_serve {
+            remove_observed_routes(context, observed).await?;
+        }
+        let proxy_target = format!("http://127.0.0.1:{}", config.web.port);
+        for route in &desired.routes {
+            match route.mode.as_str() {
+                "direct" => {
+                    let https_arg = format!("--https={}", route.https_port.unwrap_or(443));
+                    run_tailscale_serve_command(context, &["serve", "--bg", "--yes", &https_arg, &route.target], false)
+                        .await?;
+                }
+                "proxy" => {
+                    let path_arg = format!("--set-path={}", route.path);
+                    run_tailscale_serve_command(
+                        context,
+                        &["serve", "--bg", "--yes", "--https=443", &path_arg, &proxy_target],
+                        false,
+                    )
+                    .await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(desired))
+    }
+
+    async fn reconcile_absent(
+        &self,
+        context: &Context,
+        observed: Option<&TailscaleServeState>,
+    ) -> Result<Option<TailscaleServeState>, Error> {
+        let Some(observed) = observed else {
+            return Ok(None);
+        };
+        let _guard = self.serve_mutations.lock().await;
+        remove_observed_routes(context, observed).await?;
+        Ok(None)
+    }
+}
+
+async fn remove_observed_routes(context: &Context, observed: &TailscaleServeState) -> Result<(), Error> {
+    for route in &observed.routes {
         match route.mode.as_str() {
             "direct" => {
                 if let Some(port) = route.https_port {
-                    remove_port(context, port).await?;
+                    let https_arg = format!("--https={port}");
+                    run_tailscale_serve_command(context, &["serve", &https_arg, "off"], true).await?;
                 } else {
-                    remove_path(context, &route.path).await?;
+                    let path_arg = format!("--set-path={}", route.path);
+                    run_tailscale_serve_command(context, &["serve", "--https=443", &path_arg, "off"], true).await?;
                 }
             }
-            "proxy" => remove_path(context, &route.path).await?,
+            "proxy" => {
+                let path_arg = format!("--set-path={}", route.path);
+                run_tailscale_serve_command(context, &["serve", "--https=443", &path_arg, "off"], true).await?;
+            }
             _ => {}
         }
     }
     Ok(())
-}
-
-pub(crate) fn needs_reconcile(manifest: &AgentManifest, state: &AgentInstanceDocument) -> bool {
-    let desired = manifest.spec.plugins.tailscale_serve.as_ref();
-    match (desired, state.status.tailscale_serve.as_ref()) {
-        (None, None) => false,
-        (None, Some(_)) | (Some(_), None) => true,
-        (Some(plugin), Some(existing)) => routes_changed(plugin, state, existing),
-    }
-}
-
-fn routes_changed(plugin: &TailscaleServe, state: &AgentInstanceDocument, existing: &TailscaleServeState) -> bool {
-    if plugin.routes.len() != existing.routes.len() {
-        return true;
-    }
-    plugin.routes.iter().any(|route| {
-        let Some(port) = state.status.network.ports.get(&route.service) else {
-            return true;
-        };
-        let Some(host_port) = port.host else {
-            return true;
-        };
-        let mode = route.mode.to_string();
-        let expected_target = format!("http://127.0.0.1:{host_port}");
-        let expected_host = match route.mode {
-            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Direct => None,
-            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Proxy => Some(render_host(
-                route.host_template.as_deref(),
-                &route.service,
-                state.metadata.name.as_str(),
-                state.metadata.agent.as_str(),
-            )),
-        };
-        let expected_path = match route.mode {
-            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Direct => "/".to_owned(),
-            agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Proxy => render_path(
-                route.path.as_deref(),
-                &route.service,
-                state.metadata.name.as_str(),
-                state.metadata.agent.as_str(),
-            ),
-        };
-        !existing.routes.iter().any(|existing| {
-            existing.service == route.service
-                && existing.mode == mode
-                && existing.path == expected_path
-                && existing.target == expected_target
-                && match route.mode {
-                    agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Direct => {
-                        existing.https_port == Some(host_port)
-                    }
-                    agentdp_core::manifest::plugins::tailscale_serve::RouteMode::Proxy => {
-                        existing.https_port.is_none() && expected_host.as_deref() == Some(existing.host.as_str())
-                    }
-                }
-        })
-    })
 }
 
 fn ensure_ready(config_dir: &Path, config: &control_plane::ServerConfig, detection: &Detection) -> Result<(), Error> {
@@ -197,7 +229,7 @@ fn ensure_ready(config_dir: &Path, config: &control_plane::ServerConfig, detecti
 }
 
 fn resolved_routes(
-    plugin: &TailscaleServe,
+    plugin: &TailscaleServePlugin,
     manifest: &AgentManifest,
     state: &AgentInstanceDocument,
     root_host: &str,
@@ -212,7 +244,7 @@ fn resolved_routes(
 }
 
 fn resolved_routes_for_network(
-    plugin: &TailscaleServe,
+    plugin: &TailscaleServePlugin,
     agent: &str,
     instance: &str,
     network: &NetworkState,
@@ -316,10 +348,6 @@ fn dns_fragment(value: &str) -> String {
         .collect()
 }
 
-fn local_web_target(config: &control_plane::ServerConfig) -> String {
-    format!("http://127.0.0.1:{}", config.web.port)
-}
-
 const fn port_protocol_name(protocol: PortProtocolState) -> &'static str {
     match protocol {
         PortProtocolState::Tcp => "tcp",
@@ -327,36 +355,11 @@ const fn port_protocol_name(protocol: PortProtocolState) -> &'static str {
     }
 }
 
-async fn serve_path(context: &Context, path: &str, target: &str) -> Result<(), Error> {
-    run_tailscale(
-        context,
-        &[
-            "serve",
-            "--bg",
-            "--yes",
-            "--https=443",
-            &format!("--set-path={path}"),
-            target,
-        ],
-    )
-    .await
-}
-
-async fn serve_port(context: &Context, port: u16, target: &str) -> Result<(), Error> {
-    run_tailscale(context, &["serve", "--bg", "--yes", &format!("--https={port}"), target]).await
-}
-
-async fn remove_path(context: &Context, path: &str) -> Result<(), Error> {
-    run_tailscale(context, &["serve", "--https=443", &format!("--set-path={path}"), "off"]).await
-}
-
-async fn remove_port(context: &Context, port: u16) -> Result<(), Error> {
-    run_tailscale(context, &["serve", &format!("--https={port}"), "off"]).await
-}
-
 async fn detect() -> Result<Detection, Error> {
-    let Ok(version) = tailscale_command(&["version"]).await else {
-        return Ok(Detection::default());
+    let version = match run_tailscale_output(&["version"]).await {
+        Ok(output) => output,
+        Err(Error::CommandIo { .. }) => return Ok(Detection::default()),
+        Err(error) => return Err(error),
     };
     if !version.status.success() {
         return Ok(Detection::default());
@@ -365,37 +368,61 @@ async fn detect() -> Result<Detection, Error> {
     Ok(parse_status(&status.stdout))
 }
 
-async fn run_tailscale(context: &Context, args: &[&str]) -> Result<(), Error> {
-    let output = run_tailscale_output(args).await?;
-    if output.status.success() {
-        context
-            .logger()
-            .verbose_with(|| format!("tailscale {} completed", args.join(" ")));
-        Ok(())
-    } else {
-        Err(Error::CommandFailed {
+async fn run_tailscale_serve_command(context: &Context, args: &[&str], missing_handler_ok: bool) -> Result<(), Error> {
+    for attempt in 1..=SERVE_MUTATION_ATTEMPTS {
+        let output = run_tailscale_output(args).await?;
+        if output.status.success() {
+            context
+                .logger()
+                .verbose_with(|| format!("tailscale {} completed", args.join(" ")));
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if missing_handler_ok && is_missing_serve_handler(&stderr) {
+            context
+                .logger()
+                .verbose_with(|| format!("tailscale {} already absent", args.join(" ")));
+            return Ok(());
+        }
+        if is_serve_config_conflict(&stderr) && attempt < SERVE_MUTATION_ATTEMPTS {
+            context.logger().verbose_with(|| {
+                format!(
+                    "tailscale {} hit serve config conflict on attempt {attempt}; retrying",
+                    args.join(" ")
+                )
+            });
+            tokio::time::sleep(SERVE_MUTATION_RETRY_DELAY).await;
+            continue;
+        }
+        return Err(Error::CommandFailed {
             args: args.join(" "),
             status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
+            stderr,
+        });
     }
+    unreachable!("serve mutation attempts loop always returns")
 }
 
 async fn run_tailscale_output(args: &[&str]) -> Result<std::process::Output, Error> {
-    tailscale_command(args).await.map_err(|source| Error::CommandIo {
-        args: args.join(" "),
-        source,
-    })
-}
-
-async fn tailscale_command(args: &[&str]) -> std::io::Result<std::process::Output> {
-    let mut command = tokio::process::Command::new(tailscale_binary());
+    let mut command = tokio::process::Command::new(
+        std::env::var("AGENTDP_TAILSCALE_PATH").unwrap_or_else(|_| "tailscale".to_owned()),
+    );
     command.args(args);
-    platform::command::hide_child_window(&mut command).output().await
+    platform::command::hide_child_window(&mut command)
+        .output()
+        .await
+        .map_err(|source| Error::CommandIo {
+            args: args.join(" "),
+            source,
+        })
 }
 
-fn tailscale_binary() -> String {
-    std::env::var("AGENTDP_TAILSCALE_PATH").unwrap_or_else(|_| "tailscale".to_owned())
+fn is_missing_serve_handler(stderr: &str) -> bool {
+    stderr.contains("failed to remove web serve: handler does not exist")
+}
+
+fn is_serve_config_conflict(stderr: &str) -> bool {
+    stderr.contains("Another client is changing the serve config") || stderr.contains("etag mismatch")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -438,7 +465,10 @@ mod tests {
     };
     use agentdp_core::manifest::plugins::tailscale_serve::{Route, RouteMode, TailscaleServe};
 
-    use super::{dns_fragment, parse_status, render_host, resolved_routes_for_network, validate_host};
+    use super::{
+        dns_fragment, is_missing_serve_handler, is_serve_config_conflict, parse_status, render_host,
+        resolved_routes_for_network, validate_host,
+    };
 
     #[test]
     fn parses_tailscale_status_dns_name() {
@@ -462,6 +492,26 @@ mod tests {
         assert!(validate_host("-bad").is_err());
         assert!(validate_host("bad_underscore").is_err());
         assert_eq!(dns_fragment("Code_Server"), "code-server");
+    }
+
+    #[test]
+    fn treats_missing_tailscale_serve_handler_as_idempotent_remove() {
+        assert!(is_missing_serve_handler(
+            "error: failed to remove web serve: handler does not exist\n\ntry `tailscale serve --help` for usage info"
+        ));
+        assert!(!is_missing_serve_handler(
+            "error: failed to remove web serve: permission denied"
+        ));
+    }
+
+    #[test]
+    fn detects_tailscale_serve_config_conflicts() {
+        assert!(is_serve_config_conflict(
+            "Another client is changing the serve config; please try again.\nsending serve config: Preconditions failed: etag mismatch"
+        ));
+        assert!(!is_serve_config_conflict(
+            "failed to remove web serve: handler does not exist"
+        ));
     }
 
     #[test]

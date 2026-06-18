@@ -10,6 +10,7 @@ use agentdp_protocol::client_server::BackendKind;
 use tokio::task::JoinHandle;
 
 use crate::backend;
+use crate::host::tailscale::TailscaleService;
 
 use super::{Agent, AgentError as Error, AgentManifestContext, AgentName, AgentdpLayout};
 
@@ -28,7 +29,11 @@ impl fmt::Debug for AgentRegistry {
 }
 
 impl AgentRegistry {
-    pub(crate) async fn load(context: Context, layout: AgentdpLayout) -> Result<Self, Error> {
+    pub(crate) async fn load(
+        context: Context,
+        layout: AgentdpLayout,
+        tailscale: Rc<TailscaleService>,
+    ) -> Result<Self, Error> {
         let mut state = RegistryState::default();
         for agent in layout.deployed_agents().await? {
             state.agents.insert(
@@ -38,17 +43,24 @@ impl AgentRegistry {
                     agent,
                     layout.clone(),
                     backend::resolve_for_kind(BackendKind::Qemu),
+                    Rc::clone(&tailscale),
                 ),
             );
         }
-        Ok(Self::from_state(context, layout, state))
+        Ok(Self::from_state(context, layout, tailscale, state))
     }
 
-    fn from_state(context: Context, layout: AgentdpLayout, state: RegistryState) -> Self {
+    fn from_state(
+        context: Context,
+        layout: AgentdpLayout,
+        tailscale: Rc<TailscaleService>,
+        state: RegistryState,
+    ) -> Self {
         let (command_tx, command_rx) = spsc::bounded(REGISTRY_COMMAND_CAPACITY);
         let inner = Rc::new(AgentRegistryInner {
             context,
             layout,
+            tailscale,
             commands: RefCell::new(command_tx),
         });
         let task = spawn_registry_loop(Rc::clone(&inner), state, command_rx);
@@ -149,6 +161,7 @@ const REGISTRY_COMMAND_CAPACITY: usize = 1024;
 struct AgentRegistryInner {
     context: Context,
     layout: AgentdpLayout,
+    tailscale: Rc<TailscaleService>,
     commands: RefCell<spsc::Sender<RegistryCommand>>,
 }
 
@@ -217,6 +230,7 @@ impl AgentRegistryInner {
             name.clone(),
             self.layout.clone(),
             backend::resolve_for_manifest(manifest.value())?,
+            Rc::clone(&self.tailscale),
         );
         state.agents.insert(name, agent.clone());
         Ok(agent)

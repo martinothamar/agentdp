@@ -25,12 +25,17 @@ use agentdp_protocol::server_guest::{BootstrapLifecycleStatus, BootstrapStepPhas
 
 use crate::agent::{AgentBaseFiles, AgentManifestContext, AgentName, AgentdpLayout};
 use crate::backend;
+use crate::host::tailscale::TailscaleService;
 use crate::services::InstanceNetwork;
 
 use super::{Agent, AgentCommand, AgentError as Error, AgentStreamItem};
 
 static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
 const STREAM_CAPACITY: usize = 256;
+
+fn tailscale_service() -> Rc<TailscaleService> {
+    Rc::new(TailscaleService::new())
+}
 
 #[tokio::test(flavor = "local")]
 async fn cold_apply_reaches_ready_without_child_actors() {
@@ -184,6 +189,7 @@ async fn persistence_writes_agent_instances_and_events_from_commit_tail() {
         agent_name.clone(),
         layout.clone(),
         Rc::new(FakeBackend::default()),
+        tailscale_service(),
     );
     let mut stream = watch(&agent).await;
     apply(&agent, manifest_context(manifest_with(1))).await;
@@ -428,6 +434,7 @@ async fn deleted_agent_removes_state_and_can_be_recreated() {
         agent_name.clone(),
         layout.clone(),
         Rc::clone(&backend),
+        tailscale_service(),
     );
     let mut stream = watch(&agent).await;
     apply(&agent, manifest_context(manifest.clone())).await;
@@ -440,7 +447,7 @@ async fn deleted_agent_removes_state_and_can_be_recreated() {
             .expect("inspect agent document")
     );
 
-    let recreated = Agent::spawn(Context::quiet(), agent_name, layout, backend);
+    let recreated = Agent::spawn(Context::quiet(), agent_name, layout, backend, tailscale_service());
     let mut recreated_stream = watch(&recreated).await;
     apply(&recreated, manifest_context(manifest)).await;
     wait_for_ready(&mut recreated_stream, 1).await;
@@ -453,7 +460,7 @@ async fn pending_instance_creation_is_not_published_as_fake_status() {
     let release_create = backend.pause_next_instance_create();
     let agent_backend: backend::BackendRef = backend;
     let (layout, agent_name) = unique_layout(&manifest);
-    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
     let mut stream = watch(&agent).await;
 
     let accepted = apply(&agent, manifest_context(manifest)).await;
@@ -472,7 +479,13 @@ async fn persisted_bootstrap_retry_wakes_without_external_input() {
     let manifest = manifest_with(1);
     let (layout, agent_name) = unique_layout(&manifest);
     persist_retrying_running_instance(&layout, &agent_name, &manifest).await;
-    let agent = Agent::spawn(Context::quiet(), agent_name, layout, Rc::new(FakeBackend::default()));
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        Rc::new(FakeBackend::default()),
+        tailscale_service(),
+    );
     let mut stream = watch(&agent).await;
 
     let ready = wait_for_ready(&mut stream, 1).await;
@@ -485,7 +498,13 @@ async fn persisted_ready_instance_reconciles_after_agent_restart() {
     let (layout, agent_name) = unique_layout(&manifest);
     persist_ready_running_instance(&layout, &agent_name, &manifest).await;
     let backend = Rc::new(FakeBackend::default());
-    let agent = Agent::spawn(Context::quiet(), agent_name, layout, backend.clone());
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
     let mut stream = watch(&agent).await;
 
     let loaded = recv_stream_item(&mut stream).await;
@@ -509,6 +528,7 @@ async fn commit_persistence_failure_answers_pending_command() {
         agent_name.clone(),
         layout.clone(),
         Rc::new(FakeBackend::default()),
+        tailscale_service(),
     );
     let mut stream = watch(&agent).await;
     apply(&agent, manifest_context(manifest)).await;
@@ -740,7 +760,7 @@ fn manifest_context(manifest: AgentManifest) -> AgentManifestContext {
 async fn start_agent(manifest: &AgentManifest) -> (Agent, spsc::Receiver<AgentStreamItem>) {
     let backend: backend::BackendRef = Rc::new(FakeBackend::default());
     let (layout, agent_name) = unique_layout(manifest);
-    let agent = Agent::spawn(Context::quiet(), agent_name, layout, backend);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, backend, tailscale_service());
     let stream = watch(&agent).await;
     apply(&agent, manifest_context(manifest.clone())).await;
     (agent, stream)
@@ -752,7 +772,7 @@ async fn start_agent_with_backend(
     let backend = Rc::new(FakeBackend::default());
     let agent_backend: backend::BackendRef = backend.clone();
     let (layout, agent_name) = unique_layout(manifest);
-    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
     let stream = watch(&agent).await;
     apply(&agent, manifest_context(manifest.clone())).await;
     (agent, stream, backend)
