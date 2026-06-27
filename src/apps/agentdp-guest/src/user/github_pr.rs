@@ -443,7 +443,11 @@ fn compact_text(value: &str) -> String {
     if text.len() <= MAX_PREVIEW_LENGTH {
         text
     } else {
-        format!("{}...", &text[..MAX_PREVIEW_LENGTH.saturating_sub(3)])
+        let mut end = MAX_PREVIEW_LENGTH.saturating_sub(3);
+        while !text.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        format!("{}...", &text[..end])
     }
 }
 
@@ -529,6 +533,14 @@ mod tests {
         assert!(text.contains("world"));
         assert!(!text.contains("hidden"));
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn compact_text_truncates_at_utf8_boundary() {
+        let text = compact_text(&format!("{}• trailing", "a".repeat(215)));
+
+        assert!(text.ends_with("..."));
+        assert!(text.len() <= 220);
     }
 
     #[test]
