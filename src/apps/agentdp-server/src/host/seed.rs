@@ -583,7 +583,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{SecretBindings, collect, collect_host_input_file_from_path, guest_tool_path};
+    use super::{
+        MaterializationContext, SecretBindings, collect, collect_host_input_file_from_path, guest_tool_path,
+        materialize_custom_env,
+    };
     use agentdp_core::Context;
     use agentdp_core::manifest::AgentManifest;
     use agentdp_core::provisioning::guest_os::GuestOsAdapter;
@@ -1129,7 +1132,7 @@ spec:
         let mut files = Vec::new();
         let mut secrets = SecretBindings::default();
         let auth = temp.write("host-codex/auth.json", "{\"tokens\":\"opaque\"}\n");
-        let requirement = codex_auth_file(&manifest);
+        let requirement = first_auth_file(&manifest);
 
         collect_host_input_file_from_path(
             &Context::quiet(),
@@ -1192,7 +1195,7 @@ spec:
             "host-codex/auth.json",
             r#"{"tokens":{"access_token":"access-secret","refresh_token":"refresh-secret","id_token":"id-secret"},"profile":"keep-me"}"#,
         );
-        let requirement = codex_auth_file(&manifest);
+        let requirement = first_auth_file(&manifest);
 
         collect_host_input_file_from_path(
             &Context::quiet(),
@@ -1238,6 +1241,215 @@ spec:
         assert!(!secret(&secrets, &id_token_placeholder).allows_host("example.com"));
     }
 
+    #[tokio::test]
+    async fn copy_from_host_claude_auth_seeds_host_auth_file() {
+        let temp = TestTempDir::create("qemu-host-seed-claude-auth");
+        let manifest_path = temp.write(
+            "agent.yaml",
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: copy-claude-auth
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: user
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      claude:
+        auth: copy-from-host
+    secrets: []
+",
+        );
+        let manifest = manifest(&manifest_path);
+        let mut files = Vec::new();
+        let mut secrets = SecretBindings::default();
+        let auth = temp.write(
+            "host-claude/.credentials.json",
+            "{\"claudeAiOauth\":{\"accessToken\":\"opaque\"}}\n",
+        );
+        let requirement = first_auth_file(&manifest);
+
+        collect_host_input_file_from_path(
+            &Context::quiet(),
+            &requirement,
+            GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout,
+            &auth,
+            &mut files,
+            &mut secrets,
+        )
+        .await
+        .unwrap();
+
+        assert!(secrets.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "/data/home/.claude/.credentials.json");
+        assert_eq!(files[0].permissions, "0600");
+        assert_eq!(files[0].owner, None);
+        assert_eq!(files[0].contents, b"{\"claudeAiOauth\":{\"accessToken\":\"opaque\"}}\n");
+    }
+
+    #[tokio::test]
+    async fn copy_from_host_claude_auth_seeds_custom_env_without_placeholders() {
+        let temp = TestTempDir::create("qemu-host-seed-copy-claude-env");
+        let manifest_path = temp.write(
+            "agent.yaml",
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: copy-claude-env
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: user
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      claude:
+        auth: copy-from-host
+    secrets: []
+",
+        );
+        temp.write(
+            ".env",
+            "ANTHROPIC_API_KEY=opaque\nCLAUDE_CODE_OAUTH_TOKEN=also-opaque\n",
+        );
+        let manifest = manifest(&manifest_path);
+        let requirements = manifest.host_input_requirements();
+
+        // The claude copy-from-host auth file is resolved from the host home and exercised by the
+        // file-level tests above; here we assert the custom-env copy path seeds both Anthropic auth
+        // env vars verbatim, with no placeholderization or mediated secrets.
+        let materialized = materialize_custom_env(
+            &Context::quiet(),
+            manifest_path.parent().unwrap(),
+            &requirements,
+            MaterializationContext::default(),
+            "custom bootstrap env",
+        )
+        .await
+        .unwrap()
+        .expect("custom env materialized from .env");
+
+        assert!(materialized.secrets.is_empty());
+        assert_eq!(
+            String::from_utf8(materialized.contents).unwrap(),
+            "ANTHROPIC_API_KEY=opaque\nCLAUDE_CODE_OAUTH_TOKEN=also-opaque\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mediated_claude_auth_seeds_placeholder_auth_file() {
+        let temp = TestTempDir::create("qemu-host-seed-mediated-claude-auth");
+        let manifest_path = temp.write(
+            "agent.yaml",
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: mediated-claude-auth
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      claude:
+        auth: mediated
+    secrets: []
+",
+        );
+        let manifest = manifest(&manifest_path);
+        let mut files = Vec::new();
+        let mut secrets = SecretBindings::default();
+        let auth = temp.write(
+            "host-claude/.credentials.json",
+            r#"{"claudeAiOauth":{"accessToken":"access-secret","refreshToken":"refresh-secret","expiresAt":123,"scopes":["user:inference"],"subscriptionType":"max"}}"#,
+        );
+        let requirement = first_auth_file(&manifest);
+
+        collect_host_input_file_from_path(
+            &Context::quiet(),
+            &requirement,
+            GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout,
+            &auth,
+            &mut files,
+            &mut secrets,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files[0].path, "/data/home/.claude/.credentials.json");
+        let auth_json = String::from_utf8(files[0].contents.clone()).unwrap();
+        assert!(auth_json.contains("\"subscriptionType\": \"max\""));
+        assert!(auth_json.contains("\"expiresAt\": 123"));
+        assert!(!auth_json.contains("access-secret"));
+        assert!(!auth_json.contains("refresh-secret"));
+        assert!(auth_json.contains("AGENTDP_SECRET_CLAUDE_AUTH_CLAUDEAIOAUTH_ACCESSTOKEN_"));
+        assert!(auth_json.contains("AGENTDP_SECRET_CLAUDE_AUTH_CLAUDEAIOAUTH_REFRESHTOKEN_"));
+        let access_token_placeholder = json_string_at(&auth_json, "/claudeAiOauth/accessToken");
+        assert_secret(
+            &secrets,
+            &access_token_placeholder,
+            "CLAUDE_AUTH_CLAUDEAIOAUTH_ACCESSTOKEN",
+            "access-secret",
+            "api.anthropic.com",
+        );
+        assert_secret(
+            &secrets,
+            &json_string_at(&auth_json, "/claudeAiOauth/refreshToken"),
+            "CLAUDE_AUTH_CLAUDEAIOAUTH_REFRESHTOKEN",
+            "refresh-secret",
+            "console.anthropic.com",
+        );
+        let access_token = secret(&secrets, &access_token_placeholder);
+        assert!(access_token.allows_host("claude.ai"));
+        assert!(!access_token.allows_host("example.com"));
+    }
+
     #[test]
     fn guest_tool_paths_use_linux_extensionless_names() {
         assert_eq!(
@@ -1246,7 +1458,7 @@ spec:
         );
     }
 
-    fn codex_auth_file(manifest: &AgentManifest) -> agentdp_core::provisioning::host_input::HostInputFile {
+    fn first_auth_file(manifest: &AgentManifest) -> agentdp_core::provisioning::host_input::HostInputFile {
         manifest
             .spec
             .plugins
@@ -1272,8 +1484,12 @@ spec:
     }
 
     fn json_string_field(contents: &str, field: &str) -> String {
+        json_string_at(contents, &format!("/tokens/{field}"))
+    }
+
+    fn json_string_at(contents: &str, pointer: &str) -> String {
         let json = serde_json::from_str::<serde_json::Value>(contents).unwrap();
-        json.pointer(&format!("/tokens/{field}"))
+        json.pointer(pointer)
             .and_then(serde_json::Value::as_str)
             .unwrap()
             .to_owned()

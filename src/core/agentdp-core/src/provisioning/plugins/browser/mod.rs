@@ -20,3 +20,9 @@ pub(super) fn apply_codex_integration(plugins: &Plugins, builder: &mut Provision
         GuestOs::Archlinux | GuestOs::Rocky9 => linux::apply_codex_integration(plugins, builder),
     }
 }
+
+pub(super) fn apply_claude_integration(plugins: &Plugins, builder: &mut ProvisioningBuilder<'_>) {
+    match builder.guest_os() {
+        GuestOs::Archlinux | GuestOs::Rocky9 => linux::apply_claude_integration(plugins, builder),
+    }
+}

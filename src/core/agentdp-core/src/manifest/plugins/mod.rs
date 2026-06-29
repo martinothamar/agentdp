@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod claude;
 pub mod code_server;
 pub mod codex;
 pub mod docker;
@@ -6,6 +7,7 @@ pub mod dotnet;
 pub mod git;
 pub mod github;
 pub mod go;
+mod mediated_json_auth;
 pub mod mise;
 pub mod node;
 pub mod podman;
@@ -28,6 +30,7 @@ pub struct Plugins {
     pub node: Option<node::Node>,
     pub podman: Option<podman::Podman>,
     pub browser: Option<browser::Browser>,
+    pub claude: Option<claude::Claude>,
     pub codex: Option<codex::Codex>,
     pub github: Option<github::GitHub>,
     pub tailscale_serve: Option<tailscale_serve::TailscaleServe>,
@@ -36,6 +39,12 @@ pub struct Plugins {
 
 impl Plugins {
     pub(super) fn validate(&self, network: &Network, errors: &mut Vec<String>) {
+        if self.claude.is_some() && self.codex.is_some() {
+            errors.push(
+                "plugins.claude and plugins.codex cannot both be enabled: both manage the agent tmux session"
+                    .to_owned(),
+            );
+        }
         if let Some(mise) = &self.mise {
             mise.validate(errors);
         }
@@ -62,6 +71,9 @@ impl Plugins {
     #[must_use]
     pub fn host_input_requirements(&self) -> HostInputRequirements {
         let mut requirements = HostInputRequirements::default();
+        if let Some(claude) = &self.claude {
+            claude.host_input_requirements(&mut requirements);
+        }
         if let Some(codex) = &self.codex {
             codex.host_input_requirements(&mut requirements);
         }

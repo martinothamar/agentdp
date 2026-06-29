@@ -6,6 +6,8 @@ base:
   - gzip
   - inetutils
   - tmux
+  - chromium
+  - noto-fonts
   - mise
   repos: []
   shell: []
@@ -73,6 +75,9 @@ base:
         agentdp_prepend_path "/data/home/.cargo/bin"
         agentdp_prepend_path "/data/home/go/bin"
         agentdp_prepend_path "/data/home/.local/bin"
+        export PLAYWRIGHT_MCP_EXECUTABLE_PATH='/usr/bin/chromium'
+        export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH='/usr/bin/chromium'
+        export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
         agentdp_prepend_path '/data/home/.local/share/mise/shims'
 
         if [ -d '/data/home/.local/share/mise/installs/dotnet' ]; then
@@ -216,7 +221,7 @@ base:
       export HOME="${HOME:-/root}"
       . '/usr/local/lib/agentdp/env.sh'
 
-      pacman -Sy --noconfirm 'sudo' 'cloud-guest-utils' 'gptfdisk' 'gzip' 'inetutils' 'tmux' 'mise'
+      pacman -Sy --noconfirm 'sudo' 'cloud-guest-utils' 'gptfdisk' 'gzip' 'inetutils' 'tmux' 'chromium' 'noto-fonts' 'mise'
   - id: system.agent_user
     label: Prepare agent user
     phase: system
@@ -303,16 +308,37 @@ base:
       if command -v loginctl >/dev/null 2>&1; then
         loginctl enable-linger 'agent' || true
       fi
-  - id: plugin.node.corepack
-    label: Enable Node Corepack
+  - id: plugin.claude.session
+    label: Configure Claude Code session service
+    phase: system
+    depends_on:
+    - system.guest_tooling
+    resources:
+    - systemd
+    script: steps/plugin.claude.session.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/root}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 /etc/systemd/user/guestd.service.d
+      cat >/etc/systemd/user/guestd.service.d/claude.conf <<'EOF'
+      [Service]
+      Environment=AGENTDP_CLAUDE_SESSION=1
+      EOF
+  - id: plugin.browser.playwright_npm
+    label: Install Playwright npm tools
     phase: user
     depends_on:
+    - system.packages
     - plugin.mise
     resources:
     - agent_home
-    - mise
     - npm_global
-    script: steps/plugin.node.corepack.sh
+    script: steps/plugin.browser.playwright_npm.sh
     working_directory: /
     timeout_seconds: 900
     contents: |-
@@ -321,10 +347,46 @@ base:
       export HOME="${HOME:-/data/home}"
       . '/usr/local/lib/agentdp/env.sh'
 
-      corepack enable
-      if command -v mise >/dev/null 2>&1; then
-        mise reshim node
+      if [ ! -x '/usr/bin/chromium' ]; then
+        echo '/usr/bin/chromium is missing; Playwright requires plugins.browser.playwright.browser_package' >&2
+        exit 1
       fi
+      npm config set prefix "$HOME/.local"
+      npm install -g \
+        'playwright@latest' '@playwright/test@latest' '@playwright/mcp@latest'
+      node -e "const fs = require('fs'); const browser = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH; if (!browser || !fs.existsSync(browser)) { process.exit(1); }"
+      playwright-mcp --help >/dev/null
+  - id: plugin.claude.install
+    label: Install Claude Code
+    phase: user
+    depends_on:
+    - plugin.mise
+    resources:
+    - agent_home
+    - npm_global
+    script: steps/plugin.claude.install.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      install -d -m 0755 "$HOME/.local/bin" "$HOME/.local/share/agentdp/claude"
+      npm install -g --prefix "$HOME/.local/share/agentdp/claude" @anthropic-ai/claude-code@latest
+      cat >"$HOME/.local/bin/claude" <<'EOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      claude_real="$HOME/.local/share/agentdp/claude/bin/claude"
+      if [ ! -x "$claude_real" ]; then
+        echo "agentdp claude wrapper could not find $claude_real" >&2
+        exit 127
+      fi
+      exec "$claude_real" --dangerously-skip-permissions "$@"
+      EOF
+      chmod 0755 "$HOME/.local/bin/claude"
   - id: plugin.mise
     label: Install mise runtimes
     phase: user
@@ -424,11 +486,108 @@ instance:
       . '/usr/local/lib/agentdp/env.sh'
 
       chown -R 'agent':'agent' '/data/home' '/data/home/code'
+  - id: plugin.claude.config
+    label: Configure Claude Code
+    phase: user
+    depends_on:
+    - system.user_handoff
+    resources:
+    - agent_home
+    script: steps/plugin.claude.config.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      trust_js="$(mktemp)"
+      cat >"$trust_js" <<'EOF'
+      const fs = require("fs");
+      const os = require("os");
+      const path = os.homedir() + "/.claude.json";
+      let config = {};
+      try { config = JSON.parse(fs.readFileSync(path, "utf8")); } catch {}
+      config.hasCompletedOnboarding = true;
+      config.projects = config.projects || {};
+      const dir = process.argv[2];
+      config.projects[dir] = Object.assign({}, config.projects[dir], { hasTrustDialogAccepted: true });
+      fs.writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+      EOF
+      node "$trust_js" '/data/home/code'
+      rm -f "$trust_js"
+      bypass_js="$(mktemp)"
+      cat >"$bypass_js" <<'EOF'
+      const fs = require("fs");
+      const os = require("os");
+      const dir = os.homedir() + "/.claude";
+      fs.mkdirSync(dir, { recursive: true });
+      const path = dir + "/settings.json";
+      let settings = {};
+      try { settings = JSON.parse(fs.readFileSync(path, "utf8")); } catch {}
+      settings.skipDangerousModePermissionPrompt = true;
+      fs.writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+      EOF
+      node "$bypass_js"
+      rm -f "$bypass_js"
+      install -d -m 0755 "$HOME/.claude/skills/agentdp-guestctl"
+      cat >"$HOME/.claude/skills/agentdp-guestctl/SKILL.md" <<'EOF'
+      ---
+      name: agentdp-guestctl
+      description: Use inside agentdp guests to manage GitHub PR event notification registrations/subscriptions and inspect guest helper health.
+      ---
+
+      # agentdp guestctl
+
+      `guestctl` is available inside this agent VM and talks to the user-owned `guestd` daemon.
+
+      Use `guestctl ping` to verify the guest helper daemon is reachable.
+
+      Use `guestctl pr register [pr-url-or-number]` from a repository to watch a PR. Registration records the current PR state first, so only later check failures, reviews, and comments are prompted into the agent tmux pane.
+
+      Use `guestctl pr list` to show registered PRs.
+
+      Use `guestctl pr unregister [pr-url-or-number]` to stop watching a PR.
+
+      EOF
+  - id: plugin.browser.claude_mcp
+    label: Configure Claude Code Playwright MCP
+    phase: user
+    depends_on:
+    - plugin.claude.config
+    - system.user_handoff
+    resources:
+    - agent_home
+    script: steps/plugin.browser.claude_mcp.sh
+    working_directory: /
+    timeout_seconds: 900
+    contents: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME="${HOME:-/data/home}"
+      . '/usr/local/lib/agentdp/env.sh'
+
+      mcp_js="$(mktemp)"
+      cat >"$mcp_js" <<'EOF'
+      const fs = require("fs");
+      const os = require("os");
+      const path = os.homedir() + "/.claude.json";
+      let config = {};
+      try { config = JSON.parse(fs.readFileSync(path, "utf8")); } catch {}
+      config.mcpServers = config.mcpServers || {};
+      config.mcpServers.playwright = JSON.parse(process.argv[2]);
+      fs.writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+      EOF
+      node "$mcp_js" '{"args":["--browser=chromium","--executable-path=/usr/bin/chromium","--viewport-size=1440x900"],"command":"playwright-mcp","env":{"PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH":"/usr/bin/chromium","PLAYWRIGHT_MCP_EXECUTABLE_PATH":"/usr/bin/chromium","PLAYWRIGHT_MCP_VIEWPORT_SIZE":"1440x900","PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD":"1"},"type":"stdio"}'
+      rm -f "$mcp_js"
   - id: user.custom_bootstrap
     label: Run custom bootstrap hook
     phase: user
     depends_on:
     - system.user_handoff
+    - plugin.claude.config
+    - plugin.browser.claude_mcp
     resources:
     - agent_home
     - code_dir

@@ -282,7 +282,7 @@ base:
       Type=simple
       Environment=AGENTDP_STATE_DIR=%h/.local/state/agentdp
       Environment=AGENTDP_PR_REGISTRY=%h/.local/state/agentdp/pr-watch.json
-      Environment=AGENTDP_CODEX_PANE_FILE=%h/.local/state/agentdp/codex-pane-id
+      Environment=AGENTDP_AGENT_PANE_FILE=%h/.local/state/agentdp/agent-pane-id
       ExecStart=/usr/local/bin/agentdp-agent-env /usr/local/bin/guestd
       Restart=always
       RestartSec=20

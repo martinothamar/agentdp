@@ -32,7 +32,7 @@ impl RuntimePaths {
             registry: env_path("AGENTDP_PR_REGISTRY").unwrap_or_else(|| state_dir.join("pr-watch.json")),
             seen: state_dir.join("pr-subscriber-seen.json"),
             queue_dir: state_dir.join("pr-subscriber-queue"),
-            pane_file: env_path("AGENTDP_CODEX_PANE_FILE").unwrap_or_else(|| state_dir.join("codex-pane-id")),
+            pane_file: env_path("AGENTDP_AGENT_PANE_FILE").unwrap_or_else(|| state_dir.join("agent-pane-id")),
             state_dir,
             code_dir,
         })
