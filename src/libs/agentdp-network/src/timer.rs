@@ -67,8 +67,19 @@ where
         self.schedule_at(timer, self.clock.now() + delay);
     }
 
+    pub(crate) fn schedule_after_if_earlier(&mut self, timer: TimerId, delay: Duration) {
+        self.schedule_at_if_earlier(timer, self.clock.now() + delay);
+    }
+
     pub(crate) const fn schedule_at(&mut self, timer: TimerId, deadline: Instant) {
         self.deadlines[timer.index()] = Some(deadline);
+    }
+
+    fn schedule_at_if_earlier(&mut self, timer: TimerId, deadline: Instant) {
+        let slot = &mut self.deadlines[timer.index()];
+        if slot.is_none_or(|current| deadline < current) {
+            *slot = Some(deadline);
+        }
     }
 
     pub(crate) const fn clear(&mut self, timer: TimerId) {
@@ -94,6 +105,18 @@ where
                 output.push(timer);
             }
         }
+    }
+
+    pub(crate) fn pop_next_expired(&mut self) -> Option<TimerId> {
+        let now = self.clock.now();
+        for timer in TimerId::ALL {
+            let deadline = &mut self.deadlines[timer.index()];
+            if deadline.is_some_and(|deadline| deadline <= now) {
+                *deadline = None;
+                return Some(timer);
+            }
+        }
+        None
     }
 }
 
@@ -127,5 +150,35 @@ mod tests {
         timers.pop_expired(&mut expired);
         assert_eq!(expired, vec![TimerId::GatewayPoll]);
         assert!(timers.next_timeout().is_some_and(|timeout| timeout > Duration::ZERO));
+    }
+
+    #[test]
+    fn pops_one_expired_timer_without_discarding_others() {
+        let mut timers = TimerQueue::new(TIMER_QUEUE_REQUIRED_CAPACITY, SystemClock).expect("valid timer queue");
+        let now = Instant::now();
+        let expired = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+        timers.schedule_at(TimerId::GatewayPoll, expired);
+        timers.schedule_at(TimerId::StatusPublish, expired);
+
+        assert_eq!(timers.pop_next_expired(), Some(TimerId::GatewayPoll));
+        assert_eq!(timers.next_timeout(), Some(Duration::ZERO));
+        assert_eq!(timers.pop_next_expired(), Some(TimerId::StatusPublish));
+        assert_eq!(timers.pop_next_expired(), None);
+    }
+
+    #[test]
+    fn schedule_if_earlier_does_not_postpone_existing_deadline() {
+        let mut timers = TimerQueue::new(TIMER_QUEUE_REQUIRED_CAPACITY, SystemClock).expect("valid timer queue");
+        let now = Instant::now();
+        timers.schedule_at(TimerId::GatewayPoll, now + Duration::from_millis(5));
+        timers.schedule_at_if_earlier(TimerId::GatewayPoll, now + Duration::from_millis(10));
+        assert!(
+            timers
+                .next_timeout()
+                .is_some_and(|timeout| timeout <= Duration::from_millis(5))
+        );
+
+        timers.schedule_at_if_earlier(TimerId::GatewayPoll, now);
+        assert_eq!(timers.next_timeout(), Some(Duration::ZERO));
     }
 }

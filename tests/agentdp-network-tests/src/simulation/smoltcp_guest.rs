@@ -34,6 +34,7 @@ pub struct SmolTcpGuest {
     sockets: SocketSet<'static>,
     now: SmolInstant,
     next_port: u16,
+    tcp_buffer_bytes: usize,
 }
 
 impl SmolTcpGuest {
@@ -61,6 +62,13 @@ impl SmolTcpGuest {
     ///
     /// Returns an error when the guest interface cannot install the configured route.
     pub fn new(link: GuestLink) -> Result<Self> {
+        Self::with_tcp_buffer_bytes(link, TCP_BUFFER_BYTES)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the guest interface cannot install the configured route.
+    pub fn with_tcp_buffer_bytes(link: GuestLink, tcp_buffer_bytes: usize) -> Result<Self> {
         let mut device = GuestDevice::default();
         let mut iface = Interface::new(
             InterfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(GUEST_MAC))),
@@ -82,6 +90,7 @@ impl SmolTcpGuest {
             sockets: SocketSet::new(Vec::new()),
             now: SmolInstant::ZERO,
             next_port: 49_152,
+            tcp_buffer_bytes,
         })
     }
 
@@ -169,8 +178,8 @@ impl SmolTcpGuest {
                 "smoltcp guest only supports IPv4 destinations: {dst}"
             )));
         };
-        let rx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
-        let tx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+        let rx = tcp::SocketBuffer::new(vec![0; self.tcp_buffer_bytes]);
+        let tx = tcp::SocketBuffer::new(vec![0; self.tcp_buffer_bytes]);
         let socket = tcp::Socket::new(rx, tx);
         let handle = self.sockets.add(socket);
         let local_port = self.take_port();
@@ -244,7 +253,10 @@ impl SmolTcpGuest {
             self.pump(running)?;
         }
         Err(Error::new(format!(
-            "{label}: exhausted after {DEFAULT_MAX_STEPS} guest drive steps; received {output:02x?}"
+            "{label}: exhausted after {DEFAULT_MAX_STEPS} guest drive steps; received {output:02x?}; status={:?}; pending_reactor_ready={}; debug={}",
+            running.status(),
+            running.pending_reactor_ready(),
+            running.debug_snapshot(),
         )))
     }
 
@@ -373,7 +385,7 @@ impl SmolTcpGuest {
         let socket = self.sockets.get_mut::<tcp::Socket>(handle.0);
         let mut buffer = [0_u8; 4096];
         while socket.can_recv() {
-            let read_len = TCP_BUFFER_BYTES.min(socket.recv_queue()).min(buffer.len());
+            let read_len = self.tcp_buffer_bytes.min(socket.recv_queue()).min(buffer.len());
             let read = socket
                 .recv_slice(&mut buffer[..read_len])
                 .map_err(|error| Error::new(format!("guest TCP receive: {error:?}")))?;

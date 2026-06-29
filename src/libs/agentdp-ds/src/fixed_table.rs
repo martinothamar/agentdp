@@ -3,6 +3,19 @@ pub struct FixedTable<K, V> {
     entries: Vec<Option<(K, V)>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedTableReserveError {
+    KeyExists,
+    Full,
+}
+
+#[must_use]
+pub struct FixedTableReservation<'a, K, V> {
+    table: &'a mut FixedTable<K, V>,
+    index: usize,
+    key: K,
+}
+
 impl<K, V> FixedTable<K, V>
 where
     K: Eq,
@@ -32,6 +45,28 @@ where
         };
         *entry = Some((key, value));
         Ok(None)
+    }
+
+    /// # Errors
+    ///
+    /// Returns `KeyExists` when the key is already present, or `Full` when no vacant slot exists.
+    pub fn reserve_vacant(&mut self, key: K) -> Result<FixedTableReservation<'_, K, V>, FixedTableReserveError> {
+        if self
+            .entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .any(|(existing_key, _value)| *existing_key == key)
+        {
+            return Err(FixedTableReserveError::KeyExists);
+        }
+        let Some(index) = self.entries.iter().position(Option::is_none) else {
+            return Err(FixedTableReserveError::Full);
+        };
+        Ok(FixedTableReservation {
+            table: self,
+            index,
+            key,
+        })
     }
 
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
@@ -83,6 +118,13 @@ where
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.entries.len()
+    }
+}
+
+impl<K, V> FixedTableReservation<'_, K, V> {
+    pub fn insert(self, value: V) {
+        debug_assert!(self.table.entries[self.index].is_none());
+        self.table.entries[self.index] = Some((self.key, value));
     }
 }
 

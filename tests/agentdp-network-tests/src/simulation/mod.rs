@@ -82,6 +82,10 @@ pub trait NetworkUnderTest {
 
 pub trait RunningNetwork {
     fn status(&self) -> InstanceNetworkStatus;
+    fn pending_reactor_ready(&self) -> usize;
+    fn debug_snapshot(&self) -> String {
+        String::new()
+    }
 
     /// # Errors
     ///
@@ -132,6 +136,14 @@ impl NetworkUnderTest for AgentdpNetworkSim {
 impl RunningNetwork for AgentdpRunningSim<GuestLink> {
     fn status(&self) -> InstanceNetworkStatus {
         self.status()
+    }
+
+    fn pending_reactor_ready(&self) -> usize {
+        self.pending_reactor_ready()
+    }
+
+    fn debug_snapshot(&self) -> String {
+        format!("tcp={}, buffers={}", self.tcp_snapshot(), self.buffer_snapshot())
     }
 
     fn stop(self) -> Result<StopReport> {

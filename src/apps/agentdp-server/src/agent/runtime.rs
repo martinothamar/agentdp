@@ -29,9 +29,10 @@ use agentdp_platform::text::Utf8Stream;
 use agentdp_platform::time;
 use agentdp_protocol::client_server::{
     AgentInstanceExecParams, AgentInstanceExecResult, AgentInstanceListItem, AgentInstanceLogsParams,
-    AgentInstanceLogsResult, AgentInstanceShellResult, LogFile,
+    AgentInstanceLogsResult, AgentInstanceShellResult, LogFile, LogFilter, NetworkLogKind,
 };
 use thiserror::Error as ThisError;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -51,6 +52,7 @@ const RECENT_EVENT_CAPACITY: usize = 128;
 const AGENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const INSTANCE_BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(15);
 const INSTANCE_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const LOG_TAIL_CHUNK_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentStreamItem {
@@ -166,6 +168,8 @@ pub(crate) enum Error {
     InvalidStatus { name: String, status: String },
     #[error("log line count must be greater than zero")]
     InvalidLogLines,
+    #[error("log filters are only supported for the instance event log")]
+    InvalidLogFilter,
     #[error("exec command must not be empty")]
     EmptyExecCommand,
     #[error("exec timeout must be greater than zero")]
@@ -824,7 +828,7 @@ impl RunningAgentState {
                 instance,
                 params,
                 respond,
-            } => self.start_instance_logs(instance, params.file, params.lines, respond),
+            } => self.start_instance_logs(instance, &params, respond),
             AgentCommand::InstanceExec {
                 context,
                 instance,
@@ -885,12 +889,17 @@ impl RunningAgentState {
     fn start_instance_logs(
         &self,
         id: AgentInstanceId,
-        file: LogFile,
-        lines: usize,
+        params: &AgentInstanceLogsParams,
         respond: oneshot::Sender<Result<AgentInstanceLogsResult, Error>>,
     ) {
+        let file = params.file;
+        let lines = params.lines;
         if lines == 0 {
             respond.try_send(Err(Error::InvalidLogLines));
+            return;
+        }
+        if params.filter.is_some() && file != LogFile::Events {
+            respond.try_send(Err(Error::InvalidLogFilter));
             return;
         }
         let Some(instance) = self.instances.get(&id).and_then(AgentInstanceState::running_ref) else {
@@ -905,20 +914,15 @@ impl RunningAgentState {
             LogFile::Serial | LogFile::Qemu => self.backend.log_path(&instance.documents.private.status.backend, file),
         };
         let document = instance.documents.private.clone();
+        let filter = params.filter;
         tokio::task::spawn_local(async move {
-            let result = async {
-                let contents = tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|source| Error::ReadLog {
-                        path: path.clone(),
-                        source,
-                    })?;
-                let log_lines = contents.split_inclusive('\n').collect::<Vec<_>>();
-                let start = log_lines.len().saturating_sub(lines);
-                Ok::<_, Error>(log_lines[start..].concat())
-            }
-            .await
-            .map(|contents| AgentInstanceLogsResult {
+            let contents = match filter {
+                Some(LogFilter::Network { errors, event_kind }) => {
+                    read_network_event_log_tail(&path, lines, errors, event_kind).await
+                }
+                None => read_log_tail(&path, lines).await,
+            };
+            let result = contents.map(|contents| AgentInstanceLogsResult {
                 name: document.name(),
                 file: file.as_str().to_owned(),
                 path: path.display().to_string(),
@@ -1269,20 +1273,14 @@ impl RunningAgentState {
                 generation,
                 document,
             } => {
-                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Starting, document, false);
+                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Starting, document, true);
             }
             WorkCompletion::InstanceReconciled {
                 id,
                 generation,
                 document,
             } => {
-                self.apply_instance_document_completion(
-                    id,
-                    generation,
-                    AgentInstanceWork::Reconciling,
-                    document,
-                    false,
-                );
+                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Reconciling, document, true);
             }
             WorkCompletion::InstanceStopped {
                 id,
@@ -2231,6 +2229,206 @@ impl RunningAgentState {
     fn publish(&mut self, item: &AgentStreamItem) {
         self.streams.retain_mut(|stream| stream.try_send(item.clone()).is_ok());
     }
+}
+
+async fn read_log_tail(path: &Path, lines: usize) -> Result<String, Error> {
+    let mut file = tokio::fs::File::open(path).await.map_err(|source| Error::ReadLog {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut offset = file
+        .metadata()
+        .await
+        .map_err(|source| Error::ReadLog {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let mut chunks = Vec::new();
+    let mut newline_count = 0usize;
+    while offset > 0 && newline_count <= lines {
+        let chunk_len = offset.min(LOG_TAIL_CHUNK_BYTES);
+        offset -= chunk_len;
+        let mut chunk = vec![0; chunk_len as usize];
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|source| Error::ReadLog {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        file.read_exact(&mut chunk).await.map_err(|source| Error::ReadLog {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        newline_count += count_byte(&chunk, b'\n');
+        chunks.push(chunk);
+    }
+    let total_len = chunks.iter().map(Vec::len).sum();
+    let mut bytes = Vec::with_capacity(total_len);
+    for chunk in chunks.iter().rev() {
+        bytes.extend_from_slice(chunk);
+    }
+    let start = tail_start(&bytes, lines);
+    String::from_utf8(bytes[start..].to_vec()).map_err(|source| Error::ReadLog {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })
+}
+
+async fn read_network_event_log_tail(
+    path: &Path,
+    lines: usize,
+    errors: bool,
+    kind: Option<NetworkLogKind>,
+) -> Result<String, Error> {
+    let mut file = tokio::fs::File::open(path).await.map_err(|source| Error::ReadLog {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut offset = file
+        .metadata()
+        .await
+        .map_err(|source| Error::ReadLog {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let mut leading_fragment = Vec::new();
+    let mut matched_lines = Vec::new();
+    while offset > 0 && matched_lines.len() < lines {
+        let chunk_len = offset.min(LOG_TAIL_CHUNK_BYTES);
+        offset -= chunk_len;
+        let mut chunk = vec![0; chunk_len as usize];
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|source| Error::ReadLog {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        file.read_exact(&mut chunk).await.map_err(|source| Error::ReadLog {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        chunk.extend_from_slice(&leading_fragment);
+
+        let complete_lines = if offset > 0 {
+            let Some(first_newline) = chunk.iter().position(|byte| *byte == b'\n') else {
+                leading_fragment = chunk;
+                continue;
+            };
+            leading_fragment.clear();
+            leading_fragment.extend_from_slice(&chunk[..first_newline]);
+            &chunk[first_newline + 1..]
+        } else {
+            leading_fragment.clear();
+            &chunk[..]
+        };
+
+        for line in complete_lines.rsplit(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if network_event_line_matches(path, line, errors, kind)? {
+                matched_lines.push(line.to_vec());
+                if matched_lines.len() == lines {
+                    break;
+                }
+            }
+        }
+    }
+
+    matched_lines.reverse();
+    let mut bytes = Vec::with_capacity(matched_lines.iter().map(Vec::len).sum::<usize>() + matched_lines.len());
+    for line in matched_lines {
+        bytes.extend_from_slice(&line);
+        bytes.push(b'\n');
+    }
+    String::from_utf8(bytes).map_err(|source| Error::ReadLog {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })
+}
+
+fn network_event_line_matches(
+    path: &Path,
+    line: &[u8],
+    errors: bool,
+    kind: Option<NetworkLogKind>,
+) -> Result<bool, Error> {
+    let envelope = serde_json::from_slice::<AgentInstanceEventEnvelope>(line).map_err(|source| Error::ReadLog {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })?;
+    let AgentInstanceEvent::NetworkEvent(event) = &envelope.event else {
+        return Ok(false);
+    };
+    if errors && !network_event_is_error(&event.event) {
+        return Ok(false);
+    }
+    if let Some(kind) = kind
+        && network_log_kind(&event.event) != kind
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+const fn network_log_kind(event: &AgentInstanceNetworkEventKind) -> NetworkLogKind {
+    match event {
+        AgentInstanceNetworkEventKind::LifecycleStateChanged { .. } => NetworkLogKind::Lifecycle,
+        AgentInstanceNetworkEventKind::TelemetrySnapshot { .. } => NetworkLogKind::Telemetry,
+        AgentInstanceNetworkEventKind::TransportConnectFailed { .. }
+        | AgentInstanceNetworkEventKind::TransportGuestConnected { .. }
+        | AgentInstanceNetworkEventKind::TransportGuestDisconnected { .. }
+        | AgentInstanceNetworkEventKind::TransportRegisterFailed { .. } => NetworkLogKind::Transport,
+        AgentInstanceNetworkEventKind::EgressError { .. } | AgentInstanceNetworkEventKind::EgressProxyClosed { .. } => {
+            NetworkLogKind::Egress
+        }
+        AgentInstanceNetworkEventKind::DnsResolved { .. } => NetworkLogKind::Dns,
+        AgentInstanceNetworkEventKind::HostPortBound { .. } | AgentInstanceNetworkEventKind::HostPortError { .. } => {
+            NetworkLogKind::HostPort
+        }
+        AgentInstanceNetworkEventKind::ReactorError { .. } => NetworkLogKind::Reactor,
+    }
+}
+
+fn network_event_is_error(event: &AgentInstanceNetworkEventKind) -> bool {
+    match event {
+        AgentInstanceNetworkEventKind::LifecycleStateChanged { state } => state == "backoff" || state == "failed",
+        AgentInstanceNetworkEventKind::TransportConnectFailed { .. }
+        | AgentInstanceNetworkEventKind::TransportGuestDisconnected { .. }
+        | AgentInstanceNetworkEventKind::TransportRegisterFailed { .. }
+        | AgentInstanceNetworkEventKind::EgressError { .. }
+        | AgentInstanceNetworkEventKind::HostPortError { .. }
+        | AgentInstanceNetworkEventKind::ReactorError { .. } => true,
+        AgentInstanceNetworkEventKind::TelemetrySnapshot { .. }
+        | AgentInstanceNetworkEventKind::TransportGuestConnected { .. }
+        | AgentInstanceNetworkEventKind::EgressProxyClosed { .. }
+        | AgentInstanceNetworkEventKind::DnsResolved { .. }
+        | AgentInstanceNetworkEventKind::HostPortBound { .. } => false,
+    }
+}
+
+fn tail_start(bytes: &[u8], lines: usize) -> usize {
+    let mut seen = 0usize;
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        if bytes[index] == b'\n' {
+            if index + 1 == bytes.len() {
+                continue;
+            }
+            seen += 1;
+            if seen == lines {
+                return index + 1;
+            }
+        }
+    }
+    0
+}
+
+fn count_byte(bytes: &[u8], needle: u8) -> usize {
+    bytes.iter().fold(0, |count, byte| count + usize::from(*byte == needle))
 }
 
 fn spawn_prepare_base(input: inbox::Sender<AgentInput>, context: Context, document: AgentDocument, generation: u64) {

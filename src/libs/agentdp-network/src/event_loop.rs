@@ -6,7 +6,7 @@ use crate::buffers::BufferPoolSnapshot;
 use crate::buffers::{BufferPool, FrameBuf};
 use crate::clock::NetworkClock as _;
 use crate::command::{NetworkCommand, NetworkCommandSource};
-use crate::drive::DriveBudget;
+use crate::drive::{DriveBudget, DriveReport, DriveTurn};
 use crate::egress::tcp::{TcpProxies, TcpProxyEvent};
 use crate::egress::udp::{UdpProxies, UdpProxyEvent};
 use crate::events::{
@@ -14,13 +14,13 @@ use crate::events::{
     NetworkEventSink, NetworkEventText, NetworkHostPortEvent, NetworkLifecycleEvent, NetworkReactorEvent,
     NetworkStateEvent, NetworkTelemetryEvent, NetworkTelemetrySnapshot, NetworkTransportEvent,
 };
-use crate::gateway::Gateway;
-use crate::guest::{ConnectStatus, GuestEvent, GuestFrameTransport, GuestIo, TransportError};
+use crate::gateway::{Gateway, GatewayOutputs, GuestFrameIngest, UdpFrameWrite};
+use crate::guest::{ConnectStatus, GuestEvent, GuestFrameEnqueue, GuestFrameTransport, GuestIo};
 use crate::ingress::TcpConnections;
 use crate::ingress::UdpPeers;
 use crate::ingress::{HostPortEvent, HostPorts};
 use crate::network::{
-    EgressUdpSend, HostConnectionId, IngressTcpWrite, IngressUdpSend, InstanceNetworkError, InstanceNetworkSpec,
+    EgressUdpSend, HostConnectionId, IngressTcpOutput, IngressUdpSend, InstanceNetworkError, InstanceNetworkSpec,
     InstanceNetworkState, InstanceNetworkStatus,
 };
 use crate::reactor::{ProductionWake, ReactorBackend, ReactorReady};
@@ -63,6 +63,13 @@ where
     ///
     /// Returns an error when the production runtime cannot be created or the event loop cannot initialize.
     pub fn new(spec: InstanceNetworkSpec, transport: T, outputs: O, commands: C) -> Result<Self, InstanceNetworkError> {
+        spec.config
+            .limits
+            .validate_for_event_loop()
+            .map_err(|message| InstanceNetworkError::TaskFailed {
+                label: spec.label.clone(),
+                message,
+            })?;
         let runtime = production_runtime(transport, spec.config.limits.reactor_event_capacity).map_err(|error| {
             InstanceNetworkError::TaskFailed {
                 label: spec.label.clone(),
@@ -98,10 +105,6 @@ impl ComponentEvents {
             egress_udp: Vec::with_capacity(capacity),
         }
     }
-
-    const fn is_empty(&self) -> bool {
-        self.guest.is_empty() && self.host_ports.is_empty() && self.egress_tcp.is_empty() && self.egress_udp.is_empty()
-    }
 }
 
 struct ComponentOutputQueues {
@@ -115,8 +118,7 @@ struct ComponentOutputQueues {
     // back to the guest transport.
     guest_frames: Vec<FrameBuf>,
     egress_udp_sends: Vec<EgressUdpSend>,
-    ingress_tcp_writes: Vec<IngressTcpWrite>,
-    ingress_tcp_closes: Vec<HostConnectionId>,
+    ingress_tcp: Vec<IngressTcpOutput>,
     ingress_udp_sends: Vec<IngressUdpSend>,
 }
 
@@ -125,18 +127,9 @@ impl ComponentOutputQueues {
         Self {
             guest_frames: Vec::with_capacity(capacity),
             egress_udp_sends: Vec::with_capacity(capacity),
-            ingress_tcp_writes: Vec::with_capacity(capacity),
-            ingress_tcp_closes: Vec::with_capacity(capacity),
+            ingress_tcp: Vec::with_capacity(capacity),
             ingress_udp_sends: Vec::with_capacity(capacity),
         }
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.guest_frames.is_empty()
-            && self.egress_udp_sends.is_empty()
-            && self.ingress_tcp_writes.is_empty()
-            && self.ingress_tcp_closes.is_empty()
-            && self.ingress_udp_sends.is_empty()
     }
 }
 
@@ -161,6 +154,7 @@ where
     buffers: BufferPool,
     component_outputs: ComponentOutputQueues,
     component_events: ComponentEvents,
+    ingress_tcp_blocked_reads: Vec<HostConnectionId>,
     reactor_ready: Vec<ReactorReady>,
     timers: TimerQueue<R::Clock>,
     expired_timers: Vec<TimerId>,
@@ -183,6 +177,12 @@ where
         outputs: O,
     ) -> Result<Self, InstanceNetworkError> {
         let limits = spec.config.limits.clone();
+        limits
+            .validate_for_event_loop()
+            .map_err(|message| InstanceNetworkError::TaskFailed {
+                label: spec.label.clone(),
+                message,
+            })?;
         let buffers = BufferPool::new(limits.clone());
         buffers.prewarm_instance_network();
         let mut timers = TimerQueue::new(limits.timer_queue_capacity, runtime.clock().clone()).map_err(|error| {
@@ -209,6 +209,7 @@ where
             buffers,
             component_outputs: ComponentOutputQueues::with_capacity(limits.component_output_batch_capacity),
             component_events: ComponentEvents::with_capacity(limits.component_event_batch_capacity),
+            ingress_tcp_blocked_reads: Vec::with_capacity(limits.ingress_tcp_connection_limit),
             reactor_ready: Vec::with_capacity(limits.component_event_batch_capacity),
             timers,
             expired_timers: Vec::with_capacity(TIMER_QUEUE_REQUIRED_CAPACITY),
@@ -282,9 +283,8 @@ where
         // Commands are the only control-plane input in the hot connected loop.
         // The dataplane itself communicates by filling component_events and
         // component_outputs below.
-        match self.commands.try_recv() {
-            Some(command) if stop_requested(Some(&command)) => return DriveOutcome::Stop,
-            Some(_) | None => {}
+        if matches!(self.commands.try_recv(), Some(NetworkCommand::Stop)) {
+            return DriveOutcome::Stop;
         }
 
         // First drain work that is already known without blocking in the
@@ -292,42 +292,51 @@ where
         // gateway poll work, and expired timers. This keeps write-heavy flows
         // moving even when no new readiness event is needed.
         let mut budget = DriveBudget::event_loop(&self.spec.config.limits);
-        let mut made_progress = false;
-        if let Some(guest) = &mut self.guest {
-            match guest.drive_queued(&mut budget, &self.runtime) {
-                Ok(result) => made_progress |= result,
-                Err(error) => {
-                    self.guest_disconnect = Some((self.generation, error.to_string()));
-                }
+        let mut queued_report = DriveReport::new();
+        let (queued_timer_progress, queued_output_progress) = {
+            let mut drive = DriveTurn::new(&mut budget, &mut queued_report);
+            if let Some(guest) = &mut self.guest
+                && let Err(error) = guest.drive_queued(&mut self.component_events.guest, &mut drive, &self.runtime)
+            {
+                self.guest_disconnect = Some((self.generation, error.to_string()));
             }
-        }
-        if let Some(host_ports) = &mut self.host_ports {
-            made_progress |=
-                host_ports.drive_queued(&mut self.component_events.host_ports, &mut budget, &mut self.runtime);
-        }
-        made_progress |=
+            if let Some(host_ports) = &mut self.host_ports {
+                self.gateway
+                    .ingress_tcp_guest_send_blocked(&self.ingress_tcp, &mut self.ingress_tcp_blocked_reads);
+                host_ports.drive_queued(
+                    &self.ingress_tcp_blocked_reads,
+                    &mut self.component_events.host_ports,
+                    &mut drive,
+                    &mut self.runtime,
+                );
+            }
             self.egress_udp
-                .drive_queued(&mut self.component_events.egress_udp, &mut budget, &mut self.runtime);
-        made_progress |= self.drive_queued_tcp(&mut budget);
-        made_progress |= self.process_component_outputs();
-        made_progress |= self.drive_expired_timers();
+                .drive_queued(&mut self.component_events.egress_udp, &mut drive, &mut self.runtime);
+            self.drive_queued_tcp(&mut drive);
+            let before_timers = drive.progress();
+            self.drive_expired_timers(&mut drive);
+            let timer_progress = drive.progress() != before_timers;
+            let before_outputs = drive.progress();
+            self.process_component_outputs(&mut drive);
+            let output_progress = drive.progress() != before_outputs;
+            (timer_progress, output_progress)
+        };
+        let followup_progress = queued_output_progress || queued_timer_progress;
+        let made_progress = queued_report.made_progress() || followup_progress;
         if let Some((generation, reason)) = self.got_disconnected() {
             self.backoff_connected(generation, reason);
             return DriveOutcome::Reconnect;
         }
-        // A non-blocking call is used by tests/simulation and by callers that
-        // want one bounded turn. If we made progress, return now so the caller
-        // can observe the intermediate state instead of immediately polling.
-        if made_progress && poll_timeout.is_none() {
-            return DriveOutcome::Continue;
-        }
-
         // No local work is ready, so publish pending output, wait for reactor
         // readiness or the next timer, then drive the components that own those
         // ready items. Any new side effects produced by readiness are flushed at
         // the end of this same turn.
         self.refresh_timers();
-        let timeout = poll_timeout.or_else(|| self.timers.next_timeout());
+        let timeout = if made_progress {
+            Some(Duration::ZERO)
+        } else {
+            poll_timeout.or_else(|| self.timers.next_timeout())
+        };
         if let Err(message) = self.wait_reactor(timeout) {
             self.record_reactor_error(message);
             self.publish();
@@ -336,33 +345,48 @@ where
 
         let readiness = std::mem::take(&mut self.reactor_ready);
         let mut budget = DriveBudget::event_loop(&self.spec.config.limits);
-        if let Some(guest) = &mut self.guest
-            && let Err(error) =
-                guest.drive_ready(&readiness, &mut self.component_events.guest, &mut budget, &self.runtime)
-        {
-            self.guest_disconnect = Some((self.generation, error.to_string()));
-        }
-        if let Some(host_ports) = &mut self.host_ports {
-            let _progress = host_ports.drive_ready(
+        let mut ready_report = DriveReport::new();
+        let (ready_timer_progress, ready_output_progress) = {
+            let mut drive = DriveTurn::new(&mut budget, &mut ready_report);
+            if let Some(guest) = &mut self.guest
+                && let Err(error) =
+                    guest.drive_ready(&readiness, &mut self.component_events.guest, &mut drive, &self.runtime)
+            {
+                self.guest_disconnect = Some((self.generation, error.to_string()));
+            }
+            if let Some(host_ports) = &mut self.host_ports {
+                self.gateway
+                    .ingress_tcp_guest_send_blocked(&self.ingress_tcp, &mut self.ingress_tcp_blocked_reads);
+                host_ports.drive_ready(
+                    &readiness,
+                    &self.ingress_tcp_blocked_reads,
+                    &mut self.component_events.host_ports,
+                    &mut drive,
+                    &mut self.runtime,
+                );
+            }
+            self.drive_ready_tcp(&readiness, &mut drive);
+            self.egress_udp.drive_ready(
                 &readiness,
-                &mut self.component_events.host_ports,
-                &mut budget,
+                &mut self.component_events.egress_udp,
+                &mut drive,
                 &mut self.runtime,
             );
-        }
-        let _tcp_progress = self.drive_ready_tcp(&readiness, &mut budget);
-        let _udp_progress = self.egress_udp.drive_ready(
-            &readiness,
-            &mut self.component_events.egress_udp,
-            &mut budget,
-            &mut self.runtime,
-        );
-        self.reactor_ready = readiness;
-        let _timers = self.drive_expired_timers();
-        let _outputs = self.process_component_outputs();
+            self.reactor_ready = readiness;
+            let before_timers = drive.progress();
+            self.drive_expired_timers(&mut drive);
+            let timer_progress = drive.progress() != before_timers;
+            let before_outputs = drive.progress();
+            self.process_component_outputs(&mut drive);
+            let output_progress = drive.progress() != before_outputs;
+            (timer_progress, output_progress)
+        };
         if let Some((generation, reason)) = self.got_disconnected() {
             self.backoff_connected(generation, reason);
             return DriveOutcome::Reconnect;
+        }
+        if should_retry_local(&ready_report, ready_output_progress || ready_timer_progress) {
+            return DriveOutcome::Continue;
         }
         DriveOutcome::Continue
     }
@@ -380,6 +404,17 @@ where
     #[cfg(any(test, feature = "simulation"))]
     pub(crate) fn active_tcp_proxy_slots(&self) -> usize {
         self.egress_tcp.active_proxy_slots()
+    }
+
+    #[cfg(any(test, feature = "simulation"))]
+    pub(crate) fn queue_guest_frame_for_test(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let mut frame = self
+            .buffers
+            .try_frame_with_capacity(bytes.len())
+            .map_err(|error| error.to_string())?;
+        frame.as_mut_vec().extend_from_slice(bytes);
+        self.component_outputs.guest_frames.push(frame);
+        Ok(())
     }
 
     fn run_until_stopped(&mut self) -> NetworkExit {
@@ -445,169 +480,203 @@ where
             .map_err(|error| error.to_string())
     }
 
-    fn drive_queued_tcp(&mut self, budget: &mut DriveBudget) -> bool {
-        let made_progress = self.egress_tcp.drive_queued(
+    fn drive_queued_tcp(&mut self, drive: &mut DriveTurn<'_>) {
+        self.egress_tcp.drive_queued(
             &mut self.gateway,
             &mut self.component_events.egress_tcp,
-            budget,
+            drive,
             &mut self.runtime,
         );
-        if made_progress {
-            self.gateway.poll(&mut self.component_outputs.guest_frames);
-        }
-        made_progress
+        self.gateway.poll(&mut self.component_outputs.guest_frames, drive);
     }
 
-    fn drive_ready_tcp(&mut self, readiness: &[ReactorReady], budget: &mut DriveBudget) -> bool {
-        let made_progress = self.egress_tcp.drive_ready(
+    fn drive_ready_tcp(&mut self, readiness: &[ReactorReady], drive: &mut DriveTurn<'_>) {
+        self.egress_tcp.drive_ready(
             &mut self.gateway,
             readiness,
             &mut self.component_events.egress_tcp,
-            budget,
+            drive,
             &mut self.runtime,
         );
-        if made_progress {
-            self.gateway.poll(&mut self.component_outputs.guest_frames);
-        }
-        made_progress
+        self.gateway.poll(&mut self.component_outputs.guest_frames, drive);
     }
 
-    fn drive_tcp_with_gateway(&mut self) -> bool {
-        let mut budget = DriveBudget::event_loop(&self.spec.config.limits);
-        let made_progress = self.egress_tcp.drive_gateway(
+    fn drive_tcp_with_gateway(&mut self, drive: &mut DriveTurn<'_>) {
+        self.egress_tcp.drive_gateway(
             &mut self.gateway,
             &[],
             &mut self.component_events.egress_tcp,
-            &mut budget,
+            drive,
             &mut self.runtime,
         );
-        if made_progress {
-            self.gateway.poll(&mut self.component_outputs.guest_frames);
-        }
-        made_progress
+        self.gateway.poll(&mut self.component_outputs.guest_frames, drive);
     }
-    fn relay_ingress_tcp_from_gateway(&mut self) -> bool {
-        let start_writes = self.component_outputs.ingress_tcp_writes.len();
-        let start_closes = self.component_outputs.ingress_tcp_closes.len();
+    fn relay_ingress_tcp_from_gateway(&mut self, drive: &mut DriveTurn<'_>) -> bool {
+        let start_ingress_tcp = self.component_outputs.ingress_tcp.len();
         let start_frames = self.component_outputs.guest_frames.len();
         self.gateway.relay_ingress_tcp_guest_bytes(
             &mut self.ingress_tcp,
-            &mut self.component_outputs.ingress_tcp_writes,
-            &mut self.component_outputs.ingress_tcp_closes,
+            &mut self.component_outputs.ingress_tcp,
             &mut self.component_outputs.guest_frames,
+            drive,
         );
-        self.component_outputs.ingress_tcp_writes.len() > start_writes
-            || self.component_outputs.ingress_tcp_closes.len() > start_closes
+        self.component_outputs.ingress_tcp.len() > start_ingress_tcp
             || self.component_outputs.guest_frames.len() > start_frames
     }
 
-    fn process_component_outputs(&mut self) -> bool {
-        let made_progress = !self.component_events.is_empty() || !self.component_outputs.is_empty();
-        self.process_component_events();
-        self.send_guest_frames();
-        self.send_egress_udp_datagrams();
-        self.write_ingress_tcp_bytes();
-        self.close_ingress_tcp_connections();
-        self.send_ingress_udp_datagrams();
-        self.flush_outputs();
-        made_progress
+    fn process_component_outputs(&mut self, drive: &mut DriveTurn<'_>) {
+        self.process_component_events(drive);
+        self.send_guest_frames(drive);
+        self.send_egress_udp_datagrams(drive);
+        self.process_ingress_tcp_outputs(drive);
+        self.send_ingress_udp_datagrams(drive);
+        self.outputs.flush();
     }
 
-    fn process_component_events(&mut self) {
+    fn process_component_events(&mut self, drive: &mut DriveTurn<'_>) {
         // Handlers may enqueue more component events. Taking one queue at a time
         // keeps the current batch stable and makes re-entrant appends visible on
         // the next drive turn.
-        let mut guest = std::mem::take(&mut self.component_events.guest);
-        consume_events(&mut guest, |event| self.handle_guest_event(event));
+        let mut guest = take_fifo(&mut self.component_events.guest);
+        while let Some(event) = guest.pop() {
+            if let Some(event) = self.handle_guest_event(event, drive) {
+                guest.push(event);
+                break;
+            }
+        }
+        guest.reverse();
         self.component_events.guest = guest;
 
-        let mut host_ports = std::mem::take(&mut self.component_events.host_ports);
-        consume_events(&mut host_ports, |event| self.handle_host_port_event(event));
+        let mut host_ports = take_fifo(&mut self.component_events.host_ports);
+        while let Some(event) = host_ports.pop() {
+            if let Some(event) = self.handle_host_port_event(event, drive) {
+                host_ports.push(event);
+                break;
+            }
+        }
+        host_ports.reverse();
         self.component_events.host_ports = host_ports;
 
         let mut egress_tcp = std::mem::take(&mut self.component_events.egress_tcp);
         consume_events(&mut egress_tcp, |event| self.handle_tcp_event(event));
         self.component_events.egress_tcp = egress_tcp;
 
-        let mut egress_udp = std::mem::take(&mut self.component_events.egress_udp);
-        consume_events(&mut egress_udp, |event| self.handle_udp_event(event));
+        let mut egress_udp = take_fifo(&mut self.component_events.egress_udp);
+        while let Some(event) = egress_udp.pop() {
+            if let Some(event) = self.handle_udp_event(event, drive) {
+                egress_udp.push(event);
+                break;
+            }
+        }
+        egress_udp.reverse();
         self.component_events.egress_udp = egress_udp;
     }
 
-    fn flush_outputs(&mut self) {
-        self.outputs.flush();
-    }
-
-    fn handle_guest_event(&mut self, event: GuestEvent) {
+    fn handle_guest_event(&mut self, event: GuestEvent, drive: &mut DriveTurn<'_>) -> Option<GuestEvent> {
         match event {
             GuestEvent::Frame { generation, frame } if generation == self.generation => {
                 // A frame from the guest may be egress traffic to an upstream
                 // server, a response on a host-port ingress flow, or a local
                 // gateway protocol packet. Gateway classifies it and appends the
                 // resulting side effects to component_outputs.
+                let frame_len = frame.len();
+                {
+                    let mut outputs = GatewayOutputs::new(
+                        &mut self.component_outputs.egress_udp_sends,
+                        &mut self.component_outputs.ingress_udp_sends,
+                        &mut self.component_outputs.guest_frames,
+                    );
+                    let ingest = self.gateway.ingest_guest_frame(
+                        &mut self.egress_tcp,
+                        &self.ingress_udp,
+                        frame,
+                        &mut outputs,
+                        drive,
+                    );
+                    if let GuestFrameIngest::Blocked(frame) = ingest {
+                        return Some(GuestEvent::Frame { generation, frame });
+                    }
+                }
                 self.status
                     .telemetry
-                    .record_guest_frame(frame.len(), self.runtime.clock());
+                    .record_guest_frame(frame_len, self.runtime.clock());
                 self.status_dirty = true;
                 if matches!(self.status.state, InstanceNetworkState::Connected { generation: current } if current == generation)
                 {
                     self.set_state(InstanceNetworkState::TrafficObserved { generation });
                 }
-                self.gateway.ingest_guest_frame(
-                    &mut self.egress_tcp,
-                    &self.ingress_udp,
-                    frame,
-                    &mut self.component_outputs.egress_udp_sends,
-                    &mut self.component_outputs.ingress_udp_sends,
-                    &mut self.component_outputs.guest_frames,
-                );
-                self.drive_tcp_with_gateway();
-                self.relay_ingress_tcp_from_gateway();
+                self.drive_tcp_with_gateway(drive);
+                self.relay_ingress_tcp_from_gateway(drive);
+                None
             }
             GuestEvent::Disconnected { generation, result } if generation == self.generation => {
-                self.guest_disconnect = Some((generation, disconnect_reason(result)));
+                let reason = match result {
+                    Ok(()) => "guest transport closed".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                self.guest_disconnect = Some((generation, reason));
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
-    fn handle_host_port_event(&mut self, event: HostPortEvent) {
+    fn handle_host_port_event(&mut self, event: HostPortEvent, drive: &mut DriveTurn<'_>) -> Option<HostPortEvent> {
         match event {
             HostPortEvent::TcpAccepted { port, connection } => {
-                self.gateway.accept_ingress_tcp(
-                    &mut self.ingress_tcp,
-                    port,
-                    connection,
-                    &mut self.component_outputs.ingress_tcp_closes,
-                    &mut self.component_outputs.guest_frames,
-                );
-                self.relay_ingress_tcp_from_gateway();
+                let accepted = {
+                    self.gateway.accept_ingress_tcp(
+                        &mut self.ingress_tcp,
+                        port,
+                        connection,
+                        &mut self.component_outputs.ingress_tcp,
+                        &mut self.component_outputs.guest_frames,
+                        drive,
+                    )
+                };
+                if !accepted {
+                    return Some(HostPortEvent::TcpAccepted { port, connection });
+                }
+                self.relay_ingress_tcp_from_gateway(drive);
+                None
             }
             HostPortEvent::TcpBytes { connection, bytes } => {
-                self.gateway.write_ingress_tcp(
-                    &mut self.ingress_tcp,
-                    connection,
-                    bytes,
-                    &mut self.component_outputs.guest_frames,
-                );
-                self.relay_ingress_tcp_from_gateway();
+                {
+                    self.gateway.write_ingress_tcp(
+                        &mut self.ingress_tcp,
+                        connection,
+                        bytes,
+                        &mut self.component_outputs.guest_frames,
+                        drive,
+                    );
+                }
+                self.relay_ingress_tcp_from_gateway(drive);
+                None
             }
             HostPortEvent::TcpClosed { connection } => {
-                self.gateway.close_ingress_tcp(
-                    &mut self.ingress_tcp,
-                    connection,
-                    &mut self.component_outputs.guest_frames,
-                );
-                self.relay_ingress_tcp_from_gateway();
+                {
+                    self.gateway.close_ingress_tcp(
+                        &mut self.ingress_tcp,
+                        connection,
+                        &mut self.component_outputs.guest_frames,
+                        drive,
+                    );
+                }
+                self.relay_ingress_tcp_from_gateway(drive);
+                None
             }
             HostPortEvent::UdpDatagram { port, peer, bytes } => {
-                self.gateway.ingest_ingress_udp_datagram(
+                match self.gateway.ingest_ingress_udp_datagram(
                     &mut self.ingress_udp,
                     port,
                     peer,
                     &bytes,
                     &mut self.component_outputs.guest_frames,
-                );
+                    drive,
+                ) {
+                    UdpFrameWrite::Queued | UdpFrameWrite::Dropped => None,
+                    UdpFrameWrite::Blocked => Some(HostPortEvent::UdpDatagram { port, peer, bytes }),
+                }
             }
             HostPortEvent::Error { message } => {
                 self.emit_event(NetworkEvent::HostPort(NetworkHostPortEvent::Error {
@@ -615,6 +684,7 @@ where
                 }));
                 self.status.telemetry.record_egress_error(message, self.runtime.clock());
                 self.publish();
+                None
             }
         }
     }
@@ -667,17 +737,27 @@ where
         }
     }
 
-    fn handle_udp_event(&mut self, event: UdpProxyEvent) {
+    fn handle_udp_event(&mut self, event: UdpProxyEvent, drive: &mut DriveTurn<'_>) -> Option<UdpProxyEvent> {
         match event {
             UdpProxyEvent::Bytes { proxy, bytes, is_dns } => {
-                self.gateway
-                    .write_udp_response(proxy, &bytes, is_dns, &mut self.component_outputs.guest_frames);
+                match self.gateway.write_udp_response(
+                    proxy,
+                    &bytes,
+                    is_dns,
+                    &mut self.component_outputs.guest_frames,
+                    drive,
+                ) {
+                    UdpFrameWrite::Queued => None,
+                    UdpFrameWrite::Blocked => Some(UdpProxyEvent::Bytes { proxy, bytes, is_dns }),
+                    UdpFrameWrite::Dropped => unreachable!("egress UDP responses are not policy-dropped"),
+                }
             }
             UdpProxyEvent::Closed => {
                 self.emit_event(NetworkEvent::Egress(NetworkEgressEvent::ProxyClosed {
                     protocol: NetworkEgressProtocol::Udp,
                     proxy: None,
                 }));
+                None
             }
             UdpProxyEvent::DnsResolved { host, addresses, ttl } => {
                 self.emit_event(NetworkEvent::Dns(NetworkDnsEvent::Resolved {
@@ -687,6 +767,7 @@ where
                     ttl,
                 }));
                 self.gateway.record_dns_resolution(&host, addresses, ttl);
+                None
             }
             UdpProxyEvent::Error { message } => {
                 self.emit_event(NetworkEvent::Egress(NetworkEgressEvent::error(
@@ -701,64 +782,94 @@ where
                 )));
                 self.status.telemetry.record_egress_error(message, self.runtime.clock());
                 self.publish();
+                None
             }
         }
     }
 
-    fn send_guest_frames(&mut self) {
+    fn send_guest_frames(&mut self, drive: &mut DriveTurn<'_>) {
         // All protocol paths that produce packets for the guest converge here:
         // upstream responses, host-port ingress traffic, DNS replies, ARP, and
         // TCP state-machine packets from smoltcp.
         let mut frames = take_fifo(&mut self.component_outputs.guest_frames);
         while let Some(frame) = frames.pop() {
-            self.status
-                .telemetry
-                .record_host_frame(frame.len(), self.runtime.clock());
-            self.status_dirty = true;
-            if let Some(guest) = &mut self.guest
-                && let Err(error) = guest.send(frame, &self.runtime)
-            {
-                self.guest_disconnect = Some((self.generation, error.to_string()));
+            let frame_len = frame.len();
+            let Some(guest) = &mut self.guest else {
+                continue;
+            };
+            match guest.enqueue(frame, drive, &self.runtime) {
+                Ok(GuestFrameEnqueue::Queued) => {}
+                Ok(GuestFrameEnqueue::Blocked(frame)) => {
+                    frames.push(frame);
+                    break;
+                }
+                Err(error) => {
+                    self.guest_disconnect = Some((self.generation, error.to_string()));
+                    break;
+                }
             }
+            self.status.telemetry.record_host_frame(frame_len, self.runtime.clock());
+            self.status_dirty = true;
         }
+        frames.reverse();
         self.component_outputs.guest_frames = frames;
     }
 
-    fn send_egress_udp_datagrams(&mut self) {
+    fn send_egress_udp_datagrams(&mut self, drive: &mut DriveTurn<'_>) {
         let mut sends = take_fifo(&mut self.component_outputs.egress_udp_sends);
         while let Some(send) = sends.pop() {
-            self.egress_udp.send(send.proxy, send.bytes, send.is_dns);
+            if let Err(send) = drive.apply_component_output(send, |send| {
+                self.egress_udp.send(send.proxy, send.bytes, send.is_dns);
+            }) {
+                sends.push(send);
+                break;
+            }
         }
+        sends.reverse();
         self.component_outputs.egress_udp_sends = sends;
     }
 
-    fn write_ingress_tcp_bytes(&mut self) {
-        let mut writes = take_fifo(&mut self.component_outputs.ingress_tcp_writes);
-        while let Some(write) = writes.pop() {
-            if let Some(host_ports) = &mut self.host_ports {
-                host_ports.write_tcp(write.connection, write.bytes, &self.runtime);
+    fn process_ingress_tcp_outputs(&mut self, drive: &mut DriveTurn<'_>) {
+        let mut outputs = take_fifo(&mut self.component_outputs.ingress_tcp);
+        while let Some(output) = outputs.pop() {
+            if let Err(output) = drive.apply_component_output(output, |output| match output {
+                IngressTcpOutput::Write { connection, bytes } => {
+                    if let Some(host_ports) = &mut self.host_ports {
+                        host_ports.write_tcp(connection, bytes, &self.runtime);
+                    }
+                }
+                IngressTcpOutput::FinishWrite { connection } => {
+                    if let Some(host_ports) = &mut self.host_ports {
+                        host_ports.finish_tcp_write(connection);
+                    }
+                }
+                IngressTcpOutput::Close { connection } => {
+                    if let Some(host_ports) = &mut self.host_ports {
+                        host_ports.close_tcp(connection, &mut self.runtime);
+                    }
+                }
+            }) {
+                outputs.push(output);
+                break;
             }
         }
-        self.component_outputs.ingress_tcp_writes = writes;
+        outputs.reverse();
+        self.component_outputs.ingress_tcp = outputs;
     }
 
-    fn close_ingress_tcp_connections(&mut self) {
-        let mut closes = take_fifo(&mut self.component_outputs.ingress_tcp_closes);
-        while let Some(connection) = closes.pop() {
-            if let Some(host_ports) = &mut self.host_ports {
-                host_ports.close_tcp(connection, &mut self.runtime);
-            }
-        }
-        self.component_outputs.ingress_tcp_closes = closes;
-    }
-
-    fn send_ingress_udp_datagrams(&mut self) {
+    fn send_ingress_udp_datagrams(&mut self, drive: &mut DriveTurn<'_>) {
         let mut sends = take_fifo(&mut self.component_outputs.ingress_udp_sends);
         while let Some(send) = sends.pop() {
-            if let Some(host_ports) = &mut self.host_ports {
-                host_ports.send_udp(send.port, send.peer, send.bytes, &self.runtime);
+            if let Err(send) = drive.apply_component_output(send, |send| {
+                if let Some(host_ports) = &mut self.host_ports {
+                    host_ports.send_udp(send.port, send.peer, send.bytes, &self.runtime);
+                }
+            }) {
+                sends.push(send);
+                break;
             }
         }
+        sends.reverse();
         self.component_outputs.ingress_udp_sends = sends;
     }
 
@@ -872,8 +983,10 @@ where
     }
 
     fn refresh_timers(&mut self) {
+        // Gateway polling is advisory. Repeated event-loop turns must not postpone an
+        // existing smoltcp deadline, or socket timers can starve behind local work.
         self.timers
-            .schedule_after(TimerId::GatewayPoll, self.gateway.next_poll_delay());
+            .schedule_after_if_earlier(TimerId::GatewayPoll, self.gateway.next_poll_delay());
         if let Some(deadline) = self.egress_udp.next_expiry() {
             self.timers.schedule_at(TimerId::UdpExpiry, deadline);
         } else {
@@ -881,37 +994,29 @@ where
         }
     }
 
-    fn drive_expired_timers(&mut self) -> bool {
-        self.timers.pop_expired(&mut self.expired_timers);
-        let mut made_progress = false;
-        let expired = std::mem::take(&mut self.expired_timers);
-        for timer in &expired {
+    fn drive_expired_timers(&mut self, drive: &mut DriveTurn<'_>) {
+        while let Some(timer) = self.timers.pop_next_expired() {
+            if !drive.can_start_operation() {
+                self.timers.schedule_at(timer, self.runtime.clock().now());
+                break;
+            }
             match timer {
                 TimerId::GatewayPoll => {
                     // smoltcp advances TCP state from time as well as from
                     // packet input, so timer-driven gateway work can produce
                     // guest frames and proxy work even without reactor events.
-                    self.component_outputs.guest_frames.clear();
-                    self.gateway.poll(&mut self.component_outputs.guest_frames);
-                    self.drive_tcp_with_gateway();
-                    self.send_guest_frames();
-                    self.send_egress_udp_datagrams();
-                    self.write_ingress_tcp_bytes();
-                    self.close_ingress_tcp_connections();
-                    self.send_ingress_udp_datagrams();
-                    made_progress = true;
+                    self.gateway.poll(&mut self.component_outputs.guest_frames, drive);
+                    self.drive_tcp_with_gateway(drive);
                 }
                 TimerId::UdpExpiry => {
-                    let mut budget = DriveBudget::event_loop(&self.spec.config.limits);
-                    made_progress |= self.egress_udp.expire_due(
-                        &mut self.component_events.egress_udp,
-                        &mut budget,
-                        &mut self.runtime,
-                    );
+                    self.egress_udp
+                        .expire_due(&mut self.component_events.egress_udp, drive, &mut self.runtime);
                 }
                 TimerId::StatusPublish => {
-                    if self.status_dirty {
-                        self.publish();
+                    if self.status_dirty && drive.apply_state_change(|| self.publish()).is_none() {
+                        self.timers
+                            .schedule_at(TimerId::StatusPublish, self.runtime.clock().now());
+                        break;
                     }
                     self.timers
                         .schedule_after(TimerId::StatusPublish, self.spec.config.limits.status_publish_interval);
@@ -919,14 +1024,12 @@ where
                 TimerId::ConnectRetry | TimerId::Reconnect => {}
             }
         }
-        self.expired_timers = expired;
         self.refresh_timers();
-        made_progress
     }
 
     fn wait_until_timer_or_stop(&mut self, target: TimerId) -> bool {
         loop {
-            if stop_requested(self.commands.try_recv().as_ref()) {
+            if matches!(self.commands.try_recv(), Some(NetworkCommand::Stop)) {
                 return true;
             }
             if let Err(message) = self.wait_reactor(self.timers.next_timeout()) {
@@ -966,10 +1069,6 @@ where
     }
 }
 
-const fn stop_requested(command: Option<&NetworkCommand>) -> bool {
-    matches!(command, Some(NetworkCommand::Stop))
-}
-
 fn consume_events<T>(events: &mut Vec<T>, mut collect: impl FnMut(T)) {
     // Component queues append at the tail. Reversing lets us pop while still
     // preserving FIFO order and avoids shifting the Vec on every item.
@@ -979,6 +1078,11 @@ fn consume_events<T>(events: &mut Vec<T>, mut collect: impl FnMut(T)) {
     }
 }
 
+const fn should_retry_local(report: &DriveReport, followup_progress: bool) -> bool {
+    (report.budget_exhausted() && report.made_progress())
+        || (!report.runnable().is_empty() && (report.made_progress() || followup_progress))
+}
+
 fn take_fifo<T>(queue: &mut Vec<T>) -> Vec<T> {
     // Callers consume with pop(), so reverse once to preserve FIFO order.
     let mut items = std::mem::take(queue);
@@ -986,14 +1090,76 @@ fn take_fifo<T>(queue: &mut Vec<T>) -> Vec<T> {
     items
 }
 
-fn disconnect_reason(result: Result<(), TransportError>) -> String {
-    match result {
-        Ok(()) => "guest transport closed".to_owned(),
-        Err(error) => error.to_string(),
-    }
-}
-
 fn unix_millis(time: std::time::SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::drive::{DriveBudget, DriveReport, DriveRunnable, DriveTurn};
+    use crate::network::NetworkLimits;
+
+    use super::should_retry_local;
+
+    #[test]
+    fn local_retry_requires_progress_or_budgeted_work() {
+        let mut report = drive_report(|drive| {
+            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+        });
+        assert!(!should_retry_local(&report, false));
+
+        report = drive_report(|drive| {
+            record_progress(drive);
+        });
+        assert!(!should_retry_local(&report, false));
+
+        report = drive_report(|drive| {
+            record_progress(drive);
+            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+        });
+        assert!(should_retry_local(&report, false));
+    }
+
+    #[test]
+    fn budget_exhaustion_retries_only_after_progress() {
+        let mut report = drive_report_with(
+            &NetworkLimits {
+                drive_step_budget: 0,
+                ..NetworkLimits::default()
+            },
+            |drive| {
+                assert!(!drive.can_start_operation());
+            },
+        );
+        assert!(!should_retry_local(&report, false));
+
+        report = drive_report_with(
+            &NetworkLimits {
+                drive_event_budget: 1,
+                ..NetworkLimits::default()
+            },
+            |drive| {
+                record_progress(drive);
+                assert!(drive.push_event(&mut Vec::new(), ()).is_err());
+            },
+        );
+        assert!(should_retry_local(&report, false));
+    }
+
+    fn record_progress(drive: &mut DriveTurn<'_>) {
+        assert!(drive.push_event(&mut Vec::new(), ()).is_ok());
+    }
+
+    fn drive_report(f: impl FnOnce(&mut DriveTurn<'_>)) -> DriveReport {
+        drive_report_with(&NetworkLimits::default(), f)
+    }
+
+    fn drive_report_with(limits: &NetworkLimits, f: impl FnOnce(&mut DriveTurn<'_>)) -> DriveReport {
+        let mut budget = DriveBudget::event_loop(limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        f(&mut drive);
+        report
+    }
 }

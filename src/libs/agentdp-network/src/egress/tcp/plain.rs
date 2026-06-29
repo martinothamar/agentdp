@@ -1,17 +1,19 @@
 use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io;
 use std::net::SocketAddr;
 
 use crate::application::{self, TcpDnsTracker};
+use crate::buffers::WriteQueue;
 use crate::buffers::{BufferPool, ByteBuf};
-use crate::buffers::{PumpStep, WriteQueue};
 use crate::connectors::tcp::TcpConnector;
+use crate::drive::{DriveRunnable, DriveStreamRead, DriveTurn};
 use crate::network::{ApplicationPolicy, TcpProxyId};
 use crate::reactor::ReactorItemId;
-use crate::reactor::{ReactorBackend, ReactorInterest, ReactorTcpStream};
+use crate::reactor::{ReactorBackend, ReactorInterest, ReactorTcpStream, RegisteredTcpStream, RegisteringTcpStream};
+use crate::readiness::IoSlotState;
 use crate::runtime::NetworkRuntime;
 
-use super::{TcpProxyErrorContext, TcpProxyEvent, TcpProxyPoll};
+use super::{TcpProxyErrorContext, TcpProxyEvent, TcpProxyPermit, TcpProxyPoll};
 
 pub(super) struct PlainTcpProxy<R: ReactorBackend> {
     proxy: TcpProxyId,
@@ -20,7 +22,7 @@ pub(super) struct PlainTcpProxy<R: ReactorBackend> {
     authority: Option<String>,
     route_name: &'static str,
     pub(super) pending: WriteQueue,
-    pending_polls: VecDeque<PlainProxyPoll>,
+    pending_polls: VecDeque<TcpProxyPoll>,
     pub(super) guest_write_finished: bool,
     close_requested: bool,
     read_pending: bool,
@@ -30,11 +32,11 @@ pub(super) struct PlainTcpProxy<R: ReactorBackend> {
 pub(super) enum PlainTcpProxyState<R: ReactorBackend> {
     Connecting {
         route: Option<PlainRoute>,
-        stream: R::TcpStream,
+        stream: RegisteredTcpStream<R>,
         connect_ready: bool,
     },
     Open {
-        stream: R::TcpStream,
+        stream: RegisteredTcpStream<R>,
         route: PlainRoute,
         dns_tracker: Option<TcpDnsTracker>,
         upstream_write_finished: bool,
@@ -60,20 +62,6 @@ impl PlainRoute {
     }
 }
 
-enum PlainProxyPoll {
-    Bytes(ByteBuf),
-    Event(TcpProxyEvent),
-}
-
-impl PlainProxyPoll {
-    fn into_tcp_poll(self) -> TcpProxyPoll {
-        match self {
-            Self::Bytes(bytes) => TcpProxyPoll::Bytes(bytes),
-            Self::Event(event) => TcpProxyPoll::Event(event),
-        }
-    }
-}
-
 impl<R> PlainTcpProxy<R>
 where
     R: ReactorBackend,
@@ -87,12 +75,14 @@ where
         runtime: &mut impl NetworkRuntime<Reactor = R>,
     ) -> io::Result<Self> {
         let route_name = route.name();
-        let mut stream = runtime.tcp_connector().connect_tcp_stream(dst)?;
-        runtime.reactor_mut().register_tcp_stream(
-            &mut stream,
+        let stream = runtime.tcp_connector().connect_tcp_stream(dst)?;
+        let stream = RegisteringTcpStream::new(
+            runtime.reactor_mut(),
+            stream,
             ReactorItemId::TcpProxy { proxy },
             ReactorInterest::ReadWrite,
-        )?;
+        )?
+        .commit();
         Ok(Self {
             proxy,
             requested_dst,
@@ -120,7 +110,7 @@ where
             authority: context.authority.clone(),
             route_name: context.route,
             pending: WriteQueue::new(),
-            pending_polls: VecDeque::from([PlainProxyPoll::Event(
+            pending_polls: VecDeque::from([TcpProxyPoll::Event(
                 TcpProxyEvent::error(proxy, message).with_context(context),
             )]),
             guest_write_finished: false,
@@ -149,7 +139,7 @@ where
             Ok(bytes) => self.pending.push(bytes),
             Err(message) => self
                 .pending_polls
-                .push_back(PlainProxyPoll::Event(TcpProxyEvent::error(self.proxy, message))),
+                .push_back(TcpProxyPoll::Event(TcpProxyEvent::error(self.proxy, message))),
         }
     }
 
@@ -161,25 +151,124 @@ where
         self.close_requested = true;
     }
 
-    pub(super) const fn mark_connect_ready(&mut self) {
-        if let PlainTcpProxyState::Connecting { connect_ready, .. } = &mut self.state {
-            *connect_ready = true;
-        }
-    }
-
     pub(super) fn deregister(&mut self, reactor: &mut R) {
         match &mut self.state {
             PlainTcpProxyState::Connecting { stream, .. } | PlainTcpProxyState::Open { stream, .. } => {
-                let _deregistered =
-                    reactor.deregister_tcp_stream(stream, ReactorItemId::TcpProxy { proxy: self.proxy });
+                stream.deregister(reactor);
             }
             PlainTcpProxyState::Failed { .. } => {}
         }
     }
 
-    pub(super) fn drive(&mut self, buffers: &BufferPool, reactor: &mut R) -> TcpProxyPoll {
+    pub(super) fn has_local_work(&self, guest_can_send: bool) -> bool {
+        if self.close_requested {
+            return true;
+        }
+        if let Some(poll) = self.pending_polls.front() {
+            return match poll {
+                TcpProxyPoll::Bytes(_) => guest_can_send,
+                TcpProxyPoll::Event(_) => true,
+                TcpProxyPoll::Pending => false,
+            };
+        }
+        match &self.state {
+            PlainTcpProxyState::Connecting { .. } => false,
+            PlainTcpProxyState::Open {
+                stream,
+                upstream_write_finished,
+                ..
+            } => {
+                let upstream_write_pending =
+                    !self.pending.is_empty() || (self.guest_write_finished && !*upstream_write_finished);
+                let io = stream.io();
+                upstream_write_pending && (!io.watches_write() || io.can_write())
+            }
+            PlainTcpProxyState::Failed { .. } => true,
+        }
+    }
+
+    pub(super) const fn has_reactor_write_work(&self) -> bool {
+        match &self.state {
+            PlainTcpProxyState::Connecting { .. } => true,
+            PlainTcpProxyState::Open {
+                upstream_write_finished,
+                ..
+            } => !self.pending.is_empty() || (self.guest_write_finished && !*upstream_write_finished),
+            PlainTcpProxyState::Failed { .. } => false,
+        }
+    }
+
+    pub(super) const fn io(&self) -> IoSlotState {
+        match &self.state {
+            PlainTcpProxyState::Connecting { stream, .. } | PlainTcpProxyState::Open { stream, .. } => stream.io(),
+            PlainTcpProxyState::Failed { .. } => IoSlotState::new(ReactorInterest::Disabled),
+        }
+    }
+
+    pub(super) const fn mark_reactor_ready(&mut self, readable: bool, writable: bool) {
+        match &mut self.state {
+            PlainTcpProxyState::Connecting {
+                stream, connect_ready, ..
+            } => {
+                stream.mark_reactor_ready(readable, writable);
+                if readable || writable {
+                    *connect_ready = true;
+                }
+            }
+            PlainTcpProxyState::Open { stream, .. } => stream.mark_reactor_ready(readable, writable),
+            PlainTcpProxyState::Failed { .. } => {}
+        }
+    }
+
+    #[cfg(any(test, feature = "simulation"))]
+    pub(super) fn debug_snapshot(&self) -> String {
+        let state = match &self.state {
+            PlainTcpProxyState::Connecting { connect_ready, .. } => {
+                format!("Connecting {{ connect_ready: {connect_ready} }}")
+            }
+            PlainTcpProxyState::Open {
+                upstream_write_finished,
+                ..
+            } => {
+                format!("Open {{ upstream_write_finished: {upstream_write_finished} }}")
+            }
+            PlainTcpProxyState::Failed { .. } => "Failed".to_owned(),
+        };
+        format!(
+            "PlainTcpProxy {{ state: {state}, pending_bytes: {}, pending_polls: {}, guest_write_finished: {}, close_requested: {}, read_pending: {} }}",
+            self.pending.pending_bytes(),
+            self.pending_polls.len(),
+            self.guest_write_finished,
+            self.close_requested,
+            self.read_pending,
+        )
+    }
+
+    pub(super) fn drive(
+        &mut self,
+        buffers: &BufferPool,
+        reactor: &mut R,
+        drive: &mut DriveTurn<'_>,
+        permit: TcpProxyPermit,
+    ) -> TcpProxyPoll {
         if let Some(poll) = self.pending_polls.pop_front() {
-            return poll.into_tcp_poll();
+            if matches!(poll, TcpProxyPoll::Bytes(_)) && !permit.contains(TcpProxyPermit::READ_UPSTREAM) {
+                self.pending_polls.push_front(poll);
+                if permit.contains(TcpProxyPermit::WRITE_UPSTREAM)
+                    && matches!(self.state, PlainTcpProxyState::Open { .. })
+                {
+                    return match self.drive_open(buffers, reactor, drive, permit) {
+                        TcpProxyPoll::Pending => {
+                            drive.wait_for_guest_send_capacity();
+                            TcpProxyPoll::Pending
+                        }
+                        poll => poll,
+                    };
+                }
+                drive.wait_for_guest_send_capacity();
+                return TcpProxyPoll::Pending;
+            }
+            return poll;
         }
         match &mut self.state {
             PlainTcpProxyState::Connecting {
@@ -189,17 +278,22 @@ where
                     return TcpProxyPoll::Event(TcpProxyEvent::closed(self.proxy));
                 }
                 if !*connect_ready {
-                    return TcpProxyPoll::Blocked;
+                    drive.wait_for_reactor_read_write();
+                    return TcpProxyPoll::Pending;
                 }
-                if let Err(error) = stream.take_error().and_then(|error| error.map_or_else(|| Ok(()), Err)) {
+                if let Err(error) = stream
+                    .source()
+                    .take_error()
+                    .and_then(|error| error.map_or_else(|| Ok(()), Err))
+                {
                     return TcpProxyPoll::Event(TcpProxyEvent::error(self.proxy, error.to_string()));
                 }
                 if let Err(event) = self.open_plain(buffers, reactor) {
                     return TcpProxyPoll::Event(event);
                 }
-                self.drive(buffers, reactor)
+                self.drive(buffers, reactor, drive, permit)
             }
-            PlainTcpProxyState::Open { .. } => self.drive_open(buffers, reactor),
+            PlainTcpProxyState::Open { .. } => self.drive_open(buffers, reactor, drive, permit),
             PlainTcpProxyState::Failed { message } => {
                 TcpProxyPoll::Event(TcpProxyEvent::error(self.proxy, std::mem::take(message)))
             }
@@ -217,12 +311,8 @@ where
         };
         let dns_tracker = matches!(route, PlainRoute::Dns).then(TcpDnsTracker::default);
         let mut stream = stream;
-        reactor
-            .reregister_tcp_stream(
-                &mut stream,
-                ReactorItemId::TcpProxy { proxy: self.proxy },
-                ReactorInterest::Readable,
-            )
+        stream
+            .reregister(reactor, ReactorInterest::Readable)
             .map_err(|error| TcpProxyEvent::error(self.proxy, error.to_string()))?;
         self.state = PlainTcpProxyState::Open {
             stream,
@@ -240,37 +330,43 @@ where
         Ok(())
     }
 
-    fn drive_open(&mut self, buffers: &BufferPool, reactor: &R) -> TcpProxyPoll {
-        let wrote = match self.try_write_pending() {
-            Ok(wrote) => {
-                self.update_interest(reactor);
-                wrote
+    fn drive_open(
+        &mut self,
+        buffers: &BufferPool,
+        reactor: &R,
+        drive: &mut DriveTurn<'_>,
+        permit: TcpProxyPermit,
+    ) -> TcpProxyPoll {
+        if permit.contains(TcpProxyPermit::WRITE_UPSTREAM) {
+            if let PlainTcpProxyState::Open { stream, .. } = &mut self.state {
+                let (stream, io) = stream.source_and_io_mut();
+                match drive.write_stream_queue_ready(io, &mut self.pending, stream) {
+                    Ok(_write) => {}
+                    Err(error) => return TcpProxyPoll::Event(TcpProxyEvent::error(self.proxy, error.to_string())),
+                }
             }
-            Err(event) => return TcpProxyPoll::Event(event),
-        };
+        } else if !self.pending.is_empty() {
+            drive.wait_for_reactor_write();
+        }
+        if permit.contains(TcpProxyPermit::WRITE_UPSTREAM)
+            && let Err(event) = self.update_interest(reactor, permit)
+        {
+            return TcpProxyPoll::Event(event);
+        }
         if let Some(event) = self.finish_upstream_write_if_needed() {
             return TcpProxyPoll::Event(event);
         }
         if self.close_requested && self.pending.is_empty() {
             return TcpProxyPoll::Event(TcpProxyEvent::closed(self.proxy));
         }
-        if let Some(poll) = self.try_read(buffers) {
-            return poll;
+        if permit.contains(TcpProxyPermit::READ_UPSTREAM) {
+            if let Some(poll) = self.try_read(buffers, drive) {
+                return poll;
+            }
+        } else if self.read_pending {
+            drive.wait_for_guest_send_capacity();
         }
-        if wrote {
-            return TcpProxyPoll::Progress;
-        }
-        TcpProxyPoll::Blocked
-    }
-
-    fn try_write_pending(&mut self) -> Result<bool, TcpProxyEvent> {
-        let PlainTcpProxyState::Open { stream, .. } = &mut self.state else {
-            return Ok(false);
-        };
-        self.pending
-            .flush_to_std(stream)
-            .map(PumpStep::made_progress)
-            .map_err(|error| TcpProxyEvent::error(self.proxy, error.to_string()))
+        TcpProxyPoll::Pending
     }
 
     fn finish_upstream_write_if_needed(&mut self) -> Option<TcpProxyEvent> {
@@ -290,32 +386,34 @@ where
         }
         *upstream_write_finished = true;
         stream
+            .source()
             .shutdown_write()
             .err()
             .filter(|error| error.kind() != io::ErrorKind::NotConnected)
             .map(|error| TcpProxyEvent::error(self.proxy, error.to_string()))
     }
 
-    fn try_read(&mut self, buffers: &BufferPool) -> Option<TcpProxyPoll> {
+    fn try_read(&mut self, buffers: &BufferPool, drive: &mut DriveTurn<'_>) -> Option<TcpProxyPoll> {
         let PlainTcpProxyState::Open {
             stream, dns_tracker, ..
         } = &mut self.state
         else {
             return None;
         };
-        let Ok(mut bytes) = buffers.try_tcp_byte() else {
-            return None;
+        let runnable = if self.pending.is_empty() {
+            DriveRunnable::NONE
+        } else {
+            DriveRunnable::WRITE_UPSTREAM
         };
-        bytes.resize_zeroed(buffers.tcp_byte_capacity());
-        match stream.read(bytes.as_mut_slice()) {
-            Ok(0) => Some(TcpProxyPoll::Event(TcpProxyEvent::closed(self.proxy))),
-            Ok(len) => {
+        let (stream, io) = stream.source_and_io_mut();
+        match drive.read_stream_ready(io, buffers, stream, runnable) {
+            Ok(DriveStreamRead::Closed) => Some(TcpProxyPoll::Event(TcpProxyEvent::closed(self.proxy))),
+            Ok(DriveStreamRead::Bytes(bytes)) => {
                 self.read_pending = true;
-                bytes.truncate(len);
                 if let Some(tracker) = dns_tracker
                     && let Some(resolution) = tracker.response(bytes.as_slice())
                 {
-                    self.pending_polls.push_back(PlainProxyPoll::Bytes(bytes));
+                    self.pending_polls.push_back(TcpProxyPoll::Bytes(bytes));
                     return Some(TcpProxyPoll::Event(TcpProxyEvent::DnsResolved {
                         host: resolution.host,
                         addresses: resolution.addresses,
@@ -324,7 +422,7 @@ where
                 }
                 Some(TcpProxyPoll::Bytes(bytes))
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Ok(DriveStreamRead::NotReady | DriveStreamRead::WouldBlock | DriveStreamRead::Blocked) => {
                 self.read_pending = false;
                 None
             }
@@ -332,17 +430,22 @@ where
         }
     }
 
-    fn update_interest(&mut self, reactor: &R) {
+    fn update_interest(&mut self, reactor: &R, permit: TcpProxyPermit) -> Result<(), TcpProxyEvent> {
         let PlainTcpProxyState::Open { stream, .. } = &mut self.state else {
-            return;
+            return Ok(());
         };
-        let interest = if self.pending.is_empty() {
-            ReactorInterest::Readable
-        } else {
-            ReactorInterest::ReadWrite
+        let wants_read = permit.contains(TcpProxyPermit::READ_UPSTREAM);
+        let has_pending_write = !self.pending.is_empty();
+        let interest = match (wants_read, has_pending_write) {
+            (true, true) => ReactorInterest::ReadWrite,
+            (false, true) => ReactorInterest::Writable,
+            (true, false) => ReactorInterest::Readable,
+            (false, false) => ReactorInterest::Disabled,
         };
-        let _reregistered =
-            reactor.reregister_tcp_stream(stream, ReactorItemId::TcpProxy { proxy: self.proxy }, interest);
+        stream
+            .reregister(reactor, interest)
+            .map_err(|error| TcpProxyEvent::error(self.proxy, error.to_string()))?;
+        Ok(())
     }
 
     pub(super) fn process_guest_bytes(

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 #[cfg(any(test, feature = "simulation"))]
 use std::fmt::Write as _;
 use std::io;
@@ -13,12 +14,13 @@ use tls::{TlsProxyPoll, TlsTcpProxy};
 use crate::buffers::WriteQueue;
 use crate::buffers::{BufferPool, ByteBuf};
 use crate::clock::NetworkClock;
-use crate::drive::DriveBudget;
+use crate::drive::{DriveRunnable, DriveSmoltcpTcpRecv, DriveTurn};
 use crate::gateway::Gateway;
 use crate::network::NetworkLimits;
 use crate::network::{TcpEgressRoute, TcpProxyId};
 use crate::reactor::ReactorItemId;
 use crate::reactor::{ReactorBackend, ReactorReady};
+use crate::readiness::IoSlotState;
 use crate::runtime::NetworkRuntime;
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -83,34 +85,49 @@ where
         gateway: &mut Gateway<C>,
         readiness: &[ReactorReady],
         events: &mut Vec<TcpProxyEvent>,
-        budget: &mut DriveBudget,
+        drive: &mut DriveTurn<'_>,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
-    ) -> bool {
-        let start_len = events.len();
-        let mut made_progress = false;
-        made_progress |= self.activate_guest_connections(gateway, runtime);
-        self.collect_runnable_proxies(readiness);
+    ) {
+        self.activate_guest_connections(gateway, drive, runtime);
+        self.latch_reactor_readiness(readiness);
         let sockets = gateway.tcp_sockets_mut();
+        self.collect_runnable_proxies(sockets);
+        while let Some(event) = self.proxies.pending_events.pop_front() {
+            let terminal_proxy = event.terminal_proxy();
+            if !self.proxies.emit_or_queue(events, drive, event) {
+                self.poll_scratch.clear();
+                return;
+            }
+            if let Some(proxy_id) = terminal_proxy {
+                self.proxies.remove_proxy(proxy_id, runtime.reactor_mut());
+                self.proxies.close_guest(proxy_id, sockets, drive);
+            }
+            if !drive.can_start_operation() {
+                self.poll_scratch.clear();
+                return;
+            }
+        }
         let mut index = 0;
-        while index < self.poll_scratch.len() && budget.can_continue() {
+        while index < self.poll_scratch.len() {
+            if !drive.can_start_operation() {
+                break;
+            }
             let proxy_id = self.poll_scratch[index];
             index += 1;
-            made_progress |= self
-                .proxies
-                .drive_proxy_entry(proxy_id, sockets, events, budget, &self.buffers, runtime);
+            self.proxies
+                .drive_proxy_entry(proxy_id, sockets, events, drive, &self.buffers, runtime);
         }
         self.poll_scratch.clear();
-        made_progress || events.len() > start_len
     }
 
     pub(crate) fn drive_queued<C: NetworkClock>(
         &mut self,
         gateway: &mut Gateway<C>,
         events: &mut Vec<TcpProxyEvent>,
-        budget: &mut DriveBudget,
+        drive: &mut DriveTurn<'_>,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
-    ) -> bool {
-        self.drive_gateway(gateway, &[], events, budget, runtime)
+    ) {
+        self.drive_gateway(gateway, &[], events, drive, runtime);
     }
 
     pub(crate) fn drive_ready<C: NetworkClock>(
@@ -118,45 +135,50 @@ where
         gateway: &mut Gateway<C>,
         readiness: &[ReactorReady],
         events: &mut Vec<TcpProxyEvent>,
-        budget: &mut DriveBudget,
+        drive: &mut DriveTurn<'_>,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
-    ) -> bool {
-        self.drive_gateway(gateway, readiness, events, budget, runtime)
+    ) {
+        self.drive_gateway(gateway, readiness, events, drive, runtime);
     }
 
     fn activate_guest_connections<C: NetworkClock>(
         &mut self,
         gateway: &mut Gateway<C>,
+        drive: &mut DriveTurn<'_>,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
-    ) -> bool {
+    ) {
         let mut established = std::mem::take(&mut self.activation_scratch);
         established.clear();
         self.proxies
             .append_established_destinations(gateway.tcp_sockets(), &mut established);
-        let mut made_progress = false;
         for &(slot_index, requested_dst) in &established {
-            let proxy_id = TcpProxyId(self.proxies.next_proxy);
-            self.proxies.next_proxy = self.proxies.next_proxy.saturating_add(1);
-            let (upstream_dst, route) = gateway.tcp_egress_route(requested_dst);
-            let route_name = route_name(&route);
-            let proxy = TcpProxy::connecting(proxy_id, requested_dst, upstream_dst, route, &self.buffers, runtime)
-                .unwrap_or_else(|error| {
-                    TcpProxy::failed(
-                        proxy_id,
-                        TcpProxyErrorContext::new(requested_dst, upstream_dst, None, route_name, "connect"),
-                        error.to_string(),
-                    )
-                });
-            self.proxies.activate(slot_index, proxy_id, proxy);
-            made_progress = true;
+            if drive
+                .apply_state_change(|| {
+                    let proxy_id = TcpProxyId(self.proxies.next_proxy);
+                    self.proxies.next_proxy = self.proxies.next_proxy.saturating_add(1);
+                    let (upstream_dst, route) = gateway.tcp_egress_route(requested_dst);
+                    let route_name = route_name(&route);
+                    let proxy =
+                        TcpProxy::connecting(proxy_id, requested_dst, upstream_dst, route, &self.buffers, runtime)
+                            .unwrap_or_else(|error| {
+                                TcpProxy::failed(
+                                    proxy_id,
+                                    TcpProxyErrorContext::new(requested_dst, upstream_dst, None, route_name, "connect"),
+                                    error.to_string(),
+                                )
+                            });
+                    self.proxies.activate(slot_index, proxy_id, proxy);
+                })
+                .is_none()
+            {
+                break;
+            }
         }
         established.clear();
         self.activation_scratch = established;
-        made_progress
     }
 
-    fn collect_runnable_proxies(&mut self, readiness: &[ReactorReady]) {
-        self.poll_scratch.clear();
+    fn latch_reactor_readiness(&mut self, readiness: &[ReactorReady]) {
         for ready in readiness {
             let ReactorReady::Io {
                 item,
@@ -169,14 +191,13 @@ where
             let ReactorItemId::TcpProxy { proxy: proxy_id } = item else {
                 continue;
             };
-            if readable || writable {
-                self.proxies.mark_connect_ready(proxy_id);
-            }
-            if !self.poll_scratch.contains(&proxy_id) {
-                self.poll_scratch.push(proxy_id);
-            }
+            self.proxies.mark_reactor_ready(proxy_id, readable, writable);
         }
-        self.proxies.append_active_proxies(&mut self.poll_scratch);
+    }
+
+    fn collect_runnable_proxies(&mut self, sockets: &SocketSet<'static>) {
+        self.poll_scratch.clear();
+        self.proxies.append_runnable_proxies(sockets, &mut self.poll_scratch);
     }
 
     #[cfg(any(test, feature = "simulation"))]
@@ -197,6 +218,7 @@ where
 struct TcpProxySlots<R: ReactorBackend> {
     slots: Vec<Option<TcpProxySlot<R>>>,
     idle_sockets: Vec<tcp::Socket<'static>>,
+    pending_events: VecDeque<TcpProxyEvent>,
     next_proxy: u64,
 }
 
@@ -208,6 +230,7 @@ struct TcpProxySlot<R: ReactorBackend> {
 struct TcpProxyEntry<R: ReactorBackend> {
     requested: Option<(SocketAddr, SocketAddr)>,
     active: Option<TcpProxyId>,
+    upstream_read_masked: bool,
     pending_writes: WriteQueue,
     guest_write_closed: bool,
     proxy_closed: bool,
@@ -230,6 +253,7 @@ where
         Self {
             slots,
             idle_sockets,
+            pending_events: VecDeque::new(),
             next_proxy: 0,
         }
     }
@@ -299,58 +323,70 @@ where
         proxy_id: TcpProxyId,
         sockets: &mut SocketSet<'static>,
         events: &mut Vec<TcpProxyEvent>,
-        budget: &mut DriveBudget,
+        drive: &mut DriveTurn<'_>,
         buffers: &BufferPool,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
-    ) -> bool {
-        let mut made_progress = false;
+    ) {
         let mut close_slot = None;
+        let mut permit = TcpProxyPermit::ALL;
         if let Some(slot) = self.slot_by_proxy_mut(proxy_id) {
             let socket = sockets.get_mut::<tcp::Socket>(slot.handle);
             if let Some(proxy) = slot.entry.proxy.as_mut() {
-                while socket.can_recv() {
-                    let Ok(mut bytes) = buffers.try_tcp_byte() else {
-                        break;
-                    };
-                    bytes.resize_zeroed(buffers.tcp_byte_capacity());
-                    match socket.recv_slice(bytes.as_mut_slice()) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            bytes.truncate(n);
-                            proxy.write(bytes);
-                            made_progress = true;
+                while let DriveSmoltcpTcpRecv::Bytes(bytes) =
+                    drive.recv_smoltcp_tcp(buffers, socket, DriveRunnable::READ_GUEST)
+                {
+                    proxy.write(bytes);
+                }
+            }
+            drive.send_smoltcp_tcp_queue(&mut slot.entry.pending_writes, socket);
+            permit = if slot.entry.pending_writes.is_empty() && socket.can_send() {
+                TcpProxyPermit::ALL
+            } else {
+                TcpProxyPermit::WRITE_UPSTREAM
+            };
+            slot.entry.upstream_read_masked =
+                !permit.contains(TcpProxyPermit::READ_UPSTREAM) && slot.entry.proxy.is_some();
+            if socket.state() == tcp::State::CloseWait
+                && !socket.can_recv()
+                && !slot.entry.guest_write_closed
+                && drive
+                    .apply_state_change(|| {
+                        slot.entry.guest_write_closed = true;
+                        if let Some(proxy) = slot.entry.proxy.as_mut() {
+                            proxy.finish_guest_write();
                         }
-                        Err(_error) => break,
-                    }
-                }
+                    })
+                    .is_none()
+            {
+                return;
             }
-            made_progress |= slot.entry.pending_writes.flush_to_guest_socket(socket).made_progress();
-            if socket.state() == tcp::State::CloseWait && !slot.entry.guest_write_closed {
-                slot.entry.guest_write_closed = true;
-                if let Some(proxy) = slot.entry.proxy.as_mut() {
-                    proxy.finish_guest_write();
-                }
-                made_progress = true;
-            }
-            if slot.entry.proxy_closed && slot.entry.pending_writes.is_empty() && socket.may_send() {
-                socket.close();
-                made_progress = true;
+            if slot.entry.proxy_closed
+                && slot.entry.pending_writes.is_empty()
+                && socket.may_send()
+                && drive.apply_state_change(|| socket.close()).is_none()
+            {
+                return;
             }
             if !socket.is_active() {
-                if let Some(proxy) = slot.entry.proxy.as_mut() {
-                    proxy.close();
-                    made_progress = true;
+                if drive
+                    .apply_state_change(|| {
+                        if let Some(proxy) = slot.entry.proxy.as_mut() {
+                            proxy.close();
+                        }
+                    })
+                    .is_none()
+                {
+                    return;
                 }
                 close_slot = Some((slot.handle, proxy_id));
             }
         }
-        made_progress |= self.drive_proxy(proxy_id, sockets, events, budget, buffers, runtime);
+        self.drive_proxy(proxy_id, sockets, events, drive, buffers, runtime, permit);
         if let Some((handle, proxy_id)) = close_slot {
             self.remove_proxy(proxy_id, runtime.reactor_mut());
             self.remove_slot_by_handle(handle);
             self.recycle_socket(handle, sockets);
         }
-        made_progress
     }
 
     fn slot_by_proxy_mut(&mut self, proxy_id: TcpProxyId) -> Option<&mut TcpProxySlot<R>> {
@@ -360,39 +396,43 @@ where
             .find(|slot| slot.entry.active == Some(proxy_id))
     }
 
-    fn append_active_proxies(&self, proxies: &mut Vec<TcpProxyId>) {
+    fn append_runnable_proxies(&self, sockets: &SocketSet<'static>, proxies: &mut Vec<TcpProxyId>) {
         for slot in self.slots.iter().filter_map(Option::as_ref) {
-            if let Some(proxy_id) = slot.entry.active
-                && !proxies.contains(&proxy_id)
-            {
+            let Some(proxy_id) = slot.entry.active else {
+                continue;
+            };
+            let socket = sockets.get::<tcp::Socket>(slot.handle);
+            if slot.entry.is_runnable(socket) && !proxies.contains(&proxy_id) {
                 proxies.push(proxy_id);
             }
         }
     }
 
-    fn mark_connect_ready(&mut self, proxy_id: TcpProxyId) {
+    fn mark_reactor_ready(&mut self, proxy_id: TcpProxyId, readable: bool, writable: bool) {
         let Some(slot) = self.slot_by_proxy_mut(proxy_id) else {
             return;
         };
         if let Some(proxy) = slot.entry.proxy.as_mut() {
-            proxy.mark_connect_ready();
+            proxy.mark_reactor_ready(readable, writable);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drive_proxy(
         &mut self,
         proxy_id: TcpProxyId,
         sockets: &mut SocketSet<'static>,
         events: &mut Vec<TcpProxyEvent>,
-        budget: &mut DriveBudget,
+        drive: &mut DriveTurn<'_>,
         buffers: &BufferPool,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
-    ) -> bool {
-        let mut made_progress = false;
+        permit: TcpProxyPermit,
+    ) {
         loop {
-            if !budget.step() || !budget.can_continue() {
+            if !drive.can_start_operation() {
                 break;
             }
+            let before_proxy_drive = drive.progress();
             let poll = {
                 let Some(slot) = self.slot_by_proxy_mut(proxy_id) else {
                     break;
@@ -400,42 +440,50 @@ where
                 let Some(proxy) = slot.entry.proxy.as_mut() else {
                     break;
                 };
-                proxy.drive(buffers, runtime)
+                proxy.drive(buffers, runtime, drive, permit)
             };
+            let direct_progress = drive.progress() != before_proxy_drive;
             match poll {
                 TcpProxyPoll::Bytes(bytes) => {
                     if let Some(slot) = self.slot_by_proxy_mut(proxy_id) {
-                        let socket = sockets.get_mut::<tcp::Socket>(slot.handle);
                         slot.entry.pending_writes.push(bytes);
-                        let _flushed = slot.entry.pending_writes.flush_to_guest_socket(socket);
+                        let socket = sockets.get_mut::<tcp::Socket>(slot.handle);
+                        drive.send_smoltcp_tcp_queue(&mut slot.entry.pending_writes, socket);
+                        if !slot.entry.pending_writes.is_empty() || !socket.can_send() {
+                            drive.wait_for_guest_send_capacity();
+                            break;
+                        }
                     }
-                    made_progress = true;
                 }
                 TcpProxyPoll::Event(event) if event.is_terminal() => {
+                    if !self.emit_or_queue(events, drive, event) {
+                        break;
+                    }
                     self.remove_proxy(proxy_id, runtime.reactor_mut());
-                    self.close_guest(proxy_id, sockets);
-                    push_event(events, budget, event);
-                    made_progress = true;
+                    self.close_guest(proxy_id, sockets, drive);
                     break;
                 }
                 TcpProxyPoll::Event(event) => {
-                    push_event(events, budget, event);
-                    made_progress = true;
+                    if !self.emit_or_queue(events, drive, event) {
+                        break;
+                    }
                 }
-                TcpProxyPoll::Progress => made_progress = true,
-                TcpProxyPoll::Blocked => break,
+                TcpProxyPoll::Pending => {
+                    if !direct_progress {
+                        break;
+                    }
+                }
             }
         }
-        made_progress
     }
 
-    fn close_guest(&mut self, proxy_id: TcpProxyId, sockets: &mut SocketSet<'static>) {
+    fn close_guest(&mut self, proxy_id: TcpProxyId, sockets: &mut SocketSet<'static>, drive: &mut DriveTurn<'_>) {
         let Some(slot) = self.slot_by_proxy_mut(proxy_id) else {
             return;
         };
         slot.entry.proxy_closed = true;
         let socket = sockets.get_mut::<tcp::Socket>(slot.handle);
-        let _flushed = slot.entry.pending_writes.flush_to_guest_socket(socket);
+        drive.send_smoltcp_tcp_queue(&mut slot.entry.pending_writes, socket);
         if slot.entry.pending_writes.is_empty() && socket.may_send() {
             socket.close();
         }
@@ -455,9 +503,25 @@ where
     }
 
     fn shutdown(&mut self, reactor: &mut R) {
+        self.pending_events.clear();
         for slot in self.slots.iter_mut().filter_map(Option::as_mut) {
             if let Some(mut proxy) = slot.entry.proxy.take() {
                 proxy.deregister(reactor);
+            }
+        }
+    }
+
+    fn emit_or_queue(
+        &mut self,
+        events: &mut Vec<TcpProxyEvent>,
+        drive: &mut DriveTurn<'_>,
+        event: TcpProxyEvent,
+    ) -> bool {
+        match drive.push_event(events, event) {
+            Ok(()) => true,
+            Err(event) => {
+                self.pending_events.push_front(event);
+                false
             }
         }
     }
@@ -501,14 +565,20 @@ where
             };
             let socket = sockets.get::<tcp::Socket>(slot.handle);
             let active_proxy_snapshot = slot.entry.proxy.as_ref().map(TcpProxy::debug_snapshot);
+            let io = slot.entry.proxy.as_ref().map_or_else(
+                || IoSlotState::new(crate::reactor::ReactorInterest::Disabled),
+                TcpProxy::io,
+            );
             let _ = write!(
                 output,
-                ", slot[{index}]: {{ active: {:?}, has_proxy: {}, guest_write_closed: {}, proxy_closed: {}, pending_write_bytes: {}, socket_state: {:?}, socket_can_send: {}, socket_can_recv: {}, socket_may_send: {}, socket_may_recv: {}, active_proxy_snapshot: {:?}, last_proxy_snapshot: {:?} }}",
+                ", slot[{index}]: {{ active: {:?}, has_proxy: {}, guest_write_closed: {}, proxy_closed: {}, pending_write_bytes: {}, io: {:?}, upstream_read_masked: {}, socket_state: {:?}, socket_can_send: {}, socket_can_recv: {}, socket_may_send: {}, socket_may_recv: {}, active_proxy_snapshot: {:?}, last_proxy_snapshot: {:?} }}",
                 slot.entry.active,
                 slot.entry.proxy.is_some(),
                 slot.entry.guest_write_closed,
                 slot.entry.proxy_closed,
                 slot.entry.pending_writes.pending_bytes(),
+                io,
+                slot.entry.upstream_read_masked,
                 socket.state(),
                 socket.can_send(),
                 socket.can_recv(),
@@ -531,6 +601,7 @@ where
         Self {
             requested: Some((src, dst)),
             active: None,
+            upstream_read_masked: false,
             pending_writes: WriteQueue::new(),
             guest_write_closed: false,
             proxy_closed: false,
@@ -538,6 +609,28 @@ where
             #[cfg(any(test, feature = "simulation"))]
             last_proxy_snapshot: None,
         }
+    }
+
+    fn is_runnable(&self, socket: &tcp::Socket<'_>) -> bool {
+        if self.active.is_none() {
+            return false;
+        }
+        if self.proxy.is_none() {
+            return (self.proxy_closed && socket.may_send())
+                || !socket.is_active()
+                || (!self.pending_writes.is_empty() && socket.can_send());
+        }
+        let Some(proxy) = self.proxy.as_ref() else {
+            return false;
+        };
+        socket.can_recv()
+            || (matches!(socket.state(), tcp::State::CloseWait) && !socket.can_recv() && !self.guest_write_closed)
+            || !socket.is_active()
+            || (!self.pending_writes.is_empty() && socket.can_send())
+            || (self.upstream_read_masked && self.pending_writes.is_empty() && socket.can_send())
+            || (!self.upstream_read_masked && proxy.io().can_read())
+            || (proxy.io().can_write() && proxy.has_reactor_write_work())
+            || proxy.has_local_work(socket.can_send())
     }
 }
 
@@ -560,13 +653,14 @@ pub(crate) const fn tcp_listen_endpoint(dst: SocketAddr) -> Option<IpListenEndpo
     })
 }
 
-fn push_event(events: &mut Vec<TcpProxyEvent>, budget: &mut DriveBudget, event: TcpProxyEvent) {
-    if budget.event(1) {
-        events.push(event);
-    }
-}
-
 impl TcpProxyEvent {
+    const fn terminal_proxy(&self) -> Option<TcpProxyId> {
+        match self {
+            Self::Closed { proxy } | Self::Error { proxy, .. } => Some(*proxy),
+            Self::DnsResolved { .. } => None,
+        }
+    }
+
     const fn is_terminal(&self) -> bool {
         matches!(self, Self::Closed { .. } | Self::Error { .. })
     }
@@ -625,8 +719,23 @@ enum TcpProxy<R: ReactorBackend> {
 enum TcpProxyPoll {
     Bytes(ByteBuf),
     Event(TcpProxyEvent),
-    Progress,
-    Blocked,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpProxyPermit(u8);
+
+impl TcpProxyPermit {
+    const READ_UPSTREAM_BITS: u8 = 1 << 0;
+    const WRITE_UPSTREAM_BITS: u8 = 1 << 1;
+
+    const READ_UPSTREAM: Self = Self(Self::READ_UPSTREAM_BITS);
+    const WRITE_UPSTREAM: Self = Self(Self::WRITE_UPSTREAM_BITS);
+    const ALL: Self = Self(Self::READ_UPSTREAM_BITS | Self::WRITE_UPSTREAM_BITS);
+
+    const fn contains(self, permit: Self) -> bool {
+        self.0 & permit.0 != 0
+    }
 }
 
 impl<R> TcpProxy<R>
@@ -679,10 +788,10 @@ where
         }
     }
 
-    const fn mark_connect_ready(&mut self) {
+    const fn mark_reactor_ready(&mut self, readable: bool, writable: bool) {
         match self {
-            Self::Plain(plain) => plain.mark_connect_ready(),
-            Self::Tls(tls) => tls.mark_connect_ready(),
+            Self::Plain(plain) => plain.mark_reactor_ready(readable, writable),
+            Self::Tls(tls) => tls.mark_reactor_ready(readable, writable),
         }
     }
 
@@ -693,20 +802,49 @@ where
         }
     }
 
+    fn has_local_work(&self, guest_can_send: bool) -> bool {
+        match self {
+            Self::Plain(plain) => plain.has_local_work(guest_can_send),
+            Self::Tls(tls) => tls.has_local_work(guest_can_send),
+        }
+    }
+
+    const fn io(&self) -> IoSlotState {
+        match self {
+            Self::Plain(plain) => plain.io(),
+            Self::Tls(tls) => tls.io(),
+        }
+    }
+
+    fn has_reactor_write_work(&self) -> bool {
+        match self {
+            Self::Plain(plain) => plain.has_reactor_write_work(),
+            Self::Tls(tls) => tls.has_reactor_write_work(),
+        }
+    }
+
     #[cfg(any(test, feature = "simulation"))]
     fn debug_snapshot(&self) -> String {
         match self {
-            Self::Plain(_plain) => "PlainTcpProxy".to_owned(),
+            Self::Plain(plain) => plain.debug_snapshot(),
             Self::Tls(tls) => tls.debug_snapshot(),
         }
     }
 
-    fn drive(&mut self, buffers: &BufferPool, runtime: &mut impl NetworkRuntime<Reactor = R>) -> TcpProxyPoll {
+    fn drive(
+        &mut self,
+        buffers: &BufferPool,
+        runtime: &mut impl NetworkRuntime<Reactor = R>,
+        drive: &mut DriveTurn<'_>,
+        permit: TcpProxyPermit,
+    ) -> TcpProxyPoll {
         match self {
             Self::Plain(plain) => {
-                attach_error_context(plain.drive(buffers, runtime.reactor_mut()), || plain.error_context())
+                attach_error_context(plain.drive(buffers, runtime.reactor_mut(), drive, permit), || {
+                    plain.error_context()
+                })
             }
-            Self::Tls(tls) => match tls.drive(buffers, runtime) {
+            Self::Tls(tls) => match tls.drive(buffers, runtime, drive, permit) {
                 TlsProxyPoll::Bypass {
                     dst,
                     bytes,
@@ -743,7 +881,7 @@ where
                                 plain.close();
                             }
                             *self = Self::Plain(plain);
-                            self.drive(buffers, runtime)
+                            self.drive(buffers, runtime, drive, permit)
                         }
                         Err(error) => {
                             TcpProxyPoll::Event(TcpProxyEvent::error(proxy_id, error.to_string()).with_context(context))
@@ -752,8 +890,7 @@ where
                 }
                 TlsProxyPoll::Bytes(bytes) => TcpProxyPoll::Bytes(bytes),
                 TlsProxyPoll::Event(event) => TcpProxyPoll::Event(event.with_context(tls.error_context())),
-                TlsProxyPoll::Progress => TcpProxyPoll::Progress,
-                TlsProxyPoll::Blocked => TcpProxyPoll::Blocked,
+                TlsProxyPoll::Pending => TcpProxyPoll::Pending,
             },
         }
     }

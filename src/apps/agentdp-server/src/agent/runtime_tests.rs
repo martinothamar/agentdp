@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,10 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agentdp_core::Context;
 use agentdp_core::agent::{
     AgentBaseKey, AgentDocument, AgentEvent, AgentInstanceBootstrapState, AgentInstanceBootstrapStepStatus,
-    AgentInstanceDocument, AgentInstanceEvent, AgentInstanceId, AgentInstancePhase, AgentInstanceTarget,
-    AgentStatusPhase, BackendState, BootstrapEvent, InstanceName, NetworkAllowState, NetworkIpv6State,
-    NetworkModeState, NetworkState, ProcessStatus, QemuImageState, QemuInstanceNetworkState, QemuMediatedCaState,
-    QemuState, assign_port_mappings,
+    AgentInstanceDocument, AgentInstanceEvent, AgentInstanceEventEnvelope, AgentInstanceEventSource, AgentInstanceId,
+    AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind, AgentInstancePhase, AgentInstanceTarget,
+    AgentStatusPhase, BackendState, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State,
+    NetworkModeState, NetworkState, PortProtocolState, ProcessStatus, QemuImageState, QemuInstanceNetworkState,
+    QemuMediatedCaState, QemuState, assign_port_mappings,
 };
 use agentdp_core::doctor::DoctorReport;
 use agentdp_core::manifest::{AgentManifest, AgentPhase, GuestPort, NetworkProtocol};
@@ -19,7 +21,8 @@ use agentdp_core::provisioning::secrets::SecretBindings;
 use agentdp_ds::local::{oneshot, spsc};
 use agentdp_platform::ssh::{CommandOutput, OutputSink};
 use agentdp_protocol::client_server::{
-    AgentInstanceExecParams, AgentInstanceExecResult, AgentInstanceLogsParams, HostCommandResult, LogFile,
+    AgentInstanceExecParams, AgentInstanceExecResult, AgentInstanceLogsParams, AgentInstanceLogsResult,
+    HostCommandResult, LogFile, LogFilter, NetworkLogKind,
 };
 use agentdp_protocol::server_guest::{BootstrapLifecycleStatus, BootstrapStepPhase, BootstrapStepStatus};
 
@@ -263,11 +266,133 @@ async fn foreground_exec_status_and_logs_share_the_agent_runtime_queue() {
     assert_eq!(result.exit_status, 0);
     assert_eq!(result.stdout, "executed: 'echo hello'");
 
-    let logs = logs(&agent, id).await;
+    let logs = logs(&agent, id, 100).await;
     assert!(
         logs.iter().any(|line| line.contains("session_finished")),
         "event log should include session completion: {logs:?}"
     );
+}
+
+#[tokio::test(flavor = "local")]
+async fn instance_logs_tail_reads_only_requested_lines() {
+    let manifest = manifest_with(1);
+    let backend: backend::BackendRef = Rc::new(FakeBackend::default());
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name.clone(),
+        layout.clone(),
+        backend,
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_ready(&mut stream, 1).await;
+
+    let path = layout.instance(&agent_name, AgentInstanceId::new(0)).instance_events();
+    tokio::fs::create_dir_all(path.parent().expect("event log parent"))
+        .await
+        .expect("create event log directory");
+    let mut contents = String::new();
+    for index in 0..10_000 {
+        writeln!(contents, "line-{index}").expect("write test log line");
+    }
+    tokio::fs::write(&path, contents).await.expect("write event log");
+
+    let tail = logs(&agent, AgentInstanceId::new(0), 3).await;
+    assert_eq!(tail, ["line-9997", "line-9998", "line-9999"]);
+}
+
+#[tokio::test(flavor = "local")]
+async fn network_logs_are_filtered_before_tail_lines_are_applied() {
+    let manifest = manifest_with(1);
+    let backend: backend::BackendRef = Rc::new(FakeBackend::default());
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name.clone(),
+        layout.clone(),
+        backend,
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_ready(&mut stream, 1).await;
+
+    let path = layout.instance(&agent_name, AgentInstanceId::new(0)).instance_events();
+    tokio::fs::create_dir_all(path.parent().expect("event log parent"))
+        .await
+        .expect("create event log directory");
+    let mut contents = String::new();
+    push_diagnostic_log_lines(&mut contents, 0..2_000);
+    contents.push_str(&network_event_log_line(
+        10_001,
+        AgentInstanceNetworkEventKind::LifecycleStateChanged {
+            state: "connected".to_owned(),
+        },
+    ));
+    push_diagnostic_log_lines(&mut contents, 2_000..4_000);
+    contents.push_str(&network_event_log_line(
+        10_002,
+        AgentInstanceNetworkEventKind::EgressError {
+            protocol: "tcp".to_owned(),
+            proxy: Some(7),
+            destination: None,
+            upstream: None,
+            authority: None,
+            route: None,
+            phase: Some("write".to_owned()),
+            message: "synthetic failure".to_owned(),
+        },
+    ));
+    push_diagnostic_log_lines(&mut contents, 4_000..6_000);
+    contents.push_str(&network_event_log_line(
+        10_003,
+        AgentInstanceNetworkEventKind::HostPortBound {
+            name: "code_server".to_owned(),
+            protocol: PortProtocolState::Tcp,
+            guest: 4090,
+            host: 4090,
+        },
+    ));
+    push_diagnostic_log_lines(&mut contents, 6_000..8_000);
+    tokio::fs::write(&path, contents).await.expect("write event log");
+
+    let network = log_result(
+        &agent,
+        AgentInstanceId::new(0),
+        2,
+        Some(LogFilter::Network {
+            errors: false,
+            event_kind: None,
+        }),
+    )
+    .await;
+    assert_eq!(network_event_sequences(&network.contents), [10_002, 10_003]);
+
+    let errors = log_result(
+        &agent,
+        AgentInstanceId::new(0),
+        1,
+        Some(LogFilter::Network {
+            errors: true,
+            event_kind: None,
+        }),
+    )
+    .await;
+    assert_eq!(network_event_sequences(&errors.contents), [10_002]);
+
+    let host_ports = log_result(
+        &agent,
+        AgentInstanceId::new(0),
+        1,
+        Some(LogFilter::Network {
+            errors: false,
+            event_kind: Some(NetworkLogKind::HostPort),
+        }),
+    )
+    .await;
+    assert_eq!(network_event_sequences(&host_ports.contents), [10_003]);
 }
 
 #[tokio::test(flavor = "local")]
@@ -708,7 +833,21 @@ async fn exec(
     receive.await.expect("exec response")
 }
 
-async fn logs(agent: &Agent, id: AgentInstanceId) -> Vec<String> {
+async fn logs(agent: &Agent, id: AgentInstanceId, lines: usize) -> Vec<String> {
+    log_result(agent, id, lines, None)
+        .await
+        .contents
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn log_result(
+    agent: &Agent,
+    id: AgentInstanceId,
+    lines: usize,
+    filter: Option<LogFilter>,
+) -> AgentInstanceLogsResult {
     let (respond, receive) = oneshot::channel();
     agent
         .send(AgentCommand::InstanceLogs {
@@ -717,19 +856,13 @@ async fn logs(agent: &Agent, id: AgentInstanceId) -> Vec<String> {
                 agent: agent.agent().to_string(),
                 instance_id: id.as_u32(),
                 file: LogFile::Events,
-                lines: 100,
+                lines,
+                filter,
             },
             respond,
         })
         .expect("agent accepts logs command");
-    receive
-        .await
-        .expect("logs response")
-        .expect("logs succeed")
-        .contents
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    receive.await.expect("logs response").expect("logs succeed")
 }
 
 fn manifest_with(replicas: u16) -> AgentManifest {
@@ -737,6 +870,54 @@ fn manifest_with(replicas: u16) -> AgentManifest {
     manifest.spec.replicas = replicas;
     manifest.spec.phase = AgentPhase::Running;
     manifest
+}
+
+fn push_diagnostic_log_lines(contents: &mut String, range: std::ops::Range<u64>) {
+    for sequence in range {
+        let line = AgentInstanceEventEnvelope {
+            sequence,
+            timestamp: "2026-01-01T00:00:00Z".to_owned(),
+            generation: 1,
+            work_epoch: None,
+            source: AgentInstanceEventSource::Instance,
+            event: AgentInstanceEvent::Diagnostic {
+                level: EventLevel::Info,
+                message: format!("diagnostic-{sequence}"),
+            },
+        };
+        contents.push_str(&serde_json::to_string(&line).expect("serialize diagnostic event"));
+        contents.push('\n');
+    }
+}
+
+fn network_event_log_line(sequence: u64, event: AgentInstanceNetworkEventKind) -> String {
+    let line = AgentInstanceEventEnvelope {
+        sequence,
+        timestamp: "2026-01-01T00:00:00Z".to_owned(),
+        generation: 1,
+        work_epoch: None,
+        source: AgentInstanceEventSource::Network,
+        event: AgentInstanceEvent::NetworkEvent(AgentInstanceNetworkEvent {
+            sequence,
+            unix_millis: sequence,
+            dropped_events_before: 0,
+            event,
+        }),
+    };
+    format!("{}\n", serde_json::to_string(&line).expect("serialize network event"))
+}
+
+fn network_event_sequences(contents: &str) -> Vec<u64> {
+    contents
+        .lines()
+        .map(|line| serde_json::from_str::<AgentInstanceEventEnvelope>(line).expect("parse network event"))
+        .map(|envelope| {
+            let AgentInstanceEvent::NetworkEvent(event) = envelope.event else {
+                panic!("expected network event");
+            };
+            event.sequence
+        })
+        .collect()
 }
 
 fn manifest_with_code_server_host(replicas: u16, host: u16) -> AgentManifest {

@@ -2,7 +2,8 @@ use std::net::Ipv4Addr;
 
 use crate::buffers::WriteQueue;
 use crate::buffers::{BufferPool, ByteBuf};
-use crate::network::{HostConnectionId, IngressTcpWrite};
+use crate::drive::{DriveRunnable, DriveSmoltcpTcpRecv, DriveTurn};
+use crate::network::{HostConnectionId, IngressTcpOutput};
 use agentdp_ds::fixed_table::FixedTable;
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -19,6 +20,7 @@ pub(crate) struct TcpConnections {
 struct TcpConnection {
     handle: SocketHandle,
     pending_writes: WriteQueue,
+    guest_to_host_closed: bool,
 }
 
 impl TcpConnections {
@@ -54,6 +56,7 @@ impl TcpConnections {
                 TcpConnection {
                     handle,
                     pending_writes: WriteQueue::new(),
+                    guest_to_host_closed: false,
                 },
             )
             .is_ok()
@@ -64,14 +67,13 @@ impl TcpConnections {
         connection: HostConnectionId,
         bytes: ByteBuf,
         sockets: &mut SocketSet<'static>,
+        drive: &mut DriveTurn<'_>,
     ) {
         let Some(entry) = self.by_connection.get_mut(&connection) else {
             return;
         };
         entry.pending_writes.push(bytes);
-        entry
-            .pending_writes
-            .flush_to_guest_socket(sockets.get_mut::<tcp::Socket>(entry.handle));
+        drive.send_smoltcp_tcp_queue(&mut entry.pending_writes, sockets.get_mut::<tcp::Socket>(entry.handle));
     }
 
     pub(crate) fn close(&mut self, connection: HostConnectionId, sockets: &mut SocketSet<'static>) {
@@ -85,38 +87,67 @@ impl TcpConnections {
     pub(crate) fn relay_guest_bytes(
         &mut self,
         sockets: &mut SocketSet<'static>,
-        ingress_tcp_writes: &mut Vec<IngressTcpWrite>,
-        ingress_tcp_closes: &mut Vec<HostConnectionId>,
+        outputs: &mut Vec<IngressTcpOutput>,
         buffers: &BufferPool,
+        drive: &mut DriveTurn<'_>,
     ) {
         self.closed_scratch.clear();
         for (connection, entry) in self.by_connection.iter_mut() {
             let socket = sockets.get_mut::<tcp::Socket>(entry.handle);
-            let _flushed = entry.pending_writes.flush_to_guest_socket(socket);
-            while socket.can_recv() {
-                let Ok(mut bytes) = buffers.try_tcp_byte() else {
+            drive.send_smoltcp_tcp_queue(&mut entry.pending_writes, socket);
+            loop {
+                if outputs.len() >= outputs.capacity() {
+                    drive.wait_for_local_buffer_capacity();
                     break;
-                };
-                bytes.resize_zeroed(buffers.tcp_byte_capacity());
-                match socket.recv_slice(bytes.as_mut_slice()) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        bytes.truncate(n);
-                        ingress_tcp_writes.push(IngressTcpWrite { connection, bytes });
-                    }
-                    Err(_error) => break,
                 }
+                match drive.recv_smoltcp_tcp(buffers, socket, DriveRunnable::READ_GUEST) {
+                    DriveSmoltcpTcpRecv::Bytes(bytes) => {
+                        let _queued = drive.push_component_output_after_progress(
+                            outputs,
+                            IngressTcpOutput::Write { connection, bytes },
+                        );
+                    }
+                    DriveSmoltcpTcpRecv::Empty | DriveSmoltcpTcpRecv::Blocked => break,
+                }
+            }
+            if guest_send_half_closed(socket) && !entry.guest_to_host_closed {
+                if outputs.len() >= outputs.capacity() {
+                    drive.wait_for_local_buffer_capacity();
+                    break;
+                }
+                entry.guest_to_host_closed = true;
+                let _queued =
+                    drive.push_component_output_after_progress(outputs, IngressTcpOutput::FinishWrite { connection });
             }
             if !socket.is_open() {
                 self.closed_scratch.push((connection, entry.handle));
             }
         }
         for &(connection, handle) in &self.closed_scratch {
+            if drive
+                .push_component_output(outputs, IngressTcpOutput::Close { connection })
+                .is_err()
+            {
+                break;
+            }
             self.by_connection.remove(&connection);
             sockets.remove(handle);
-            ingress_tcp_closes.push(connection);
         }
         self.closed_scratch.clear();
+    }
+
+    pub(crate) fn guest_send_blocked_connections(
+        &self,
+        sockets: &SocketSet<'static>,
+        output: &mut Vec<HostConnectionId>,
+    ) {
+        output.clear();
+        for (connection, entry) in self.by_connection.iter() {
+            let socket = sockets.get::<tcp::Socket>(entry.handle);
+            if !entry.pending_writes.is_empty() || !socket.can_send() {
+                output.push(connection);
+            }
+        }
     }
 }
 
@@ -135,6 +166,18 @@ fn tcp_socket(rx: tcp::SocketBuffer<'static>, tx: tcp::SocketBuffer<'static>) ->
     socket.set_ack_delay(None);
     socket.set_nagle_enabled(false);
     socket
+}
+
+fn guest_send_half_closed(socket: &tcp::Socket<'_>) -> bool {
+    !socket.can_recv()
+        && matches!(
+            socket.state(),
+            tcp::State::CloseWait
+                | tcp::State::Closing
+                | tcp::State::LastAck
+                | tcp::State::TimeWait
+                | tcp::State::Closed
+        )
 }
 
 #[cfg(test)]

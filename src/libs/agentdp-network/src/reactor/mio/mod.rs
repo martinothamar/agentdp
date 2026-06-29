@@ -2,11 +2,12 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 
 use ::mio::{Events, Interest, Poll, Registry, Token};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::guest::{GuestIoSource, TransportError};
 use crate::reactor::ReactorItemId;
-use crate::reactor::{ReactorBackend, ReactorInterest, ReactorWake};
+use crate::reactor::{ReactorBackend, ReactorInterest, ReactorRegistrationToken, ReactorWake};
 use crate::reactor::{
     ReactorTcpListener as ReactorTcpListenerTrait, ReactorTcpStream as ReactorTcpStreamTrait,
     ReactorUdpSocket as ReactorUdpSocketTrait,
@@ -37,6 +38,7 @@ pub(crate) struct MioReactor {
     next_backend_token: usize,
     by_backend_token: FixedTable<Token, ReactorItemId>,
     by_item: FixedTable<ReactorItemId, Token>,
+    suspended_items: RefCell<Vec<ReactorItemId>>,
     guest_sources: GuestSources,
 }
 
@@ -222,6 +224,7 @@ impl MioReactor {
             next_backend_token: 1,
             by_backend_token: FixedTable::with_capacity(event_capacity),
             by_item: FixedTable::with_capacity(event_capacity),
+            suspended_items: RefCell::new(Vec::with_capacity(event_capacity)),
             guest_sources: GuestSources::new(),
         })
     }
@@ -236,10 +239,16 @@ impl MioReactor {
         &mut self,
         source: &mut S,
         item: ReactorItemId,
-        interest: Interest,
+        interest: ReactorInterest,
     ) -> std::io::Result<()> {
         self.ensure_unregistered(item)?;
         let token = self.next_token();
+        let Some(interest) = interest.mio() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "initial reactor registration cannot be disabled",
+            ));
+        };
         self.poll.registry().register(source, token, interest)?;
         if let Err(error) = self.remember_registration(token, item) {
             let _ = self.poll.registry().deregister(source);
@@ -252,10 +261,22 @@ impl MioReactor {
         &self,
         source: &mut S,
         item: ReactorItemId,
-        interest: Interest,
+        interest: ReactorInterest,
     ) -> std::io::Result<()> {
         let token = self.token_for_item(item)?;
-        self.poll.registry().reregister(source, token, interest)
+        if let Some(interest) = interest.mio() {
+            if self.unsuspend_item(item) {
+                self.poll.registry().register(source, token, interest)
+            } else {
+                self.poll.registry().reregister(source, token, interest)
+            }
+        } else {
+            if !self.is_suspended(item) {
+                self.poll.registry().deregister(source)?;
+                self.suspended_items.borrow_mut().push(item);
+            }
+            Ok(())
+        }
     }
 
     fn deregister_source<S: ::mio::event::Source + ?Sized>(
@@ -267,7 +288,11 @@ impl MioReactor {
         if let Some(token) = token {
             self.by_backend_token.remove(&token);
         }
-        self.poll.registry().deregister(source)
+        if self.unsuspend_item(item) {
+            Ok(())
+        } else {
+            self.poll.registry().deregister(source)
+        }
     }
 
     fn register_guest_source_with_interest(
@@ -314,67 +339,93 @@ impl ReactorBackend for MioReactor {
 
     fn register_tcp_listener(
         &mut self,
+        _registration: ReactorRegistrationToken,
         source: &mut MioTcpListener,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> std::io::Result<()> {
-        self.register_source(source, item, interest.into())
+        self.register_source(source, item, interest)
     }
 
     fn register_tcp_stream(
         &mut self,
+        _registration: ReactorRegistrationToken,
         source: &mut MioTcpStream,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> std::io::Result<()> {
-        self.register_source(source, item, interest.into())
+        self.register_source(source, item, interest)
     }
 
     fn register_udp_socket(
         &mut self,
+        _registration: ReactorRegistrationToken,
         source: &mut MioUdpSocket,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> std::io::Result<()> {
-        self.register_source(source, item, interest.into())
+        self.register_source(source, item, interest)
     }
 
     fn reregister_tcp_stream(
         &self,
+        _registration: ReactorRegistrationToken,
         source: &mut MioTcpStream,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> std::io::Result<()> {
-        self.reregister_source(source, item, interest.into())
+        self.reregister_source(source, item, interest)
     }
 
     fn reregister_udp_socket(
         &self,
+        _registration: ReactorRegistrationToken,
         source: &mut MioUdpSocket,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> std::io::Result<()> {
-        self.reregister_source(source, item, interest.into())
+        self.reregister_source(source, item, interest)
     }
 
-    fn deregister_tcp_listener(&mut self, source: &mut MioTcpListener, item: ReactorItemId) -> std::io::Result<()> {
+    fn deregister_tcp_listener(
+        &mut self,
+        _registration: ReactorRegistrationToken,
+        source: &mut MioTcpListener,
+        item: ReactorItemId,
+    ) -> std::io::Result<()> {
         self.deregister_source(source, item)
     }
 
-    fn deregister_tcp_stream(&mut self, source: &mut MioTcpStream, item: ReactorItemId) -> std::io::Result<()> {
+    fn deregister_tcp_stream(
+        &mut self,
+        _registration: ReactorRegistrationToken,
+        source: &mut MioTcpStream,
+        item: ReactorItemId,
+    ) -> std::io::Result<()> {
         self.deregister_source(source, item)
     }
 
-    fn deregister_udp_socket(&mut self, source: &mut MioUdpSocket, item: ReactorItemId) -> std::io::Result<()> {
+    fn deregister_udp_socket(
+        &mut self,
+        _registration: ReactorRegistrationToken,
+        source: &mut MioUdpSocket,
+        item: ReactorItemId,
+    ) -> std::io::Result<()> {
         self.deregister_source(source, item)
     }
 
-    fn register_guest_source(&mut self, source: GuestIoSource<'_>, item: ReactorItemId) -> Result<(), TransportError> {
+    fn register_guest_source(
+        &mut self,
+        _registration: crate::reactor::ReactorRegistrationToken,
+        source: GuestIoSource<'_>,
+        item: ReactorItemId,
+    ) -> Result<(), TransportError> {
         self.register_guest_source_with_interest(source, item, Interest::READABLE)
     }
 
     fn reregister_guest_source(
         &self,
+        _registration: crate::reactor::ReactorRegistrationToken,
         source: GuestIoSource<'_>,
         item: ReactorItemId,
         writable: bool,
@@ -389,6 +440,7 @@ impl ReactorBackend for MioReactor {
 
     fn deregister_guest_source(
         &mut self,
+        _registration: crate::reactor::ReactorRegistrationToken,
         source: GuestIoSource<'_>,
         item: ReactorItemId,
     ) -> Result<(), TransportError> {
@@ -404,15 +456,17 @@ impl ReactorBackend for MioReactor {
         output: &mut Vec<ReactorReady>,
         timeout: Option<std::time::Duration>,
     ) -> std::io::Result<()> {
-        let Self { poll, events, .. } = self;
-        events.clear();
+        self.events.clear();
         output.clear();
-        poll.poll(events, timeout)?;
-        output.extend(events.iter().filter_map(|event| {
+        self.poll.poll(&mut self.events, timeout)?;
+        output.extend(self.events.iter().filter_map(|event| {
             if event.token() == WAKE_TOKEN {
                 Some(ReactorReady::Wake)
             } else {
                 let item = self.by_backend_token.get(&event.token()).copied()?;
+                if self.is_suspended(item) {
+                    return None;
+                }
                 Some(ReactorReady::Io {
                     item,
                     readable: event.is_readable(),
@@ -421,15 +475,6 @@ impl ReactorBackend for MioReactor {
             }
         }));
         Ok(())
-    }
-}
-
-impl From<ReactorInterest> for Interest {
-    fn from(interest: ReactorInterest) -> Self {
-        match interest {
-            ReactorInterest::Readable => Self::READABLE,
-            ReactorInterest::ReadWrite => Self::READABLE | Self::WRITABLE,
-        }
     }
 }
 
@@ -447,6 +492,19 @@ impl MioReactor {
                 format!("reactor item {item:?} is not registered"),
             )
         })
+    }
+
+    fn is_suspended(&self, item: ReactorItemId) -> bool {
+        self.suspended_items.borrow().contains(&item)
+    }
+
+    fn unsuspend_item(&self, item: ReactorItemId) -> bool {
+        let mut suspended = self.suspended_items.borrow_mut();
+        let Some(index) = suspended.iter().position(|suspended| *suspended == item) else {
+            return false;
+        };
+        suspended.swap_remove(index);
+        true
     }
 
     fn ensure_unregistered(&self, item: ReactorItemId) -> std::io::Result<()> {
@@ -468,6 +526,17 @@ impl MioReactor {
             return Err(reactor_capacity_error());
         }
         Ok(())
+    }
+}
+
+impl ReactorInterest {
+    fn mio(self) -> Option<Interest> {
+        match self {
+            Self::Disabled => None,
+            Self::Readable => Some(Interest::READABLE),
+            Self::Writable => Some(Interest::WRITABLE),
+            Self::ReadWrite => Some(Interest::READABLE | Interest::WRITABLE),
+        }
     }
 }
 

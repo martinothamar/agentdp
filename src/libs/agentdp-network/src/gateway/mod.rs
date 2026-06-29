@@ -12,17 +12,18 @@ use packet::{TcpSyn, UdpDatagram, resolve_gateway_destination, udp_frame, udp_re
 use crate::application::{self, ApplicationProtocol};
 use crate::buffers::{BufferPool, ByteBuf, FrameBuf};
 use crate::clock::NetworkClock;
+use crate::drive::DriveTurn;
 use crate::egress::tcp::TcpProxies;
 use crate::ingress::TcpConnections;
 use crate::ingress::UdpPeers;
 use crate::network::{
-    ApplicationPolicy, BlockReason, EgressDecision, EgressUdpSend, HostConnectionId, IngressTcpWrite, IngressUdpSend,
+    ApplicationPolicy, BlockReason, EgressDecision, EgressUdpSend, HostConnectionId, IngressTcpOutput, IngressUdpSend,
     InstanceMacAddresses, InstanceNetworkConfig, TcpEgressPolicy, TcpEgressRoute, UdpProxyKey,
 };
 use crate::policy::{Authority, NetworkPolicy};
 use crate::reactor::ReactorBackend;
 use crate::tls::TlsIntercept;
-use smoltcp::iface::{Config as SmoltcpConfig, Interface, SocketSet};
+use smoltcp::iface::{Config as SmoltcpConfig, Interface, PollResult, SocketSet};
 use smoltcp::wire::IpAddress;
 use smoltcp::wire::{HardwareAddress, IpCidr};
 
@@ -34,6 +35,56 @@ pub(crate) struct Gateway<C: NetworkClock> {
     dns: DnsAttribution,
     clock: C,
     config: GatewayConfig,
+}
+
+pub(crate) struct GatewayOutputs<'a> {
+    egress_udp_sends: &'a mut Vec<EgressUdpSend>,
+    ingress_udp_sends: &'a mut Vec<IngressUdpSend>,
+    guest_frames: &'a mut Vec<FrameBuf>,
+}
+
+impl<'a> GatewayOutputs<'a> {
+    pub(crate) const fn new(
+        egress_udp_sends: &'a mut Vec<EgressUdpSend>,
+        ingress_udp_sends: &'a mut Vec<IngressUdpSend>,
+        guest_frames: &'a mut Vec<FrameBuf>,
+    ) -> Self {
+        Self {
+            egress_udp_sends,
+            ingress_udp_sends,
+            guest_frames,
+        }
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "gateway returns owned pooled outputs on capacity exhaustion without boxing or copying"
+    )]
+    fn push_egress_udp(&mut self, send: EgressUdpSend, drive: &mut DriveTurn<'_>) -> Result<(), EgressUdpSend> {
+        drive.push_component_output(self.egress_udp_sends, send)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "gateway returns owned pooled outputs on capacity exhaustion without boxing or copying"
+    )]
+    fn push_ingress_udp(&mut self, send: IngressUdpSend, drive: &mut DriveTurn<'_>) -> Result<(), IngressUdpSend> {
+        drive.push_component_output(self.ingress_udp_sends, send)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UdpFrameWrite {
+    Queued,
+    Blocked,
+    Dropped,
+}
+
+#[derive(Debug)]
+pub(crate) enum GuestFrameIngest {
+    Queued,
+    Blocked(FrameBuf),
+    Dropped,
 }
 
 impl<C: NetworkClock> Gateway<C> {
@@ -87,13 +138,57 @@ impl<C: NetworkClock> Gateway<C> {
     }
 
     /// Advances smoltcp timers/socket state and returns frames produced by the gateway.
-    pub(crate) fn poll(&mut self, guest_frames: &mut Vec<FrameBuf>) {
+    pub(crate) fn poll(&mut self, guest_frames: &mut Vec<FrameBuf>, drive: &mut DriveTurn<'_>) {
+        self.drain_transmitted_frames(guest_frames, drive);
+        if !self.has_poll_work() {
+            return;
+        }
         let now = self.clock.smoltcp_now();
-        while !matches!(
-            self.iface.poll(now, &mut self.device, &mut self.sockets),
-            smoltcp::iface::PollResult::None
-        ) {}
-        guest_frames.extend(self.device.take_transmitted_frames());
+        let poll_delay_before_poll = self.iface.poll_delay(now, &self.sockets).map(Duration::from);
+        let received_frames_before_poll = self.device.received_frame_count();
+        let transmitted_frames_before_poll = self.device.transmitted_frame_count();
+        let Some(poll_result) = drive.poll_gateway(|| {
+            self.device.allow_one_receive();
+            self.iface.poll(now, &mut self.device, &mut self.sockets)
+        }) else {
+            return;
+        };
+        if poll_result == PollResult::SocketStateChanged
+            || self.iface.poll_delay(now, &self.sockets).map(Duration::from) != poll_delay_before_poll
+            || self.device.received_frame_count() < received_frames_before_poll
+            || self.device.transmitted_frame_count() > transmitted_frames_before_poll
+        {
+            drive.gateway_poll_progress();
+        }
+        self.drain_transmitted_frames(guest_frames, drive);
+    }
+
+    fn has_poll_work(&mut self) -> bool {
+        if self.device.has_received_frames() || self.device.has_transmitted_frames() {
+            return true;
+        }
+        self.iface
+            .poll_delay(self.clock.smoltcp_now(), &self.sockets)
+            .is_some_and(|delay| Duration::from(delay).is_zero())
+    }
+
+    fn drain_transmitted_frames(&mut self, guest_frames: &mut Vec<FrameBuf>, drive: &mut DriveTurn<'_>) {
+        let mut frame_count = 0_usize;
+        while let Some(frame_len) = self.device.next_transmitted_frame_len() {
+            let reservation = match drive.enqueue_guest_frame(guest_frames.len(), guest_frames.capacity(), frame_len) {
+                crate::drive::DriveGuestFrameEnqueue::Reserved(reservation) => reservation,
+                crate::drive::DriveGuestFrameEnqueue::Blocked => break,
+            };
+            let Some(frame) = self.device.pop_transmitted_frame() else {
+                break;
+            };
+            reservation.push_vec(guest_frames, frame);
+            frame_count = frame_count.saturating_add(1);
+        }
+        if self.device.has_transmitted_frames() {
+            drive.wait_for_guest_send_capacity();
+        }
+        drive.gateway_frames_transmitted(frame_count);
     }
 
     pub(crate) const fn tcp_sockets(&self) -> &SocketSet<'static> {
@@ -104,15 +199,19 @@ impl<C: NetworkClock> Gateway<C> {
         &mut self.sockets
     }
 
+    pub(crate) fn ingress_tcp_guest_send_blocked(&self, tcp: &TcpConnections, output: &mut Vec<HostConnectionId>) {
+        tcp.guest_send_blocked_connections(&self.sockets, output);
+    }
+
     pub(crate) fn relay_ingress_tcp_guest_bytes(
         &mut self,
         tcp: &mut TcpConnections,
-        ingress_tcp_writes: &mut Vec<IngressTcpWrite>,
-        ingress_tcp_closes: &mut Vec<HostConnectionId>,
+        outputs: &mut Vec<IngressTcpOutput>,
         guest_frames: &mut Vec<FrameBuf>,
+        drive: &mut DriveTurn<'_>,
     ) {
-        tcp.relay_guest_bytes(&mut self.sockets, ingress_tcp_writes, ingress_tcp_closes, &self.buffers);
-        self.poll(guest_frames);
+        tcp.relay_guest_bytes(&mut self.sockets, outputs, &self.buffers, drive);
+        self.poll(guest_frames, drive);
     }
 
     pub(crate) fn tcp_egress_route(&mut self, dst: SocketAddr) -> (SocketAddr, TcpEgressRoute) {
@@ -126,30 +225,51 @@ impl<C: NetworkClock> Gateway<C> {
         tcp: &mut TcpProxies<R>,
         udp: &UdpPeers,
         frame: FrameBuf,
-        egress_udp_sends: &mut Vec<EgressUdpSend>,
-        ingress_udp_sends: &mut Vec<IngressUdpSend>,
-        guest_frames: &mut Vec<FrameBuf>,
-    ) {
+        outputs: &mut GatewayOutputs<'_>,
+        drive: &mut DriveTurn<'_>,
+    ) -> GuestFrameIngest {
         if let Some(datagram) = UdpDatagram::from_frame(frame.as_slice(), &self.buffers) {
             match udp.host_port_response(datagram.dst, IpAddr::V4(self.config.gateway), datagram.payload) {
-                Ok(send) => ingress_udp_sends.push(send),
+                Ok(send) => {
+                    if outputs.push_ingress_udp(send, drive).is_err() {
+                        return GuestFrameIngest::Blocked(frame);
+                    }
+                }
                 Err(payload) => {
-                    self.handle_guest_udp(datagram.src, datagram.dst, payload.as_slice(), egress_udp_sends);
+                    if !self.handle_guest_udp(datagram.src, datagram.dst, payload.as_slice(), outputs, drive) {
+                        return GuestFrameIngest::Blocked(frame);
+                    }
                 }
             }
-            return;
+            return GuestFrameIngest::Queued;
         }
         if let Some(syn) = TcpSyn::from_frame(frame.as_slice())
             && self.allows_tcp_syn(&syn)
             && !tcp.has_connection(syn.src, syn.dst)
-            && !tcp.listen(syn.src, syn.dst, &mut self.sockets)
         {
-            return;
+            if !self.device.can_receive_frame() {
+                self.poll(outputs.guest_frames, drive);
+            }
+            if !self.device.can_receive_frame() {
+                drive.wait_for_local_buffer_capacity();
+                return GuestFrameIngest::Blocked(frame);
+            }
+            if !tcp.listen(syn.src, syn.dst, &mut self.sockets) {
+                return GuestFrameIngest::Dropped;
+            }
         }
 
-        if self.device.receive_frame(frame) {
-            self.poll(guest_frames);
+        if !self.device.can_receive_frame() {
+            self.poll(outputs.guest_frames, drive);
         }
+        if !self.device.can_receive_frame() {
+            drive.wait_for_local_buffer_capacity();
+            return GuestFrameIngest::Blocked(frame);
+        }
+        let queued = self.device.receive_frame(frame);
+        debug_assert!(queued);
+        self.poll(outputs.guest_frames, drive);
+        GuestFrameIngest::Queued
     }
 
     pub(crate) fn write_udp_response(
@@ -158,14 +278,20 @@ impl<C: NetworkClock> Gateway<C> {
         bytes: &ByteBuf,
         is_dns: bool,
         guest_frames: &mut Vec<FrameBuf>,
-    ) {
+        drive: &mut DriveTurn<'_>,
+    ) -> UdpFrameWrite {
+        let Some(frame) = udp_response_frame(proxy, bytes.as_slice(), self.config.mac, &self.buffers) else {
+            drive.wait_for_local_buffer_capacity();
+            return UdpFrameWrite::Blocked;
+        };
+        if drive.push_guest_frame(guest_frames, frame).is_err() {
+            return UdpFrameWrite::Blocked;
+        }
         if is_dns {
             self.dns.record_response(bytes.as_slice(), &self.clock);
         }
-        if let Some(frame) = udp_response_frame(proxy, bytes.as_slice(), self.config.mac, &self.buffers) {
-            guest_frames.push(frame);
-        }
-        self.poll(guest_frames);
+        self.poll(guest_frames, drive);
+        UdpFrameWrite::Queued
     }
 
     pub(crate) fn write_ingress_tcp(
@@ -174,9 +300,10 @@ impl<C: NetworkClock> Gateway<C> {
         connection: HostConnectionId,
         bytes: ByteBuf,
         guest_frames: &mut Vec<FrameBuf>,
+        drive: &mut DriveTurn<'_>,
     ) {
-        tcp.write_peer_bytes(connection, bytes, &mut self.sockets);
-        self.poll(guest_frames);
+        tcp.write_peer_bytes(connection, bytes, &mut self.sockets, drive);
+        self.poll(guest_frames, drive);
     }
 
     pub(crate) fn accept_ingress_tcp(
@@ -184,9 +311,10 @@ impl<C: NetworkClock> Gateway<C> {
         tcp: &mut TcpConnections,
         port: u16,
         connection: HostConnectionId,
-        ingress_tcp_closes: &mut Vec<HostConnectionId>,
+        ingress_tcp_outputs: &mut Vec<IngressTcpOutput>,
         guest_frames: &mut Vec<FrameBuf>,
-    ) {
+        drive: &mut DriveTurn<'_>,
+    ) -> bool {
         if !tcp.connect(
             connection,
             self.config.guest,
@@ -201,10 +329,12 @@ impl<C: NetworkClock> Gateway<C> {
                 Some(self.sockets.add(socket))
             },
         ) {
-            ingress_tcp_closes.push(connection);
-            return;
+            return drive
+                .push_component_output(ingress_tcp_outputs, IngressTcpOutput::Close { connection })
+                .is_ok();
         }
-        self.poll(guest_frames);
+        self.poll(guest_frames, drive);
+        true
     }
 
     pub(crate) fn close_ingress_tcp(
@@ -212,9 +342,10 @@ impl<C: NetworkClock> Gateway<C> {
         tcp: &mut TcpConnections,
         connection: HostConnectionId,
         guest_frames: &mut Vec<FrameBuf>,
+        drive: &mut DriveTurn<'_>,
     ) {
         tcp.close(connection, &mut self.sockets);
-        self.poll(guest_frames);
+        self.poll(guest_frames, drive);
     }
 
     pub(crate) fn ingest_ingress_udp_datagram(
@@ -224,20 +355,32 @@ impl<C: NetworkClock> Gateway<C> {
         peer: SocketAddr,
         bytes: &ByteBuf,
         guest_frames: &mut Vec<FrameBuf>,
-    ) {
-        if udp.open_host_port(port, peer)
-            && let Some(frame) = udp_frame(
-                SocketAddr::new(IpAddr::V4(self.config.gateway), port),
-                SocketAddr::new(IpAddr::V4(self.config.guest), port),
-                bytes.as_slice(),
-                self.config.mac.gateway,
-                self.config.mac.guest,
-                &self.buffers,
-            )
-        {
-            guest_frames.push(frame);
+        drive: &mut DriveTurn<'_>,
+    ) -> UdpFrameWrite {
+        if !udp.can_open_host_port(port) {
+            return UdpFrameWrite::Dropped;
         }
-        self.poll(guest_frames);
+        let Some(frame) = udp_frame(
+            SocketAddr::new(IpAddr::V4(self.config.gateway), port),
+            SocketAddr::new(IpAddr::V4(self.config.guest), port),
+            bytes.as_slice(),
+            self.config.mac.gateway,
+            self.config.mac.guest,
+            &self.buffers,
+        ) else {
+            drive.wait_for_local_buffer_capacity();
+            return UdpFrameWrite::Blocked;
+        };
+        if drive.push_guest_frame(guest_frames, frame).is_err() {
+            return UdpFrameWrite::Blocked;
+        }
+        let opened = udp.open_host_port(port, peer);
+        debug_assert!(opened);
+        if !opened {
+            return UdpFrameWrite::Dropped;
+        }
+        self.poll(guest_frames, drive);
+        UdpFrameWrite::Queued
     }
 
     fn handle_guest_udp(
@@ -245,35 +388,42 @@ impl<C: NetworkClock> Gateway<C> {
         src: SocketAddr,
         dst: SocketAddr,
         payload: &[u8],
-        egress_udp_sends: &mut Vec<EgressUdpSend>,
-    ) {
+        outputs: &mut GatewayOutputs<'_>,
+        drive: &mut DriveTurn<'_>,
+    ) -> bool {
         let protocol = application::classify_udp_datagram(payload);
         let is_dns = self.is_dns_udp(dst) || matches!(protocol, ApplicationProtocol::Dns);
-        if is_dns {
-            self.dns.record_query(payload);
-        }
         let bytes = match prepare_udp_payload(&self.config.policy, protocol, payload, &self.buffers) {
             Ok(bytes) => bytes,
-            Err(_error) => return,
+            Err(_error) => return true,
         };
         let guest_dst = dst;
         let dst = udp_host_destination(dst, &self.config);
         if self.config.policy.egress.check_destination(dst.ip()).is_err() {
-            return;
+            return true;
         }
         if !is_dns
             && !self
                 .dns
                 .has_allowed_authority_for_ip(dst.ip(), &self.config.policy.egress, &self.clock)
         {
-            return;
+            return true;
         }
         let proxy = UdpProxyKey {
             guest_src: src,
             guest_dst,
             host_dst: dst,
         };
-        egress_udp_sends.push(EgressUdpSend { proxy, bytes, is_dns });
+        if outputs
+            .push_egress_udp(EgressUdpSend { proxy, bytes, is_dns }, drive)
+            .is_err()
+        {
+            return false;
+        }
+        if is_dns {
+            self.dns.record_query(payload);
+        }
+        true
     }
 
     fn is_dns_udp(&self, dst: SocketAddr) -> bool {
@@ -390,10 +540,11 @@ mod tests {
     use crate::RuntimeSecret;
     use crate::buffers::{BufferPool, FrameBuf};
     use crate::clock::SystemClock;
-    use crate::ingress::UdpPeers;
+    use crate::drive::{DriveBudget, DriveReport, DriveTurn};
+    use crate::ingress::{TcpConnections, UdpPeers};
     use crate::network::{
-        ApplicationPolicy, EgressDecision, EgressUdpSend, IngressUdpSend, InstanceAddresses, InstanceMacAddresses,
-        InstanceNetworkConfig, MacAddress, NetworkLimits,
+        ApplicationPolicy, EgressDecision, EgressUdpSend, HostConnectionId, IngressTcpOutput, IngressUdpSend,
+        InstanceAddresses, InstanceMacAddresses, InstanceNetworkConfig, MacAddress, NetworkLimits,
     };
     use crate::policy::{EgressPolicy, NetworkPolicy, RuntimeSecrets};
     use crate::test_support::unit::{dns_a_response, dns_query};
@@ -401,8 +552,8 @@ mod tests {
     use super::dns::DnsAttribution;
     use super::packet::{UdpDatagram, resolve_gateway_destination, udp_frame, udp_response_frame};
     use super::{
-        Gateway, GatewayConfig, TcpEgressPolicy, TcpEgressRoute, UdpProxyKey, prepare_udp_payload, tcp_egress_route,
-        udp_host_destination,
+        Gateway, GatewayConfig, GatewayOutputs, GuestFrameIngest, TcpEgressPolicy, TcpEgressRoute, UdpFrameWrite,
+        UdpProxyKey, prepare_udp_payload, tcp_egress_route, udp_host_destination,
     };
     use crate::application::ApplicationProtocol;
     use crate::egress::tcp::{TcpProxies, tcp_listen_endpoint};
@@ -423,6 +574,22 @@ mod tests {
         let buffers = BufferPool::default();
         buffers.prewarm_instance_network();
         buffers
+    }
+
+    fn test_guest_frames(limits: &NetworkLimits) -> Vec<FrameBuf> {
+        Vec::with_capacity(limits.component_output_batch_capacity)
+    }
+
+    fn test_egress_udp_sends(limits: &NetworkLimits) -> Vec<EgressUdpSend> {
+        Vec::with_capacity(limits.component_output_batch_capacity)
+    }
+
+    fn test_ingress_udp_sends(limits: &NetworkLimits) -> Vec<IngressUdpSend> {
+        Vec::with_capacity(limits.component_output_batch_capacity)
+    }
+
+    fn test_ingress_tcp_outputs(limits: &NetworkLimits) -> Vec<IngressTcpOutput> {
+        Vec::with_capacity(limits.component_output_batch_capacity)
     }
 
     fn test_bytes(buffers: &BufferPool, bytes: &[u8]) -> crate::buffers::ByteBuf {
@@ -610,7 +777,7 @@ mod tests {
         let config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
         let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
         let bytes = test_bytes(&buffers, b"ping");
-        let mut guest_frames = Vec::new();
+        let mut guest_frames = test_guest_frames(&config.limits);
 
         handle_ingress_udp_datagram(
             &mut gateway,
@@ -624,6 +791,245 @@ mod tests {
     }
 
     #[test]
+    fn gateway_ingress_tcp_connect_does_not_finish_host_write_before_guest_fin() {
+        let buffers = test_buffers();
+        let config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        let mut gateway = Gateway::new(&config, buffers, SystemClock);
+        let mut tcp = TcpConnections::new(
+            config.limits.ingress_tcp_connection_limit,
+            config.limits.tcp_socket_buffer_capacity,
+        );
+        let mut outputs = test_ingress_tcp_outputs(&config.limits);
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let connection = HostConnectionId(22);
+
+        gateway.accept_ingress_tcp(&mut tcp, 22, connection, &mut outputs, &mut guest_frames, &mut drive);
+        gateway.relay_ingress_tcp_guest_bytes(&mut tcp, &mut outputs, &mut guest_frames, &mut drive);
+
+        assert!(
+            !outputs.iter().any(
+                |output| matches!(output, IngressTcpOutput::FinishWrite { connection: output } if *output == connection)
+            ),
+            "guest-to-host half-close must wait for guest FIN, not pre-established TCP state"
+        );
+    }
+
+    #[test]
+    fn gateway_reports_udp_response_frame_backpressure() {
+        let limits = NetworkLimits {
+            frame_buffer_pool_capacity: 0,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let resolved = Ipv4Addr::new(203, 0, 113, 7);
+        let mut config = InstanceNetworkConfig::new(
+            TEST_ADDRESSES,
+            TEST_MAC,
+            EgressPolicy::allow_all().with_allowed_authority("allowed.test"),
+        );
+        config.limits = limits;
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let query = dns_query(0x1201, "allowed.test", 1);
+        gateway.dns.record_query(&query);
+        let response = dns_a_response(0x1201, "allowed.test", resolved, 60);
+        let bytes = test_bytes(&buffers, &response);
+        let proxy = UdpProxyKey {
+            guest_src: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 73, 0, 10)), 40_000),
+            guest_dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+            host_dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+        };
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        let result = gateway.write_udp_response(proxy, &bytes, true, &mut guest_frames, &mut drive);
+
+        assert_eq!(result, UdpFrameWrite::Blocked);
+        assert!(guest_frames.is_empty());
+        assert!(report.wait().contains(crate::drive::DriveWait::LOCAL_BUFFER_CAPACITY));
+        assert!(
+            !gateway
+                .dns
+                .has_allowed_authority_for_ip(IpAddr::V4(resolved), &config.policy.egress, &SystemClock,)
+        );
+    }
+
+    #[test]
+    fn gateway_udp_response_budget_block_does_not_commit_dns_attribution() {
+        let limits = NetworkLimits {
+            drive_byte_budget: 4,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let resolved = Ipv4Addr::new(203, 0, 113, 7);
+        let mut config = InstanceNetworkConfig::new(
+            TEST_ADDRESSES,
+            TEST_MAC,
+            EgressPolicy::allow_all().with_allowed_authority("allowed.test"),
+        );
+        config.limits = limits;
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let query = dns_query(0x1201, "allowed.test", 1);
+        gateway.dns.record_query(&query);
+        let response = dns_a_response(0x1201, "allowed.test", resolved, 60);
+        let bytes = test_bytes(&buffers, &response);
+        let proxy = UdpProxyKey {
+            guest_src: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 73, 0, 10)), 40_000),
+            guest_dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+            host_dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+        };
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        let result = gateway.write_udp_response(proxy, &bytes, true, &mut guest_frames, &mut drive);
+
+        assert_eq!(result, UdpFrameWrite::Blocked);
+        assert!(guest_frames.is_empty());
+        assert!(report.budget_exhausted());
+        assert!(
+            !gateway
+                .dns
+                .has_allowed_authority_for_ip(IpAddr::V4(resolved), &config.policy.egress, &SystemClock,)
+        );
+    }
+
+    #[test]
+    fn gateway_udp_response_frame_write_reports_progress() {
+        let buffers = test_buffers();
+        let config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let bytes = test_bytes(&buffers, b"response");
+        let proxy = UdpProxyKey {
+            guest_src: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 73, 0, 10)), 40_000),
+            guest_dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+            host_dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+        };
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        let result = gateway.write_udp_response(proxy, &bytes, false, &mut guest_frames, &mut drive);
+
+        assert_eq!(result, UdpFrameWrite::Queued);
+        assert_eq!(guest_frames.len(), 1);
+        assert!(report.made_progress());
+    }
+
+    #[test]
+    fn blocked_ingress_udp_frame_does_not_commit_peer_mapping() {
+        let limits = NetworkLimits {
+            frame_buffer_pool_capacity: 0,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        config.limits = limits;
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let mut udp = UdpPeers::new(config.limits.ingress_udp_peer_limit);
+        let bytes = test_bytes(&buffers, b"ingress");
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let port = 8080;
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        let result = gateway.ingest_ingress_udp_datagram(&mut udp, port, peer, &bytes, &mut guest_frames, &mut drive);
+
+        assert_eq!(result, UdpFrameWrite::Blocked);
+        assert!(!report.made_progress());
+        assert!(guest_frames.is_empty());
+        let response = test_bytes(&buffers, b"response");
+        assert!(
+            udp.host_port_response(
+                SocketAddr::new(IpAddr::V4(TEST_ADDRESSES.gateway.std()), port),
+                IpAddr::V4(TEST_ADDRESSES.gateway.std()),
+                response,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn blocked_ingress_udp_frame_budget_does_not_commit_peer_mapping() {
+        let limits = NetworkLimits {
+            drive_byte_budget: 4,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        config.limits = limits;
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let mut udp = UdpPeers::new(config.limits.ingress_udp_peer_limit);
+        let bytes = test_bytes(&buffers, b"ingress");
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let port = 8080;
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        let result = gateway.ingest_ingress_udp_datagram(&mut udp, port, peer, &bytes, &mut guest_frames, &mut drive);
+
+        assert_eq!(result, UdpFrameWrite::Blocked);
+        assert!(report.budget_exhausted());
+        assert!(guest_frames.is_empty());
+        let response = test_bytes(&buffers, b"response");
+        assert!(
+            udp.host_port_response(
+                SocketAddr::new(IpAddr::V4(TEST_ADDRESSES.gateway.std()), port),
+                IpAddr::V4(TEST_ADDRESSES.gateway.std()),
+                response,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ingress_udp_peer_capacity_is_checked_before_frame_capacity() {
+        let limits = NetworkLimits {
+            frame_buffer_pool_capacity: 0,
+            ingress_udp_peer_limit: 0,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        config.limits = limits;
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let mut udp = UdpPeers::new(config.limits.ingress_udp_peer_limit);
+        let bytes = test_bytes(&buffers, b"ingress");
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        let result = gateway.ingest_ingress_udp_datagram(
+            &mut udp,
+            8080,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
+            &bytes,
+            &mut guest_frames,
+            &mut drive,
+        );
+
+        assert_eq!(result, UdpFrameWrite::Dropped);
+        assert!(!report.wait().contains(crate::drive::DriveWait::LOCAL_BUFFER_CAPACITY));
+        assert!(guest_frames.is_empty());
+    }
+
+    #[test]
     fn gateway_drops_new_ingress_udp_peers_after_limit() {
         let buffers = test_buffers();
         let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
@@ -633,17 +1039,22 @@ mod tests {
         };
         let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
         let bytes = test_bytes(&buffers, b"ping");
-        let mut guest_frames = Vec::new();
+        let mut guest_frames = test_guest_frames(&config.limits);
         let mut udp = UdpPeers::new(config.limits.ingress_udp_peer_limit);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
 
-        gateway.ingest_ingress_udp_datagram(
+        let result = gateway.ingest_ingress_udp_datagram(
             &mut udp,
             8080,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
             &bytes,
             &mut guest_frames,
+            &mut drive,
         );
 
+        assert_eq!(result, UdpFrameWrite::Dropped);
         assert!(guest_frames.is_empty());
     }
 
@@ -658,9 +1069,13 @@ mod tests {
         let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
         let mut tcp = test_tcp(&config.limits, &buffers);
         let udp = UdpPeers::new(config.limits.ingress_udp_peer_limit);
-        let mut egress_udp_sends = Vec::new();
-        let mut ingress_udp_sends = Vec::new();
-        let mut guest_frames = Vec::new();
+        let mut egress_udp_sends = test_egress_udp_sends(&config.limits);
+        let mut ingress_udp_sends = test_ingress_udp_sends(&config.limits);
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut outputs = GatewayOutputs::new(&mut egress_udp_sends, &mut ingress_udp_sends, &mut guest_frames);
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
         let src_addr = Ipv4Addr::new(10, 73, 0, 10);
         let src = SocketAddr::new(IpAddr::V4(src_addr), 40_001);
         let dst_addr = Ipv4Addr::new(203, 0, 113, 7);
@@ -670,14 +1085,118 @@ mod tests {
             &mut tcp,
             &udp,
             tcp_syn_frame(src_addr, src.port(), dst_addr, dst.port(), &buffers),
-            &mut egress_udp_sends,
-            &mut ingress_udp_sends,
-            &mut guest_frames,
+            &mut outputs,
+            &mut drive,
         );
 
         assert!(!tcp.has_connection(src, dst));
         assert!(egress_udp_sends.is_empty());
         assert!(ingress_udp_sends.is_empty());
+        assert!(guest_frames.is_empty());
+    }
+
+    #[test]
+    fn gateway_returns_blocked_guest_tcp_frame_without_opening_proxy() {
+        let limits = NetworkLimits {
+            frame_device_queue_capacity: 0,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        config.limits = limits;
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let mut tcp = test_tcp(&config.limits, &buffers);
+        let udp = UdpPeers::new(config.limits.ingress_udp_peer_limit);
+        let mut egress_udp_sends = test_egress_udp_sends(&config.limits);
+        let mut ingress_udp_sends = test_ingress_udp_sends(&config.limits);
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut outputs = GatewayOutputs::new(&mut egress_udp_sends, &mut ingress_udp_sends, &mut guest_frames);
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let src_addr = Ipv4Addr::new(10, 73, 0, 10);
+        let src = SocketAddr::new(IpAddr::V4(src_addr), 40_001);
+        let dst_addr = Ipv4Addr::new(203, 0, 113, 7);
+        let dst = SocketAddr::new(IpAddr::V4(dst_addr), 443);
+        let frame = tcp_syn_frame(src_addr, src.port(), dst_addr, dst.port(), &buffers);
+        let frame_len = frame.len();
+
+        let result = gateway.ingest_guest_frame(&mut tcp, &udp, frame, &mut outputs, &mut drive);
+
+        let GuestFrameIngest::Blocked(frame) = result else {
+            panic!("expected blocked guest frame");
+        };
+        assert_eq!(frame.len(), frame_len);
+        assert!(!tcp.has_connection(src, dst));
+        assert!(egress_udp_sends.is_empty());
+        assert!(ingress_udp_sends.is_empty());
+        assert!(guest_frames.is_empty());
+        assert!(report.wait().contains(crate::drive::DriveWait::LOCAL_BUFFER_CAPACITY));
+    }
+
+    #[test]
+    fn gateway_polls_existing_guest_frame_before_blocking_next_frame() {
+        let limits = NetworkLimits {
+            frame_device_queue_capacity: 1,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        config.limits = limits;
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let mut tcp = test_tcp(&config.limits, &buffers);
+        let udp = UdpPeers::new(config.limits.ingress_udp_peer_limit);
+        let mut egress_udp_sends = test_egress_udp_sends(&config.limits);
+        let mut ingress_udp_sends = test_ingress_udp_sends(&config.limits);
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut outputs = GatewayOutputs::new(&mut egress_udp_sends, &mut ingress_udp_sends, &mut guest_frames);
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let stale_src = Ipv4Addr::new(10, 73, 0, 10);
+        let stale_dst = Ipv4Addr::new(203, 0, 113, 7);
+        let next_src = Ipv4Addr::new(10, 73, 0, 10);
+        let next_dst = Ipv4Addr::new(203, 0, 113, 8);
+        let next = SocketAddr::new(IpAddr::V4(next_src), 40_002);
+        let next_dst_socket = SocketAddr::new(IpAddr::V4(next_dst), 443);
+
+        assert!(
+            gateway
+                .device
+                .receive_frame(tcp_syn_frame(stale_src, 40_001, stale_dst, 443, &buffers))
+        );
+
+        let result = gateway.ingest_guest_frame(
+            &mut tcp,
+            &udp,
+            tcp_syn_frame(next_src, next.port(), next_dst, next_dst_socket.port(), &buffers),
+            &mut outputs,
+            &mut drive,
+        );
+
+        assert!(matches!(result, GuestFrameIngest::Queued));
+        assert!(tcp.has_connection(next, next_dst_socket));
+        assert!(!report.wait().contains(crate::drive::DriveWait::LOCAL_BUFFER_CAPACITY));
+    }
+
+    #[test]
+    fn gateway_poll_reports_progress_when_rx_frame_is_consumed_without_socket_change() {
+        let buffers = test_buffers();
+        let config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
+        let mut frame = buffers.try_frame().expect("prewarmed frame");
+        frame.as_mut_vec().extend_from_slice(b"invalid");
+        assert!(gateway.device.receive_frame(frame));
+        let mut guest_frames = test_guest_frames(&config.limits);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        gateway.poll(&mut guest_frames, &mut drive);
+
+        assert!(report.made_progress());
         assert!(guest_frames.is_empty());
     }
 
@@ -692,9 +1211,9 @@ mod tests {
         );
         config.dns_upstream = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300);
         let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
-        let mut egress_udp_sends = Vec::new();
-        let mut ingress_udp_sends = Vec::new();
-        let mut guest_frames = Vec::new();
+        let mut egress_udp_sends = test_egress_udp_sends(&config.limits);
+        let mut ingress_udp_sends = test_ingress_udp_sends(&config.limits);
+        let mut guest_frames = test_guest_frames(&config.limits);
         let query = dns_query(0x1201, "allowed.test", 1);
 
         handle_guest_frame(
@@ -728,7 +1247,10 @@ mod tests {
 
         let response = dns_a_response(0x1201, "allowed.test", resolved, 60);
         let response_bytes = test_bytes(&buffers, &response);
-        gateway.write_udp_response(proxy, &response_bytes, true, &mut guest_frames);
+        let mut budget = DriveBudget::event_loop(&config.limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        gateway.write_udp_response(proxy, &response_bytes, true, &mut guest_frames, &mut drive);
         assert!(egress_udp_sends.is_empty());
         assert!(ingress_udp_sends.is_empty());
         assert_eq!(guest_frames.len(), 1);
@@ -772,9 +1294,9 @@ mod tests {
             EgressPolicy::allow_all().with_allowed_authority("allowed.test"),
         );
         let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
-        let mut egress_udp_sends = Vec::new();
-        let mut ingress_udp_sends = Vec::new();
-        let mut guest_frames = Vec::new();
+        let mut egress_udp_sends = test_egress_udp_sends(&config.limits);
+        let mut ingress_udp_sends = test_ingress_udp_sends(&config.limits);
+        let mut guest_frames = test_guest_frames(&config.limits);
 
         handle_guest_frame(
             &mut gateway,
@@ -807,7 +1329,11 @@ mod tests {
         let buffers = test_buffers();
         let mut tcp = test_tcp(&NetworkLimits::default(), &buffers);
         let udp = UdpPeers::new(NetworkLimits::default().ingress_udp_peer_limit);
-        gateway.ingest_guest_frame(&mut tcp, &udp, frame, egress_udp_sends, ingress_udp_sends, guest_frames);
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let mut report = DriveReport::new();
+        let mut outputs = GatewayOutputs::new(egress_udp_sends, ingress_udp_sends, guest_frames);
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        gateway.ingest_guest_frame(&mut tcp, &udp, frame, &mut outputs, &mut drive);
     }
 
     fn handle_ingress_udp_datagram(
@@ -818,7 +1344,10 @@ mod tests {
         bytes: &crate::buffers::ByteBuf,
     ) {
         let mut udp = UdpPeers::new(NetworkLimits::default().ingress_udp_peer_limit);
-        gateway.ingest_ingress_udp_datagram(&mut udp, port, peer, bytes, guest_frames);
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let _result = gateway.ingest_ingress_udp_datagram(&mut udp, port, peer, bytes, guest_frames, &mut drive);
     }
 
     fn test_tcp(limits: &NetworkLimits, buffers: &BufferPool) -> TcpProxies<MioReactor> {

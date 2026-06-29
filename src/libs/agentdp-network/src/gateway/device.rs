@@ -15,6 +15,7 @@ pub(crate) struct FrameDevice {
     queue_capacity: usize,
     rx: VecDeque<FrameBuf>,
     tx: VecDeque<FrameBuf>,
+    rx_budget: usize,
 }
 
 impl FrameDevice {
@@ -25,6 +26,7 @@ impl FrameDevice {
             queue_capacity,
             rx: VecDeque::with_capacity(queue_capacity),
             tx: VecDeque::with_capacity(queue_capacity),
+            rx_budget: usize::MAX,
         }
     }
 
@@ -36,8 +38,36 @@ impl FrameDevice {
         true
     }
 
-    pub(crate) fn take_transmitted_frames(&mut self) -> impl Iterator<Item = FrameBuf> + '_ {
-        std::iter::from_fn(|| self.tx.pop_front())
+    pub(crate) fn can_receive_frame(&self) -> bool {
+        self.rx.len() < self.queue_capacity
+    }
+
+    pub(crate) fn has_received_frames(&self) -> bool {
+        !self.rx.is_empty()
+    }
+
+    pub(crate) fn received_frame_count(&self) -> usize {
+        self.rx.len()
+    }
+
+    pub(crate) fn pop_transmitted_frame(&mut self) -> Option<FrameBuf> {
+        self.tx.pop_front()
+    }
+
+    pub(crate) fn next_transmitted_frame_len(&self) -> Option<usize> {
+        self.tx.front().map(FrameBuf::len)
+    }
+
+    pub(crate) fn has_transmitted_frames(&self) -> bool {
+        !self.tx.is_empty()
+    }
+
+    pub(crate) fn transmitted_frame_count(&self) -> usize {
+        self.tx.len()
+    }
+
+    pub(crate) const fn allow_one_receive(&mut self) {
+        self.rx_budget = 1;
     }
 }
 
@@ -58,11 +88,18 @@ impl Device for FrameDevice {
         if self.tx.len() >= self.queue_capacity {
             return None;
         }
-        let frame = self.rx.pop_front()?;
+        if self.rx_budget == 0 {
+            return None;
+        }
+        if self.rx.is_empty() {
+            return None;
+        }
         let tx_frame = self
             .buffers
             .try_frame_with_capacity(self.mtu + ETHERNET_HEADER_LEN)
             .ok()?;
+        let frame = self.rx.pop_front()?;
+        self.rx_budget = self.rx_budget.saturating_sub(1);
         Some((
             FrameRxToken { frame },
             FrameTxToken {
@@ -128,6 +165,7 @@ mod tests {
     use smoltcp::wire::ETHERNET_HEADER_LEN;
 
     use crate::buffers::BufferPool;
+    use crate::network::NetworkLimits;
 
     use super::{FrameDevice, smoltcp_now};
 
@@ -145,8 +183,7 @@ mod tests {
         assert_eq!(received, b"frame");
 
         tx.consume(4, |bytes| bytes.copy_from_slice(b"pong"));
-        let transmitted = device
-            .take_transmitted_frames()
+        let transmitted = std::iter::from_fn(|| device.pop_transmitted_frame())
             .map(|frame| frame.as_slice().to_vec())
             .collect::<Vec<_>>();
         assert_eq!(transmitted, vec![b"pong".to_vec()]);
@@ -174,6 +211,49 @@ mod tests {
 
         assert!(device.receive_frame(first));
         assert!(!device.receive_frame(second));
+    }
+
+    #[test]
+    fn receive_budget_limits_rx_frames_per_poll_call() {
+        let buffers = BufferPool::default();
+        buffers.prewarm_instance_network();
+        let mut device = FrameDevice::new(1500, buffers.clone(), 4);
+        let mut first = buffers.try_frame().expect("prewarmed frame");
+        first.as_mut_vec().extend_from_slice(b"first");
+        let mut second = buffers.try_frame().expect("prewarmed frame");
+        second.as_mut_vec().extend_from_slice(b"second");
+        assert!(device.receive_frame(first));
+        assert!(device.receive_frame(second));
+
+        device.allow_one_receive();
+        assert!(device.receive(smoltcp_now()).is_some());
+        assert!(device.receive(smoltcp_now()).is_none());
+
+        device.allow_one_receive();
+        assert!(device.receive(smoltcp_now()).is_some());
+    }
+
+    #[test]
+    fn receive_keeps_rx_frame_when_tx_buffer_allocation_fails() -> Result<(), Box<dyn std::error::Error>> {
+        let buffers = BufferPool::new(NetworkLimits {
+            frame_buffer_pool_capacity: 2,
+            ..NetworkLimits::default()
+        });
+        buffers.prewarm_instance_network();
+        let mut device = FrameDevice::new(1500, buffers.clone(), 1);
+        let mut frame = buffers.try_frame().expect("prewarmed frame");
+        frame.as_mut_vec().extend_from_slice(b"saved");
+        let held = buffers.try_frame().expect("prewarmed frame");
+        assert!(device.receive_frame(frame));
+
+        assert!(device.receive(smoltcp_now()).is_none());
+        drop(held);
+        let (rx, _tx) = device
+            .receive(smoltcp_now())
+            .ok_or("expected RX frame to remain queued")?;
+
+        assert_eq!(rx.consume(<[u8]>::to_vec), b"saved");
+        Ok(())
     }
 
     #[test]

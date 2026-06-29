@@ -110,7 +110,7 @@ where
     let mut flushed = 0_usize;
     loop {
         let mut output = Vec::new();
-        tls.drain_ciphertext_to(&mut output)
+        tls.drain_ciphertext_to(&mut output, usize::MAX)
             .map_err(|error| Error::from_display("write client TLS", error))?;
         if output.is_empty() {
             return Ok(flushed);
@@ -210,7 +210,7 @@ pub(crate) fn read_plaintext_into(tls: &mut TlsServerSession, output: &mut Vec<u
 }
 
 pub(crate) fn flush_server_tls(tls: &mut TlsServerSession, output: &mut Vec<u8>) -> io::Result<()> {
-    let _drain = tls.drain_ciphertext_to(output)?;
+    let _drain = tls.drain_ciphertext_to(output, usize::MAX)?;
     Ok(())
 }
 

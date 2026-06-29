@@ -480,7 +480,7 @@ async fn write_tls_plaintext(
 
 async fn drain_tls_ciphertext(stream: &mut tokio::net::TcpStream, tls: &mut TlsServerSession) -> std::io::Result<()> {
     let mut output = Vec::new();
-    tls.drain_ciphertext_to(&mut output)?;
+    tls.drain_ciphertext_to(&mut output, usize::MAX)?;
     if !output.is_empty() {
         stream.write_all(&output).await?;
     }

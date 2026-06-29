@@ -60,6 +60,36 @@ pub struct TlsServerConfig {
     inner: Arc<rustls::ServerConfig>,
 }
 
+struct BoundedWrite<'a> {
+    inner: &'a mut dyn io::Write,
+    remaining: usize,
+}
+
+impl<'a> BoundedWrite<'a> {
+    const fn new(inner: &'a mut dyn io::Write, limit: usize) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+impl io::Write for BoundedWrite<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let len = bytes.len().min(self.remaining);
+        let written = self.inner.write(&bytes[..len])?;
+        self.remaining = self.remaining.saturating_sub(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl TlsServerConfig {
     pub(crate) fn from_single_cert(
         chain: Vec<CertificateDer<'static>>,
@@ -102,7 +132,7 @@ pub enum TlsPlaintextRead {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsCiphertextDrain {
-    Progress,
+    Progress(usize),
     Blocked,
     Empty,
 }
@@ -194,27 +224,33 @@ impl TlsClientSession {
         }
     }
 
+    /// Drains up to `limit` pending TLS ciphertext bytes into `output`.
+    ///
     /// # Errors
     ///
     /// Returns an error when rustls cannot serialize pending TLS bytes to `output`.
-    pub fn drain_ciphertext_to(&mut self, output: &mut dyn io::Write) -> io::Result<TlsCiphertextDrain> {
+    pub fn drain_ciphertext_to(&mut self, output: &mut dyn io::Write, limit: usize) -> io::Result<TlsCiphertextDrain> {
         if !self.inner.wants_write() {
             return Ok(TlsCiphertextDrain::Empty);
         }
-        let mut made_progress = false;
+        if limit == 0 {
+            return Ok(TlsCiphertextDrain::Blocked);
+        }
+        let mut bytes_written = 0_usize;
+        let mut output = BoundedWrite::new(output, limit);
         while self.inner.wants_write() {
-            match self.inner.write_tls(output) {
-                Ok(written) if written > 0 => made_progress = true,
+            match self.inner.write_tls(&mut output) {
+                Ok(written) if written > 0 => bytes_written = bytes_written.saturating_add(written),
                 Ok(_empty) => {
-                    return Ok(if made_progress {
-                        TlsCiphertextDrain::Progress
+                    return Ok(if bytes_written > 0 {
+                        TlsCiphertextDrain::Progress(bytes_written)
                     } else {
                         TlsCiphertextDrain::Blocked
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(if made_progress {
-                        TlsCiphertextDrain::Progress
+                    return Ok(if bytes_written > 0 {
+                        TlsCiphertextDrain::Progress(bytes_written)
                     } else {
                         TlsCiphertextDrain::Blocked
                     });
@@ -222,7 +258,7 @@ impl TlsClientSession {
                 Err(error) => return Err(error),
             }
         }
-        Ok(TlsCiphertextDrain::Progress)
+        Ok(TlsCiphertextDrain::Progress(bytes_written))
     }
 
     /// # Errors
@@ -300,27 +336,33 @@ impl TlsServerSession {
         }
     }
 
+    /// Drains up to `limit` pending TLS ciphertext bytes into `output`.
+    ///
     /// # Errors
     ///
     /// Returns an error when rustls cannot serialize pending TLS bytes to `output`.
-    pub fn drain_ciphertext_to(&mut self, output: &mut dyn io::Write) -> io::Result<TlsCiphertextDrain> {
+    pub fn drain_ciphertext_to(&mut self, output: &mut dyn io::Write, limit: usize) -> io::Result<TlsCiphertextDrain> {
         if !self.inner.wants_write() {
             return Ok(TlsCiphertextDrain::Empty);
         }
-        let mut made_progress = false;
+        if limit == 0 {
+            return Ok(TlsCiphertextDrain::Blocked);
+        }
+        let mut bytes_written = 0_usize;
+        let mut output = BoundedWrite::new(output, limit);
         while self.inner.wants_write() {
-            match self.inner.write_tls(output) {
-                Ok(written) if written > 0 => made_progress = true,
+            match self.inner.write_tls(&mut output) {
+                Ok(written) if written > 0 => bytes_written = bytes_written.saturating_add(written),
                 Ok(_empty) => {
-                    return Ok(if made_progress {
-                        TlsCiphertextDrain::Progress
+                    return Ok(if bytes_written > 0 {
+                        TlsCiphertextDrain::Progress(bytes_written)
                     } else {
                         TlsCiphertextDrain::Blocked
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(if made_progress {
-                        TlsCiphertextDrain::Progress
+                    return Ok(if bytes_written > 0 {
+                        TlsCiphertextDrain::Progress(bytes_written)
                     } else {
                         TlsCiphertextDrain::Blocked
                     });
@@ -328,7 +370,7 @@ impl TlsServerSession {
                 Err(error) => return Err(error),
             }
         }
-        Ok(TlsCiphertextDrain::Progress)
+        Ok(TlsCiphertextDrain::Progress(bytes_written))
     }
 
     /// # Errors
@@ -387,14 +429,20 @@ mod tests {
     #[test]
     fn ciphertext_drain_distinguishes_blocked_from_empty() -> Result<(), Box<dyn std::error::Error>> {
         let (mut client, _server) = connected_tls_pair()?;
-        assert_eq!(client.drain_ciphertext_to(&mut Vec::new())?, TlsCiphertextDrain::Empty);
+        assert_eq!(
+            client.drain_ciphertext_to(&mut Vec::new(), usize::MAX)?,
+            TlsCiphertextDrain::Empty
+        );
 
         assert_eq!(
             client.write_plaintext_some(b"hello")?,
             TlsPlaintextWrite::Accepted(b"hello".len())
         );
         let mut blocked = CapacityWriter::new(0);
-        assert_eq!(client.drain_ciphertext_to(&mut blocked)?, TlsCiphertextDrain::Blocked);
+        assert_eq!(
+            client.drain_ciphertext_to(&mut blocked, usize::MAX)?,
+            TlsCiphertextDrain::Blocked
+        );
         Ok(())
     }
 
@@ -407,10 +455,10 @@ mod tests {
             TlsPlaintextWrite::Accepted(b"response".len())
         );
         let mut ciphertext = Vec::new();
-        assert_eq!(
-            server.drain_ciphertext_to(&mut ciphertext)?,
-            TlsCiphertextDrain::Progress
-        );
+        assert!(matches!(
+            server.drain_ciphertext_to(&mut ciphertext, usize::MAX)?,
+            TlsCiphertextDrain::Progress(_)
+        ));
 
         let first = match client.read_ciphertext_bounded(&mut ciphertext.as_slice(), 1)? {
             TlsCiphertextRead::Read(read) => read,
@@ -432,10 +480,10 @@ mod tests {
             TlsPlaintextWrite::Accepted(b"response".len())
         );
         let mut ciphertext = Vec::new();
-        assert_eq!(
-            server.drain_ciphertext_to(&mut ciphertext)?,
-            TlsCiphertextDrain::Progress
-        );
+        assert!(matches!(
+            server.drain_ciphertext_to(&mut ciphertext, usize::MAX)?,
+            TlsCiphertextDrain::Progress(_)
+        ));
         assert!(matches!(
             client.read_ciphertext_bounded(&mut ciphertext.as_slice(), ciphertext.len())?,
             TlsCiphertextRead::Read(_)
@@ -454,10 +502,10 @@ mod tests {
 
         server.queue_close_notify();
         let mut ciphertext = Vec::new();
-        assert_eq!(
-            server.drain_ciphertext_to(&mut ciphertext)?,
-            TlsCiphertextDrain::Progress
-        );
+        assert!(matches!(
+            server.drain_ciphertext_to(&mut ciphertext, usize::MAX)?,
+            TlsCiphertextDrain::Progress(_)
+        ));
         assert!(matches!(
             client.read_ciphertext_bounded(&mut ciphertext.as_slice(), ciphertext.len())?,
             TlsCiphertextRead::Read(_)

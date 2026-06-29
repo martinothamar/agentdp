@@ -41,8 +41,8 @@ mod tests {
     use crate::client_server::{
         AgentApplyParams, AgentInstanceExecParams, AgentInstanceListParams, AgentInstanceLogsParams,
         AgentInstanceSelector, AgentScaleParams, AgentSelector, AgentWaitCondition, AgentWaitParams, AgentWatchParams,
-        BackendKind, Event, EventKind, EventLevel, LogFile, PingResult, Request, RequestFactory, RequestKind, Response,
-        ServerDoctorParams, ServerMessage,
+        BackendKind, Event, EventKind, EventLevel, LogFile, LogFilter, NetworkLogKind, PingResult, Request,
+        RequestFactory, RequestKind, Response, ServerDoctorParams, ServerMessage,
     };
 
     use super::{decode_request, decode_server_message, encode_line};
@@ -386,14 +386,22 @@ mod tests {
                         timeout_seconds,
                     })
                 }),
-            (bounded_text(), any::<u32>(), log_file(), 0_usize..1000).prop_map(|(agent, instance_id, file, lines)| {
-                RequestKind::AgentInstanceLogs(AgentInstanceLogsParams {
-                    agent,
-                    instance_id,
-                    file,
-                    lines,
-                })
-            }),
+            (
+                bounded_text(),
+                any::<u32>(),
+                log_file(),
+                0_usize..1000,
+                prop::option::of(log_filter())
+            )
+                .prop_map(|(agent, instance_id, file, lines, filter)| {
+                    RequestKind::AgentInstanceLogs(AgentInstanceLogsParams {
+                        agent,
+                        instance_id,
+                        file,
+                        lines,
+                        filter,
+                    })
+                }),
             prop::option::of(bounded_text())
                 .prop_map(|agent| RequestKind::AgentInstanceList(AgentInstanceListParams { agent })),
         ]
@@ -409,6 +417,23 @@ mod tests {
 
     fn log_file() -> impl Strategy<Value = LogFile> {
         prop_oneof![Just(LogFile::Serial), Just(LogFile::Qemu), Just(LogFile::Events)]
+    }
+
+    fn log_filter() -> impl Strategy<Value = LogFilter> {
+        (any::<bool>(), prop::option::of(network_log_kind()))
+            .prop_map(|(errors, event_kind)| LogFilter::Network { errors, event_kind })
+    }
+
+    fn network_log_kind() -> impl Strategy<Value = NetworkLogKind> {
+        prop_oneof![
+            Just(NetworkLogKind::Lifecycle),
+            Just(NetworkLogKind::Telemetry),
+            Just(NetworkLogKind::Transport),
+            Just(NetworkLogKind::Egress),
+            Just(NetworkLogKind::Dns),
+            Just(NetworkLogKind::HostPort),
+            Just(NetworkLogKind::Reactor),
+        ]
     }
 
     fn wait_condition() -> impl Strategy<Value = AgentWaitCondition> {

@@ -27,6 +27,8 @@ pub(super) struct TcpStreamCase {
     upstream_eof: bool,
     iterations: usize,
     reuse_connection: bool,
+    drive_step_budget: Option<usize>,
+    drive_byte_budget: Option<usize>,
 }
 
 impl TcpStreamCase {
@@ -39,6 +41,8 @@ impl TcpStreamCase {
             upstream_eof: false,
             iterations: 1,
             reuse_connection: false,
+            drive_step_budget: None,
+            drive_byte_budget: None,
         }
     }
 
@@ -64,6 +68,16 @@ impl TcpStreamCase {
 
     pub(super) const fn reuse_connection(mut self) -> Self {
         self.reuse_connection = true;
+        self
+    }
+
+    pub(super) const fn drive_step_budget(mut self, steps: usize) -> Self {
+        self.drive_step_budget = Some(steps);
+        self
+    }
+
+    pub(super) const fn drive_byte_budget(mut self, bytes: usize) -> Self {
+        self.drive_byte_budget = Some(bytes);
         self
     }
 
@@ -105,10 +119,20 @@ impl TcpStreamCase {
                 }
             })
         };
+        let mut network = allow_all_network_config();
+        if let Some(steps) = self.drive_step_budget {
+            network.limits.drive_step_budget = steps;
+        }
+        if let Some(bytes) = self.drive_byte_budget {
+            network.limits.drive_byte_budget = bytes;
+            network.limits.udp_datagram_buffer_capacity = network.limits.udp_datagram_buffer_capacity.min(bytes);
+            network.limits.ingress_udp_datagram_buffer_capacity =
+                network.limits.ingress_udp_datagram_buffer_capacity.min(bytes);
+        }
         let mut running = N::start(
             ScenarioNetworkConfig {
                 seed: sim.seed(),
-                network: allow_all_network_config(),
+                network,
                 upstreams: SimulationUpstreams::default().with_tcp_handler(upstream_addr(), handler),
             },
             guest_link.clone(),

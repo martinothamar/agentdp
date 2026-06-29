@@ -87,10 +87,14 @@ impl Simulator {
     }
 
     #[must_use]
-    pub fn quiescence(&self, guest_link: &GuestLink) -> QuiescenceReport {
+    pub fn quiescence<N>(&self, running: &N, guest_link: &GuestLink) -> QuiescenceReport
+    where
+        N: super::RunningNetwork,
+    {
         QuiescenceReport {
             virtual_time: self.now,
             pending_actions: self.scheduled.len(),
+            pending_reactor_ready: running.pending_reactor_ready(),
             pending_guest_frames: guest_link.pending_to_network_frames(),
             pending_network_frames: guest_link.pending_from_network_frames(),
             exhausted_budget: self.budget.is_exhausted(),
@@ -139,7 +143,8 @@ impl Simulator {
             budget.max_steps,
             running.simulated_time(),
             &running.status(),
-            &self.quiescence(guest_link),
+            &running.debug_snapshot(),
+            &self.quiescence(running, guest_link),
             &guest_link.trace(),
         ))
     }
@@ -161,7 +166,7 @@ impl Simulator {
     {
         let mut stable_status = None;
         for step in 0..=budget.max_steps {
-            let quiescence = self.quiescence(guest_link);
+            let quiescence = self.quiescence(running, guest_link);
             let status = running.status();
             if quiescence.is_quiescent() {
                 if stable_status.as_ref() == Some(&status) {
@@ -189,7 +194,8 @@ impl Simulator {
             budget.max_steps,
             running.simulated_time(),
             &running.status(),
-            &self.quiescence(guest_link),
+            &running.debug_snapshot(),
+            &self.quiescence(running, guest_link),
             &guest_link.trace(),
         ))
     }
@@ -212,7 +218,7 @@ impl Simulator {
     {
         let mut stable_status = None;
         for step in 0..=budget.max_steps {
-            let quiescence = self.quiescence(guest_link);
+            let quiescence = self.quiescence(running, guest_link);
             let status = running.status();
             if quiescence.is_quiescent() {
                 if stable_status.as_ref() == Some(&status) {
@@ -242,7 +248,8 @@ impl Simulator {
             budget.max_steps,
             running.simulated_time(),
             &running.status(),
-            &self.quiescence(guest_link),
+            &running.debug_snapshot(),
+            &self.quiescence(running, guest_link),
             &guest_link.trace(),
         ))
     }
@@ -459,17 +466,22 @@ impl Simulator {
         });
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "failure snapshots include each independently useful diagnostic stream"
+    )]
     fn drive_error(
         &self,
         label: &str,
         steps: usize,
         at: Duration,
         status: &agentdp_network::InstanceNetworkStatus,
+        debug: &str,
         quiescence: &QuiescenceReport,
         link_trace: &[LinkTraceEvent],
     ) -> Error {
         Error::new(format!(
-            "drive {label:?} exhausted after {steps} steps at {at:?}; seed={}; status={status:?}; quiescence={quiescence:?}; simulator_trace={:?}; link_trace={link_trace:?}",
+            "drive {label:?} exhausted after {steps} steps at {at:?}; seed={}; status={status:?}; debug={debug}; quiescence={quiescence:?}; simulator_trace={:?}; link_trace={link_trace:?}",
             self.seed, self.trace
         ))
     }
@@ -479,6 +491,7 @@ impl Simulator {
 pub struct QuiescenceReport {
     pub virtual_time: Duration,
     pub pending_actions: usize,
+    pub pending_reactor_ready: usize,
     pub pending_guest_frames: usize,
     pub pending_network_frames: usize,
     pub exhausted_budget: bool,
@@ -491,7 +504,10 @@ impl QuiescenceReport {
         // useful diagnostic pressure for long randomized runs, but local drive
         // calls are bounded by their own DriveBudget and must still be allowed
         // to observe an empty network after the global counter reaches zero.
-        self.pending_actions == 0 && self.pending_guest_frames == 0 && self.pending_network_frames == 0
+        self.pending_actions == 0
+            && self.pending_reactor_ready == 0
+            && self.pending_guest_frames == 0
+            && self.pending_network_frames == 0
     }
 }
 
@@ -573,6 +589,10 @@ where
         "  guest_tcp_buffer_bytes: {}",
         SmolTcpGuest::tcp_buffer_bytes()
     );
+    let debug = running.debug_snapshot();
+    if !debug.is_empty() {
+        let _ = writeln!(message, "  network_debug: {debug}");
+    }
 }
 
 fn drive_progress_marker(guest: &SmolTcpGuest, protocol_progress: usize) -> usize {

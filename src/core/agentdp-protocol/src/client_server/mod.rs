@@ -11,7 +11,7 @@ pub use message::{Event, EventKind, EventLevel, OutputStreamResult, ServerMessag
 pub use params::{
     AgentApplyParams, AgentInstanceExecParams, AgentInstanceListParams, AgentInstanceLogsParams, AgentInstanceSelector,
     AgentScaleParams, AgentSelector, AgentWaitCondition, AgentWaitParams, AgentWatchParams, BackendKind, LogFile,
-    ServerDoctorParams,
+    LogFilter, NetworkLogKind, ServerDoctorParams,
 };
 pub use request::{Request, RequestFactory, RequestKind, request};
 pub use response::{ErrorObject, Response, invalid_request};

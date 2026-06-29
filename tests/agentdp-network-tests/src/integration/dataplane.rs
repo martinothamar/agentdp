@@ -960,7 +960,7 @@ impl GuestTlsHttpClient {
         loop {
             let before = self.tls_output.len();
             self.tls
-                .drain_ciphertext_to(&mut self.tls_output)
+                .drain_ciphertext_to(&mut self.tls_output, usize::MAX)
                 .map_err(|error| Error::from_display("write guest TLS records", error))?;
             if self.tls_output.len() == before {
                 return Ok(());

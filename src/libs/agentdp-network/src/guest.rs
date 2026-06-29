@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 
 use crate::buffers::{BufferPool, FrameBuf};
-use crate::drive::DriveBudget;
+use crate::drive::{DriveApply, DriveGuestFrameRead, DriveGuestFrameReadStatus, DriveGuestFrameWrite, DriveTurn};
 use crate::reactor::ReactorItemId;
-use crate::reactor::{ReactorBackend, ReactorReady};
+use crate::reactor::ReactorReady;
+use crate::reactor::RegisteredGuestSource;
 use crate::runtime::NetworkRuntime;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -123,12 +124,18 @@ pub(crate) enum GuestEvent {
     },
 }
 
+pub(crate) enum GuestFrameEnqueue {
+    Queued,
+    Blocked(FrameBuf),
+}
+
 pub(crate) struct GuestIo<S: GuestFrameSession> {
     session: S,
     generation: u64,
     outbound: VecDeque<FrameBuf>,
+    outbound_capacity: usize,
     buffers: BufferPool,
-    wants_write: bool,
+    io: RegisteredGuestSource,
 }
 
 impl<S> GuestIo<S>
@@ -141,59 +148,80 @@ where
         buffers: &BufferPool,
         runtime: &mut impl NetworkRuntime,
     ) -> Result<Self, TransportError> {
-        register_guest_io_source(&mut session, runtime.reactor_mut())?;
+        let io = RegisteredGuestSource::register(runtime.reactor_mut(), session.io_source(), ReactorItemId::Guest)?;
         Ok(Self {
             session,
             generation,
             outbound: VecDeque::new(),
+            outbound_capacity: buffers.limits().frame_device_queue_capacity,
             buffers: buffers.clone(),
-            wants_write: false,
+            io,
         })
     }
 
-    pub(crate) fn send(&mut self, frame: FrameBuf, runtime: &impl NetworkRuntime) -> Result<(), TransportError> {
-        self.outbound.push_back(frame);
-        if !self.wants_write {
-            self.wants_write = true;
-            reregister_guest_io_source(&mut self.session, runtime.reactor(), true)?;
-        }
-        Ok(())
+    pub(crate) fn enqueue(
+        &mut self,
+        frame: FrameBuf,
+        drive: &mut DriveTurn<'_>,
+        runtime: &impl NetworkRuntime,
+    ) -> Result<GuestFrameEnqueue, TransportError> {
+        let reservation = match drive.enqueue_guest_frame(self.outbound.len(), self.outbound_capacity, frame.len()) {
+            crate::drive::DriveGuestFrameEnqueue::Reserved(reservation) => reservation,
+            crate::drive::DriveGuestFrameEnqueue::Blocked => return Ok(GuestFrameEnqueue::Blocked(frame)),
+        };
+        reservation.push_queue(&mut self.outbound, frame);
+        self.io.enable_write(runtime.reactor(), self.session.io_source())?;
+        Ok(GuestFrameEnqueue::Queued)
     }
 
     pub(crate) fn drive_queued(
         &mut self,
-        budget: &mut DriveBudget,
+        events: &mut Vec<GuestEvent>,
+        drive: &mut DriveTurn<'_>,
         runtime: &impl NetworkRuntime,
-    ) -> Result<bool, TransportError> {
-        let mut made_progress = false;
-        while let Some(frame) = self.outbound.front() {
-            if !budget.step() || !budget.event(frame.len()) {
-                break;
-            }
-            match self.session.write_frame(frame.as_slice())? {
-                FrameWrite::Flushed => {
+    ) -> Result<(), TransportError> {
+        while self.io.io().can_write()
+            && let Some(frame) = self.outbound.front()
+        {
+            let frame_len = frame.len();
+            match drive.write_guest_frame(frame_len, || {
+                self.session
+                    .write_frame(frame.as_slice())
+                    .map(|status| matches!(status, FrameWrite::Flushed))
+            })? {
+                DriveGuestFrameWrite::Flushed => {
                     self.outbound.pop_front();
-                    made_progress = true;
                 }
-                FrameWrite::Blocked => break,
+                DriveGuestFrameWrite::WouldBlock => {
+                    self.io.clear_write_after_would_block();
+                    break;
+                }
+                DriveGuestFrameWrite::Budget => {
+                    break;
+                }
             }
         }
-        if self.outbound.is_empty() && self.wants_write {
-            self.wants_write = false;
-            reregister_guest_io_source(&mut self.session, runtime.reactor(), false)?;
+        if self.outbound.is_empty() && self.io.io().watches_write() {
+            match drive.try_apply_state_change(|| self.io.disable_write(runtime.reactor(), self.session.io_source())) {
+                DriveApply::Applied(()) => {}
+                DriveApply::Failed(error) => return Err(error),
+                DriveApply::Deferred => return Ok(()),
+            }
+        } else if !self.outbound.is_empty() && !self.io.io().can_write() {
+            drive.wait_for_guest_send_capacity();
         }
-        Ok(made_progress)
+        self.drain_ready_reads(events, drive)?;
+        Ok(())
     }
 
     pub(crate) fn drive_ready(
         &mut self,
         readiness: &[ReactorReady],
         events: &mut Vec<GuestEvent>,
-        budget: &mut DriveBudget,
+        drive: &mut DriveTurn<'_>,
         runtime: &impl NetworkRuntime,
-    ) -> Result<bool, TransportError> {
-        let start_len = events.len();
-        let mut made_progress = false;
+    ) -> Result<(), TransportError> {
+        let mut guest_ready = false;
         for ready in readiness {
             let ReactorReady::Io {
                 item,
@@ -206,68 +234,57 @@ where
             if item != ReactorItemId::Guest {
                 continue;
             }
-            if writable {
-                made_progress |= self.drive_queued(budget, runtime)?;
-            }
-            if readable {
-                while budget.can_continue() {
-                    let Ok(mut frame) = self.buffers.try_frame() else {
-                        break;
-                    };
-                    match self.session.read_frame_into(&mut frame)? {
-                        FrameRead::Frame => {
-                            let len = frame.len();
-                            if !budget.event(len) {
-                                break;
-                            }
-                            events.push(GuestEvent::Frame {
-                                generation: self.generation,
-                                frame,
-                            });
-                            made_progress = true;
-                        }
-                        FrameRead::Blocked => break,
-                        FrameRead::Closed => {
-                            events.push(GuestEvent::Disconnected {
-                                generation: self.generation,
-                                result: Ok(()),
-                            });
-                            made_progress = true;
-                            break;
-                        }
-                    }
+            guest_ready = true;
+            self.io.mark_reactor_ready(readable, writable);
+        }
+        if guest_ready {
+            self.drive_queued(events, drive, runtime)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn drain_ready_reads(
+        &mut self,
+        events: &mut Vec<GuestEvent>,
+        drive: &mut DriveTurn<'_>,
+    ) -> Result<(), TransportError> {
+        while self.io.io().can_read() {
+            match drive.read_guest_frame(&self.buffers, |frame| {
+                self.session.read_frame_into(frame).map(|status| match status {
+                    FrameRead::Frame => DriveGuestFrameReadStatus::Frame,
+                    FrameRead::Blocked => DriveGuestFrameReadStatus::Blocked,
+                    FrameRead::Closed => DriveGuestFrameReadStatus::Closed,
+                })
+            })? {
+                DriveGuestFrameRead::Frame(frame) => {
+                    events.push(GuestEvent::Frame {
+                        generation: self.generation,
+                        frame,
+                    });
+                }
+                DriveGuestFrameRead::WouldBlock => {
+                    self.io.clear_read_after_would_block();
+                    return Ok(());
+                }
+                DriveGuestFrameRead::Blocked => return Ok(()),
+                DriveGuestFrameRead::Closed => {
+                    self.io.clear_read_after_would_block();
+                    events.push(GuestEvent::Disconnected {
+                        generation: self.generation,
+                        result: Ok(()),
+                    });
+                    return Ok(());
                 }
             }
         }
-        Ok(made_progress || events.len() > start_len)
+        Ok(())
     }
 
     pub(crate) fn shutdown(&mut self, runtime: &mut impl NetworkRuntime) {
-        let _deregistered = deregister_guest_io_source(&mut self.session, runtime.reactor_mut());
+        self.io.deregister(runtime.reactor_mut(), self.session.io_source());
         let _shutdown = self.session.shutdown_write();
     }
-}
-
-fn register_guest_io_source<S: GuestFrameSession>(
-    session: &mut S,
-    reactor: &mut impl ReactorBackend,
-) -> Result<(), TransportError> {
-    reactor.register_guest_source(session.io_source(), ReactorItemId::Guest)
-}
-
-fn reregister_guest_io_source<S: GuestFrameSession>(
-    session: &mut S,
-    reactor: &impl ReactorBackend,
-    writable: bool,
-) -> Result<(), TransportError> {
-    reactor.reregister_guest_source(session.io_source(), ReactorItemId::Guest, writable)
-}
-
-fn deregister_guest_io_source<S: GuestFrameSession>(
-    session: &mut S,
-    reactor: &mut impl ReactorBackend,
-) -> Result<(), TransportError> {
-    reactor.deregister_guest_source(session.io_source(), ReactorItemId::Guest)
 }
 
 #[cfg(test)]
@@ -275,12 +292,12 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     use crate::buffers::{BufferPool, FrameBuf};
-    use crate::drive::DriveBudget;
+    use crate::drive::{DriveBudget, DriveReport, DriveTurn};
     use crate::network::NetworkLimits;
-    use crate::reactor::default_backend;
+    use crate::reactor::{ReactorItemId, ReactorReady, default_backend};
     use crate::test_support::unit::runtime_context;
 
-    use super::{FrameRead, FrameWrite, GuestFrameSession, GuestIo, GuestIoSource, TransportError};
+    use super::{FrameRead, FrameWrite, GuestFrameEnqueue, GuestFrameSession, GuestIo, GuestIoSource, TransportError};
 
     #[test]
     fn flush_outbound_drains_all_queued_frames_before_reading() {
@@ -295,17 +312,23 @@ mod tests {
         writer.set_nonblocking(true).expect("writer should become nonblocking");
         let mut guest = GuestIo::register(TestSession { reader, writer }, 1, &buffers, &mut runtime)
             .expect("guest session should register");
-
-        guest
-            .send(frame(&buffers, b"first"), &runtime)
-            .expect("first frame should queue");
-        guest
-            .send(frame(&buffers, b"second"), &runtime)
-            .expect("second frame should queue");
         let mut budget = DriveBudget::event_loop(&crate::network::NetworkLimits::default());
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        assert!(matches!(
+            guest.enqueue(frame(&buffers, b"first"), &mut drive, &runtime),
+            Ok(GuestFrameEnqueue::Queued)
+        ));
+        assert!(matches!(
+            guest.enqueue(frame(&buffers, b"second"), &mut drive, &runtime),
+            Ok(GuestFrameEnqueue::Queued)
+        ));
+        let mut events = Vec::new();
         guest
-            .drive_queued(&mut budget, &runtime)
+            .drive_queued(&mut events, &mut drive, &runtime)
             .expect("queued frames should flush");
+        assert!(events.is_empty());
 
         let mut observed = [0_u8; 11];
         guest
@@ -314,6 +337,73 @@ mod tests {
             .read_exact(&mut observed)
             .expect("peer should observe flushed frames");
         assert_eq!(&observed, b"firstsecond");
+    }
+
+    #[test]
+    fn enqueue_blocks_when_guest_outbound_queue_is_full() {
+        let limits = NetworkLimits {
+            frame_device_queue_capacity: 1,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let mut runtime = runtime_context(
+            default_backend(limits.reactor_event_capacity).expect("unit-test reactor should initialize"),
+        );
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stream pair should initialize");
+        reader.set_nonblocking(true).expect("reader should become nonblocking");
+        writer.set_nonblocking(true).expect("writer should become nonblocking");
+        let mut guest = GuestIo::register(TestSession { reader, writer }, 1, &buffers, &mut runtime)
+            .expect("guest session should register");
+        let mut budget = DriveBudget::event_loop(&limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        assert!(matches!(
+            guest.enqueue(frame(&buffers, b"first"), &mut drive, &runtime),
+            Ok(GuestFrameEnqueue::Queued)
+        ));
+        assert!(matches!(
+            guest.enqueue(frame(&buffers, b"second"), &mut drive, &runtime),
+            Ok(GuestFrameEnqueue::Blocked(_))
+        ));
+        assert!(report.wait().contains(crate::drive::DriveWait::GUEST_SEND_CAPACITY));
+    }
+
+    #[test]
+    fn guest_read_would_block_clears_read_readiness() {
+        let buffers = BufferPool::default();
+        buffers.prewarm_instance_network();
+        let mut runtime = runtime_context(
+            default_backend(NetworkLimits::default().reactor_event_capacity)
+                .expect("unit-test reactor should initialize"),
+        );
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stream pair should initialize");
+        reader.set_nonblocking(true).expect("reader should become nonblocking");
+        writer.set_nonblocking(true).expect("writer should become nonblocking");
+        let mut guest = GuestIo::register(TestSession { reader, writer }, 1, &buffers, &mut runtime)
+            .expect("guest session should register");
+        let mut events = Vec::new();
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        guest
+            .drive_ready(
+                &[ReactorReady::Io {
+                    item: ReactorItemId::Guest,
+                    readable: true,
+                    writable: false,
+                }],
+                &mut events,
+                &mut drive,
+                &runtime,
+            )
+            .expect("guest would-block read should not error");
+
+        assert!(events.is_empty());
+        assert!(report.wait().contains(crate::drive::DriveWait::GUEST_RECV));
+        assert!(!guest.io.io().can_read());
     }
 
     fn frame(buffers: &BufferPool, bytes: &[u8]) -> FrameBuf {

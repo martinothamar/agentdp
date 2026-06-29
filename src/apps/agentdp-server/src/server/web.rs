@@ -267,6 +267,7 @@ async fn handle_instance_route(agents: &AgentRegistry, request: &Request) -> Res
                 instance_id: instance_id.as_u32(),
                 file: LogFile::Serial,
                 lines: 200,
+                filter: None,
             };
             match route_logs(agents, &route, &params).await {
                 Ok(result) => Response::json(200, &result),

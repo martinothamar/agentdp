@@ -10,7 +10,9 @@ use agentdp_core::{
     layout::AgentdpLayout,
     manifest::LoadedAgentManifest,
 };
-use agentdp_protocol::client_server::{AgentInstanceLogsParams, AgentInstanceLogsResult, LogFile, RequestKind};
+use agentdp_protocol::client_server::{
+    AgentInstanceLogsParams, AgentInstanceLogsResult, LogFile, LogFilter, NetworkLogKind, RequestKind,
+};
 use clap::{ArgAction, Args, ValueEnum};
 
 use crate::server_client;
@@ -73,7 +75,8 @@ async fn try_run(command: &Command, context: &Context) -> Result<(), Error> {
             agent: manifest.agent_name().to_owned(),
             instance_id: command.instance_id,
             file: log_file(command),
-            lines: requested_log_lines(command),
+            lines: command.lines,
+            filter: log_filter(command),
         }),
         None,
     )
@@ -98,12 +101,11 @@ const fn log_file(command: &Command) -> LogFile {
     }
 }
 
-const fn requested_log_lines(command: &Command) -> usize {
-    if flag_selected(command.network) {
-        usize::MAX
-    } else {
-        command.lines
-    }
+fn log_filter(command: &Command) -> Option<LogFilter> {
+    flag_selected(command.network).then_some(LogFilter::Network {
+        errors: command.errors,
+        event_kind: command.kind.map(NetworkLogKind::from),
+    })
 }
 
 const fn flag_selected(flag: u8) -> bool {
@@ -128,38 +130,19 @@ fn validate_log_selection(command: &Command) -> Result<(), Error> {
 }
 
 fn print_network_events(contents: &str, command: &Command) -> Result<(), Error> {
-    let mut output = Vec::new();
+    if command.json {
+        print!("{contents}");
+        return Ok(());
+    }
+
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
         let envelope = serde_json::from_str::<AgentInstanceEventEnvelope>(line).map_err(Error::ParseEvent)?;
         let AgentInstanceEvent::NetworkEvent(event) = &envelope.event else {
             continue;
         };
-        if !network_event_matches(event, command) {
-            continue;
-        }
-        if command.json {
-            output.push(line.to_owned());
-        } else {
-            output.push(format_network_event(event));
-        }
-    }
-    let start = output.len().saturating_sub(command.lines);
-    for line in &output[start..] {
-        println!("{line}");
+        println!("{}", format_network_event(event));
     }
     Ok(())
-}
-
-fn network_event_matches(event: &AgentInstanceNetworkEvent, command: &Command) -> bool {
-    if command.errors && !network_event_is_error(&event.event) {
-        return false;
-    }
-    if let Some(kind) = command.kind
-        && kind != network_event_kind(&event.event)
-    {
-        return false;
-    }
-    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -173,39 +156,17 @@ enum NetworkEventKind {
     Reactor,
 }
 
-const fn network_event_kind(event: &AgentInstanceNetworkEventKind) -> NetworkEventKind {
-    match event {
-        AgentInstanceNetworkEventKind::LifecycleStateChanged { .. } => NetworkEventKind::Lifecycle,
-        AgentInstanceNetworkEventKind::TelemetrySnapshot { .. } => NetworkEventKind::Telemetry,
-        AgentInstanceNetworkEventKind::TransportConnectFailed { .. }
-        | AgentInstanceNetworkEventKind::TransportGuestConnected { .. }
-        | AgentInstanceNetworkEventKind::TransportGuestDisconnected { .. }
-        | AgentInstanceNetworkEventKind::TransportRegisterFailed { .. } => NetworkEventKind::Transport,
-        AgentInstanceNetworkEventKind::EgressError { .. } | AgentInstanceNetworkEventKind::EgressProxyClosed { .. } => {
-            NetworkEventKind::Egress
+impl From<NetworkEventKind> for NetworkLogKind {
+    fn from(kind: NetworkEventKind) -> Self {
+        match kind {
+            NetworkEventKind::Lifecycle => Self::Lifecycle,
+            NetworkEventKind::Telemetry => Self::Telemetry,
+            NetworkEventKind::Transport => Self::Transport,
+            NetworkEventKind::Egress => Self::Egress,
+            NetworkEventKind::Dns => Self::Dns,
+            NetworkEventKind::HostPort => Self::HostPort,
+            NetworkEventKind::Reactor => Self::Reactor,
         }
-        AgentInstanceNetworkEventKind::DnsResolved { .. } => NetworkEventKind::Dns,
-        AgentInstanceNetworkEventKind::HostPortBound { .. } | AgentInstanceNetworkEventKind::HostPortError { .. } => {
-            NetworkEventKind::HostPort
-        }
-        AgentInstanceNetworkEventKind::ReactorError { .. } => NetworkEventKind::Reactor,
-    }
-}
-
-fn network_event_is_error(event: &AgentInstanceNetworkEventKind) -> bool {
-    match event {
-        AgentInstanceNetworkEventKind::LifecycleStateChanged { state } => state == "backoff" || state == "failed",
-        AgentInstanceNetworkEventKind::TransportConnectFailed { .. }
-        | AgentInstanceNetworkEventKind::TransportGuestDisconnected { .. }
-        | AgentInstanceNetworkEventKind::TransportRegisterFailed { .. }
-        | AgentInstanceNetworkEventKind::EgressError { .. }
-        | AgentInstanceNetworkEventKind::HostPortError { .. }
-        | AgentInstanceNetworkEventKind::ReactorError { .. } => true,
-        AgentInstanceNetworkEventKind::TelemetrySnapshot { .. }
-        | AgentInstanceNetworkEventKind::TransportGuestConnected { .. }
-        | AgentInstanceNetworkEventKind::EgressProxyClosed { .. }
-        | AgentInstanceNetworkEventKind::DnsResolved { .. }
-        | AgentInstanceNetworkEventKind::HostPortBound { .. } => false,
     }
 }
 

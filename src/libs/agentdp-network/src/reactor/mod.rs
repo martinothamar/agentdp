@@ -1,4 +1,5 @@
 mod mio;
+mod registered;
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -9,9 +10,26 @@ use crate::network::{HostConnectionId, TcpProxyId, UdpProxyKey};
 
 pub use mio::MioReactorWake as ProductionWake;
 pub(crate) use mio::{MioReactor, ReactorReady};
+pub(crate) use registered::{
+    RegisteredGuestSource, RegisteredTcpListener, RegisteredTcpStream, RegisteredUdpSocket, RegisteringTcpListener,
+    RegisteringTcpStream, RegisteringUdpSocket,
+};
 
 pub(crate) fn default_backend(event_capacity: usize) -> io::Result<MioReactor> {
     mio::MioReactor::new(event_capacity)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReactorRegistrationToken {
+    _private: (),
+}
+
+impl ReactorRegistrationToken {
+    // Capability boundary, not a security boundary: only reactor-owned code can
+    // construct this token, so adapters cannot bypass Registered* wrappers.
+    pub(in crate::reactor) const fn new() -> Self {
+        Self { _private: () }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,7 +44,9 @@ pub(crate) enum ReactorItemId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReactorInterest {
+    Disabled,
     Readable,
+    Writable,
     ReadWrite,
 }
 
@@ -109,6 +129,7 @@ pub(crate) trait ReactorBackend {
 
     fn register_tcp_listener(
         &mut self,
+        registration: ReactorRegistrationToken,
         source: &mut Self::TcpListener,
         item: ReactorItemId,
         interest: ReactorInterest,
@@ -116,6 +137,7 @@ pub(crate) trait ReactorBackend {
 
     fn register_tcp_stream(
         &mut self,
+        registration: ReactorRegistrationToken,
         source: &mut Self::TcpStream,
         item: ReactorItemId,
         interest: ReactorInterest,
@@ -123,6 +145,7 @@ pub(crate) trait ReactorBackend {
 
     fn register_udp_socket(
         &mut self,
+        registration: ReactorRegistrationToken,
         source: &mut Self::UdpSocket,
         item: ReactorItemId,
         interest: ReactorInterest,
@@ -130,6 +153,7 @@ pub(crate) trait ReactorBackend {
 
     fn reregister_tcp_stream(
         &self,
+        registration: ReactorRegistrationToken,
         source: &mut Self::TcpStream,
         item: ReactorItemId,
         interest: ReactorInterest,
@@ -137,28 +161,54 @@ pub(crate) trait ReactorBackend {
 
     fn reregister_udp_socket(
         &self,
+        registration: ReactorRegistrationToken,
         source: &mut Self::UdpSocket,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> io::Result<()>;
 
-    fn deregister_tcp_listener(&mut self, source: &mut Self::TcpListener, item: ReactorItemId) -> io::Result<()>;
+    fn deregister_tcp_listener(
+        &mut self,
+        registration: ReactorRegistrationToken,
+        source: &mut Self::TcpListener,
+        item: ReactorItemId,
+    ) -> io::Result<()>;
 
-    fn deregister_tcp_stream(&mut self, source: &mut Self::TcpStream, item: ReactorItemId) -> io::Result<()>;
+    fn deregister_tcp_stream(
+        &mut self,
+        registration: ReactorRegistrationToken,
+        source: &mut Self::TcpStream,
+        item: ReactorItemId,
+    ) -> io::Result<()>;
 
-    fn deregister_udp_socket(&mut self, source: &mut Self::UdpSocket, item: ReactorItemId) -> io::Result<()>;
+    fn deregister_udp_socket(
+        &mut self,
+        registration: ReactorRegistrationToken,
+        source: &mut Self::UdpSocket,
+        item: ReactorItemId,
+    ) -> io::Result<()>;
 
-    fn register_guest_source(&mut self, source: GuestIoSource<'_>, item: ReactorItemId) -> Result<(), TransportError>;
+    fn register_guest_source(
+        &mut self,
+        registration: ReactorRegistrationToken,
+        source: GuestIoSource<'_>,
+        item: ReactorItemId,
+    ) -> Result<(), TransportError>;
 
     fn reregister_guest_source(
         &self,
+        registration: ReactorRegistrationToken,
         source: GuestIoSource<'_>,
         item: ReactorItemId,
         writable: bool,
     ) -> Result<(), TransportError>;
 
-    fn deregister_guest_source(&mut self, source: GuestIoSource<'_>, item: ReactorItemId)
-    -> Result<(), TransportError>;
+    fn deregister_guest_source(
+        &mut self,
+        registration: ReactorRegistrationToken,
+        source: GuestIoSource<'_>,
+        item: ReactorItemId,
+    ) -> Result<(), TransportError>;
 
     fn ready_into(&mut self, output: &mut Vec<ReactorReady>, timeout: Option<Duration>) -> io::Result<()>;
 }

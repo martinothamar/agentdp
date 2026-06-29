@@ -823,6 +823,113 @@ where
     Ok(response)
 }
 
+pub(crate) fn https_request_read_after_backpressure_with_hook<N>(
+    sim: &mut Simulator,
+    guest: &mut SmolTcpGuest,
+    running: &mut N,
+    guest_link: &GuestLink,
+    tcp: TcpHandle,
+    roundtrip: HttpsRequestRoundtrip<'_>,
+    after_tls_handshake: impl FnOnce(),
+) -> Result<Vec<u8>>
+where
+    N: SteppedNetwork,
+{
+    let mut tls = client_tls(roundtrip.host, roundtrip.ca_pem)?;
+    drive_tls_until(
+        sim,
+        guest,
+        running,
+        tcp,
+        &mut tls,
+        "TLS handshake",
+        |tls, _plaintext| !tls.is_handshaking(),
+    )?;
+    after_tls_handshake();
+
+    let mut written = 0;
+    let request_plaintext_written = Cell::new(0_usize);
+    let client_tls_bytes_flushed = Cell::new(0_usize);
+    sim.drive_guest_until_with_progress(
+        guest,
+        running,
+        DriveGuestProgress {
+            label: "HTTPS request upload",
+            budget: HTTP_DRIVE_BUDGET,
+        },
+        |guest, running| {
+            write_client_plaintext_limited(
+                &mut tls,
+                roundtrip.request,
+                &mut written,
+                roundtrip.plaintext_write_limit,
+            )?;
+            request_plaintext_written.set(written);
+            let flushed = flush_client_tls(guest, running, tcp, &mut tls)?;
+            client_tls_bytes_flushed.set(client_tls_bytes_flushed.get().saturating_add(flushed));
+            Ok(written == roundtrip.request.len() && !tls.wants_write())
+        },
+        || {
+            request_plaintext_written
+                .get()
+                .saturating_add(client_tls_bytes_flushed.get())
+        },
+        |output| {
+            let _ = writeln!(output, "  phase: HTTPS request upload");
+            let _ = writeln!(
+                output,
+                "  request_plaintext_bytes_accepted: {}/{}",
+                request_plaintext_written.get(),
+                roundtrip.request.len()
+            );
+            let _ = writeln!(output, "  client_tls_bytes_flushed: {}", client_tls_bytes_flushed.get());
+        },
+    )?;
+
+    let _quiescence = sim.drive_guest_network_until_quiescent(
+        guest,
+        running,
+        guest_link,
+        "HTTPS response backpressure before read",
+        DriveBudget {
+            max_steps: 4096,
+            ..DriveBudget::default()
+        },
+    )?;
+
+    let mut response = Vec::new();
+    let mut completion = HttpResponseCompletion::for_request(roundtrip.request);
+    let response_plaintext_read = Cell::new(0_usize);
+    sim.drive_guest_until_with_progress(
+        guest,
+        running,
+        DriveGuestProgress {
+            label: "HTTPS response after backpressure",
+            budget: HTTP_DRIVE_BUDGET,
+        },
+        |guest, running| {
+            let _io = drive_client_tls_io(guest, running, tcp, &mut tls, &mut response)?;
+            response_plaintext_read.set(response.len());
+            Ok(http_response_is_complete(
+                &mut completion,
+                &response,
+                guest.tcp_may_recv(tcp),
+            ))
+        },
+        || response_plaintext_read.get(),
+        |output| {
+            let _ = writeln!(output, "  phase: HTTPS response after backpressure");
+            let _ = writeln!(
+                output,
+                "  response_plaintext_bytes_read: {}",
+                response_plaintext_read.get()
+            );
+        },
+    )?;
+    drain_tls_response_after_completion(sim, guest, running, guest_link, tcp, &mut tls, &mut response)?;
+    Ok(response)
+}
+
 pub(crate) fn https_requests_with_hook<N>(
     sim: &mut Simulator,
     guest: &mut SmolTcpGuest,

@@ -1,11 +1,24 @@
-use super::fixtures::{BLOCKED_HOST, BYPASS_HOST, HOST, PLACEHOLDER, SECRET_VALUE, UNKNOWN_PLACEHOLDER};
-use super::protocol::http1::Http1Response;
+use agentdp_network::RuntimeSecrets;
+use agentdp_network::test_support::simulation::SimulationUpstreams;
+use agentdp_rand::Seed;
+
+use super::case_support::stop_tcp_report;
+use super::fixtures::{
+    BLOCKED_HOST, BYPASS_HOST, HOST, PLACEHOLDER, SECRET_VALUE, UNKNOWN_PLACEHOLDER, tls_network_config_for,
+    upstream_addr,
+};
+use super::protocol::http1::{Http1Response, TlsHttpUpstream};
+use super::protocol::tls::{client_tls, drive_tls_until, fixed_mediated_ca};
 use super::tls_case::{LinkAction, https_http1_case, wss_http1_case};
-use super::{AgentdpNetworkSim, LinkDirection, Result};
+use super::{
+    AgentdpNetworkSim, LinkDirection, NetworkUnderTest, Result, ScenarioNetworkConfig, Simulator, SmolTcpGuest,
+};
 
 const LARGE_BODY_LEN: usize = 1024 * 1024 + 8192;
+const HUGE_RESPONSE_LEN: usize = 3 * 1024 * 1024;
 const BYPASS_LARGE_BODY_LEN: usize = 32 * 1024;
 static LARGE_RESPONSE_BODY: [u8; LARGE_BODY_LEN] = [b'R'; LARGE_BODY_LEN];
+static HUGE_RESPONSE_BODY: [u8; HUGE_RESPONSE_LEN] = [b'E'; HUGE_RESPONSE_LEN];
 static BYPASS_LARGE_RESPONSE_BODY: [u8; BYPASS_LARGE_BODY_LEN] = [b'B'; BYPASS_LARGE_BODY_LEN];
 static CHUNKED_RESPONSE_BODY: &[u8] = b"chunked response body over mediated HTTPS\n";
 
@@ -24,6 +37,84 @@ fn simulated_guest_https_http1_substitutes_authorized_secret_header() -> Result<
             "GET /real-traffic HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {PLACEHOLDER}\r\nConnection: close\r\n\r\n"
         ))
         .run::<AgentdpNetworkSim>()
+}
+
+/// Verifies that a parsed `ClientHello` is retried after another TLS flow releases local buffer capacity.
+///
+/// # Errors
+///
+/// Returns an error when the target handshake waits for more guest bytes after the pressure clears.
+#[test]
+fn simulated_tls_handshake_retries_parsed_client_hello_after_transient_buffer_pressure() -> Result<()> {
+    let mut sim = Simulator::new(Seed::new(0x22a));
+    let guest_link = sim.guest_link()?;
+    let mediated_ca = fixed_mediated_ca();
+    let upstream = TlsHttpUpstream::with_response(Http1Response::ok(b"unused\n"))?;
+    let mut config = tls_network_config_for(
+        &mediated_ca,
+        std::slice::from_ref(&upstream.root_ca_pem),
+        &[HOST],
+        RuntimeSecrets::new(),
+        &[],
+    );
+    config.limits.medium_byte_pool_capacity = 2;
+    config.limits.tls_relay_buffer_capacity = 4096;
+
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network: config,
+            upstreams: SimulationUpstreams::default()
+                .with_dns_a_endpoint(super::fixtures::DNS_UPSTREAM, super::fixtures::UPSTREAM_IP)
+                .with_tcp_handler(upstream_addr(), upstream.handler()),
+        },
+        guest_link.clone(),
+    )?;
+    super::fixtures::attribute_named_host_to_upstream(&mut sim, &mut running, &guest_link, HOST)?;
+
+    let mut guest = SmolTcpGuest::new(guest_link.clone())?;
+    let holder_tcp = guest.connect(&mut running, upstream_addr())?;
+    let mut holder_tls = client_tls(HOST, &mediated_ca.cert_pem)?;
+    let mut holder_client_hello = Vec::new();
+    holder_tls
+        .drain_ciphertext_to(&mut holder_client_hello, usize::MAX)
+        .map_err(|error| super::Error::from_display("drain holder ClientHello", error))?;
+    guest.write_all(&mut running, holder_tcp, &holder_client_hello[..16])?;
+    guest.drain(&mut running, 8)?;
+
+    let target_tcp = guest.connect(&mut running, upstream_addr())?;
+    let mut target_tls = client_tls(HOST, &mediated_ca.cert_pem)?;
+    let mut target_client_hello = Vec::new();
+    target_tls
+        .drain_ciphertext_to(&mut target_client_hello, usize::MAX)
+        .map_err(|error| super::Error::from_display("drain target ClientHello", error))?;
+    guest.write_all(&mut running, target_tcp, &target_client_hello)?;
+    guest.drain(&mut running, 8)?;
+
+    guest.abort_tcp(&mut running, holder_tcp)?;
+    guest.drain(&mut running, 8)?;
+
+    drive_tls_until(
+        &mut sim,
+        &mut guest,
+        &mut running,
+        target_tcp,
+        &mut target_tls,
+        "TLS handshake after transient local buffer pressure",
+        |tls, _plaintext| !tls.is_handshaking(),
+    )?;
+
+    let _closed = guest.abort_tcp(&mut running, target_tcp);
+    let _report = stop_tcp_report(
+        "guest_tls_handshake_retries_parsed_client_hello_after_transient_buffer_pressure",
+        sim,
+        guest,
+        running,
+        &guest_link,
+        target_tcp,
+        false,
+    )?;
+    Ok(())
 }
 
 /// Verifies HTTP/1 substitution in headers, URL query text, and fixed request bodies.
@@ -178,6 +269,73 @@ fn simulated_guest_https_http1_large_upload_survives_early_large_response() -> R
         .authority(HOST)
         .large_upload_with_early_response(request, &LARGE_RESPONSE_BODY)
         .run::<AgentdpNetworkSim>()
+}
+
+/// Verifies that budget-limited dataplane turns requeue intercepted TLS upload continuations.
+///
+/// # Errors
+///
+/// Returns an error when guest ciphertext buffered by the TLS proxy stalls instead of being drained.
+#[test]
+fn simulated_guest_https_http1_large_upload_survives_constrained_drive_budget() -> Result<()> {
+    let body = vec![b'U'; LARGE_BODY_LEN];
+    let mut request = format!(
+        "POST /budgeted-upload HTTP/1.1\r\nHost: {HOST}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+
+    https_http1_case(
+        "guest_https_http1_large_upload_survives_constrained_drive_budget",
+        0x229,
+    )
+    .authority(HOST)
+    .large_upload_with_early_response(request, &LARGE_RESPONSE_BODY)
+    .drive_step_budget(8)
+    .run::<AgentdpNetworkSim>()
+}
+
+/// Verifies budget-limited dataplane turns requeue intercepted TLS response continuations.
+///
+/// # Errors
+///
+/// Returns an error when a large HTTPS response is truncated or stalls under a constrained byte budget.
+#[test]
+fn simulated_guest_https_http1_large_response_survives_constrained_drive_byte_budget() -> Result<()> {
+    https_http1_case(
+        "guest_https_http1_large_response_survives_constrained_drive_byte_budget",
+        0x22b,
+    )
+    .authority(HOST)
+    .upstream_response(&LARGE_RESPONSE_BODY)
+    .upstream_close_after_response()
+    .request(format!(
+        "GET /budgeted-response HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n"
+    ))
+    .drive_byte_budget(4096)
+    .run::<AgentdpNetworkSim>()
+}
+
+/// Verifies upstream EOF does not keep the dataplane runnable while guest response reads are backpressured.
+///
+/// # Errors
+///
+/// Returns an error when upstream close plus downstream pressure truncates the response or prevents quiescence.
+#[test]
+fn simulated_guest_https_http1_huge_response_close_quiesces_under_backpressure() -> Result<()> {
+    https_http1_case(
+        "guest_https_http1_huge_response_close_quiesces_under_backpressure",
+        0x227,
+    )
+    .authority(HOST)
+    .upstream_response(&HUGE_RESPONSE_BODY)
+    .upstream_close_after_response()
+    .read_response_after_backpressure()
+    .request(format!(
+        "GET /huge-before-eof HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n"
+    ))
+    .run::<AgentdpNetworkSim>()
 }
 
 /// Verifies quiescent HTTPS/1 shutdown when upstream EOF follows a short response.

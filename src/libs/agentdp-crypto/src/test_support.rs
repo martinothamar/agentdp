@@ -58,13 +58,13 @@ pub fn tls_server_config_from_pem(cert_pem: &str, key_pem: &str) -> std::io::Res
 
 fn transfer_client_to_server(client: &mut TlsClientSession, server: &mut TlsServerSession) -> std::io::Result<()> {
     let mut ciphertext = Vec::new();
-    let _drain = client.drain_ciphertext_to(&mut ciphertext)?;
+    let _drain = client.drain_ciphertext_to(&mut ciphertext, usize::MAX)?;
     feed_server_ciphertext(server, &ciphertext)
 }
 
 fn transfer_server_to_client(server: &mut TlsServerSession, client: &mut TlsClientSession) -> std::io::Result<()> {
     let mut ciphertext = Vec::new();
-    let _drain = server.drain_ciphertext_to(&mut ciphertext)?;
+    let _drain = server.drain_ciphertext_to(&mut ciphertext, usize::MAX)?;
     let mut remaining = ciphertext.as_slice();
     while !remaining.is_empty() {
         let limit = remaining.len();

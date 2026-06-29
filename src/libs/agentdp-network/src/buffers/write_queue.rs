@@ -1,19 +1,6 @@
 use std::collections::VecDeque;
 
 use crate::buffers::{BufferPool, ByteBuf};
-use smoltcp::socket::tcp;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PumpStep {
-    Progress,
-    Blocked,
-}
-
-impl PumpStep {
-    pub(crate) const fn made_progress(self) -> bool {
-        matches!(self, Self::Progress)
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct WriteQueue {
@@ -89,90 +76,6 @@ impl WriteQueue {
             .chain(self.rest.iter())
             .map(PendingWrite::remaining_len)
             .sum()
-    }
-
-    pub(crate) fn flush_to_std<W: std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<PumpStep> {
-        let mut made_progress = false;
-        loop {
-            self.discard_exhausted_front();
-            let Some(write) = self.first.as_mut() else {
-                return Ok(if made_progress {
-                    PumpStep::Progress
-                } else {
-                    PumpStep::Blocked
-                });
-            };
-            let remaining = &write.bytes.as_slice()[write.offset..];
-            match writer.write(remaining) {
-                Ok(0) => {
-                    return if remaining.is_empty() {
-                        Ok(if made_progress {
-                            PumpStep::Progress
-                        } else {
-                            PumpStep::Blocked
-                        })
-                    } else {
-                        Err(std::io::ErrorKind::WriteZero.into())
-                    };
-                }
-                Ok(written) => {
-                    made_progress = true;
-                    write.offset += written;
-                    if write.offset >= write.bytes.len() {
-                        self.first = self.rest.pop_front();
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(if made_progress {
-                        PumpStep::Progress
-                    } else {
-                        PumpStep::Blocked
-                    });
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    pub(crate) fn flush_to_guest_socket(&mut self, socket: &mut tcp::Socket<'_>) -> PumpStep {
-        let mut made_progress = false;
-        while socket.can_send() {
-            self.discard_exhausted_front();
-            let Some(write) = self.first.as_mut() else {
-                return if made_progress {
-                    PumpStep::Progress
-                } else {
-                    PumpStep::Blocked
-                };
-            };
-            match socket.send_slice(&write.bytes.as_slice()[write.offset..]) {
-                Ok(0) | Err(_) => {
-                    return if made_progress {
-                        PumpStep::Progress
-                    } else {
-                        PumpStep::Blocked
-                    };
-                }
-                Ok(written) => {
-                    made_progress = true;
-                    write.offset += written;
-                    if write.offset >= write.bytes.len() {
-                        self.first = self.rest.pop_front();
-                    }
-                }
-            }
-        }
-        if made_progress {
-            PumpStep::Progress
-        } else {
-            PumpStep::Blocked
-        }
-    }
-
-    fn discard_exhausted_front(&mut self) {
-        while self.first.as_ref().is_some_and(PendingWrite::is_empty) {
-            self.first = self.rest.pop_front();
-        }
     }
 }
 

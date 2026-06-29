@@ -10,7 +10,8 @@ use crate::connectors::udp::UdpSocketFactory;
 use crate::guest::{GuestIoSource, TransportError};
 use crate::reactor::ReactorItemId;
 use crate::reactor::{
-    ReactorBackend, ReactorInterest, ReactorReady, ReactorTcpListener, ReactorTcpStream, ReactorUdpSocket, ReactorWake,
+    ReactorBackend, ReactorInterest, ReactorReady, ReactorRegistrationToken, ReactorTcpListener, ReactorTcpStream,
+    ReactorUdpSocket, ReactorWake,
 };
 
 const LOOPBACK_EPHEMERAL: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
@@ -267,10 +268,22 @@ impl SimReactor {
     pub(crate) fn push_ready(&self, item: ReactorItemId, readable: bool, writable: bool) {
         self.inner.borrow_mut().push_ready(item, readable, writable);
     }
+
+    pub(crate) fn pending_ready_len(&self) -> usize {
+        self.inner.borrow().ready.len()
+    }
 }
 
 impl SimReactorState {
     fn push_ready(&mut self, item: ReactorItemId, readable: bool, writable: bool) {
+        let Some(interest) = self.registered.get(&item).copied() else {
+            return;
+        };
+        let readable = readable && interest.readable();
+        let writable = writable && interest.writable();
+        if !readable && !writable {
+            return;
+        }
         for ready in &mut self.ready {
             let ReactorReady::Io {
                 item: ready_item,
@@ -504,6 +517,10 @@ impl SimTcpStream {
     fn has_readable_bytes(&self) -> bool {
         self.readable.is_some() || !self.followup_readable.is_empty() || self.closed || self.reset
     }
+
+    const fn is_writable(&self) -> bool {
+        !self.closed && !self.reset
+    }
 }
 
 impl Read for SimTcpStream {
@@ -546,6 +563,9 @@ impl Write for SimTcpStream {
             self.reset |= response.reset;
             if self.has_readable_bytes() {
                 self.push_readiness(true, false);
+            }
+            if self.is_writable() {
+                self.push_readiness(false, true);
             }
             return Ok(write.accepted);
         }
@@ -786,6 +806,7 @@ impl ReactorBackend for SimReactor {
 
     fn register_tcp_listener(
         &mut self,
+        _registration: ReactorRegistrationToken,
         _source: &mut Self::TcpListener,
         item: ReactorItemId,
         interest: ReactorInterest,
@@ -796,40 +817,46 @@ impl ReactorBackend for SimReactor {
 
     fn register_tcp_stream(
         &mut self,
+        _registration: ReactorRegistrationToken,
         source: &mut Self::TcpStream,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> io::Result<()> {
         self.register(item, interest);
         source.register(self.inner.clone(), item);
-        if matches!(interest, ReactorInterest::ReadWrite) {
+        if interest.writable() && source.is_writable() {
             self.push_ready(item, false, true);
+        }
+        if interest.readable() && source.has_readable_bytes() {
+            self.push_ready(item, true, false);
         }
         Ok(())
     }
 
     fn register_udp_socket(
         &mut self,
+        _registration: ReactorRegistrationToken,
         source: &mut Self::UdpSocket,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> io::Result<()> {
         self.register(item, interest);
         source.register(self.inner.clone(), item);
-        if matches!(interest, ReactorInterest::ReadWrite) {
-            self.push_ready(item, false, true);
-        }
         Ok(())
     }
 
     fn reregister_tcp_stream(
         &self,
+        _registration: ReactorRegistrationToken,
         source: &mut Self::TcpStream,
         item: ReactorItemId,
         interest: ReactorInterest,
     ) -> io::Result<()> {
         self.reregister(item, interest)?;
-        if matches!(interest, ReactorInterest::Readable | ReactorInterest::ReadWrite) && source.has_readable_bytes() {
+        if interest.writable() && source.is_writable() {
+            self.push_ready(item, false, true);
+        }
+        if interest.readable() && source.has_readable_bytes() {
             self.push_ready(item, true, false);
         }
         Ok(())
@@ -837,6 +864,7 @@ impl ReactorBackend for SimReactor {
 
     fn reregister_udp_socket(
         &self,
+        _registration: ReactorRegistrationToken,
         _source: &mut Self::UdpSocket,
         item: ReactorItemId,
         interest: ReactorInterest,
@@ -844,28 +872,49 @@ impl ReactorBackend for SimReactor {
         self.reregister(item, interest)
     }
 
-    fn deregister_tcp_listener(&mut self, _source: &mut Self::TcpListener, item: ReactorItemId) -> io::Result<()> {
+    fn deregister_tcp_listener(
+        &mut self,
+        _registration: ReactorRegistrationToken,
+        _source: &mut Self::TcpListener,
+        item: ReactorItemId,
+    ) -> io::Result<()> {
         self.inner.borrow_mut().registered.remove(&item);
         Ok(())
     }
 
-    fn deregister_tcp_stream(&mut self, _source: &mut Self::TcpStream, item: ReactorItemId) -> io::Result<()> {
+    fn deregister_tcp_stream(
+        &mut self,
+        _registration: ReactorRegistrationToken,
+        _source: &mut Self::TcpStream,
+        item: ReactorItemId,
+    ) -> io::Result<()> {
         self.inner.borrow_mut().registered.remove(&item);
         Ok(())
     }
 
-    fn deregister_udp_socket(&mut self, _source: &mut Self::UdpSocket, item: ReactorItemId) -> io::Result<()> {
+    fn deregister_udp_socket(
+        &mut self,
+        _registration: ReactorRegistrationToken,
+        _source: &mut Self::UdpSocket,
+        item: ReactorItemId,
+    ) -> io::Result<()> {
         self.inner.borrow_mut().registered.remove(&item);
         Ok(())
     }
 
-    fn register_guest_source(&mut self, _source: GuestIoSource<'_>, item: ReactorItemId) -> Result<(), TransportError> {
+    fn register_guest_source(
+        &mut self,
+        _registration: crate::reactor::ReactorRegistrationToken,
+        _source: GuestIoSource<'_>,
+        item: ReactorItemId,
+    ) -> Result<(), TransportError> {
         self.register(item, ReactorInterest::Readable);
         Ok(())
     }
 
     fn reregister_guest_source(
         &self,
+        _registration: crate::reactor::ReactorRegistrationToken,
         _source: GuestIoSource<'_>,
         item: ReactorItemId,
         writable: bool,
@@ -881,6 +930,7 @@ impl ReactorBackend for SimReactor {
 
     fn deregister_guest_source(
         &mut self,
+        _registration: crate::reactor::ReactorRegistrationToken,
         _source: GuestIoSource<'_>,
         item: ReactorItemId,
     ) -> Result<(), TransportError> {
@@ -895,7 +945,24 @@ impl ReactorBackend for SimReactor {
             inner.wake_requested = false;
             output.push(ReactorReady::Wake);
         }
-        output.extend(inner.ready.drain(..));
+        let ready = std::mem::take(&mut inner.ready);
+        output.extend(ready.into_iter().filter_map(|ready| match ready {
+            ReactorReady::Wake => Some(ReactorReady::Wake),
+            ReactorReady::Io {
+                item,
+                readable,
+                writable,
+            } => {
+                let interest = inner.registered.get(&item).copied()?;
+                let readable = readable && interest.readable();
+                let writable = writable && interest.writable();
+                (readable || writable).then_some(ReactorReady::Io {
+                    item,
+                    readable,
+                    writable,
+                })
+            }
+        }));
         Ok(())
     }
 }
@@ -915,5 +982,44 @@ impl SimReactor {
         };
         *current = interest;
         Ok(())
+    }
+}
+
+impl ReactorInterest {
+    const fn readable(self) -> bool {
+        matches!(self, Self::Readable | Self::ReadWrite)
+    }
+
+    const fn writable(self) -> bool {
+        matches!(self, Self::Writable | Self::ReadWrite)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReactorBackend as _, *};
+
+    #[test]
+    fn queued_readiness_is_filtered_by_current_interest() {
+        let mut reactor = SimReactor::new();
+        let stream = SimTcpStream::default();
+        let item = ReactorItemId::TcpProxy {
+            proxy: crate::network::TcpProxyId(7),
+        };
+        let mut stream =
+            crate::reactor::RegisteringTcpStream::new(&mut reactor, stream, item, ReactorInterest::ReadWrite)
+                .expect("simulated stream should register")
+                .commit();
+        stream
+            .reregister(&reactor, ReactorInterest::Disabled)
+            .expect("simulated stream should disable");
+        reactor.push_ready(item, true, true);
+
+        let mut ready = Vec::new();
+        reactor
+            .ready_into(&mut ready, Some(Duration::ZERO))
+            .expect("simulated readiness should drain");
+
+        assert!(ready.is_empty());
     }
 }

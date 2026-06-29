@@ -205,6 +205,34 @@ impl NetworkLimits {
             telemetry_event_capacity: 16,
         }
     }
+
+    pub(crate) fn validate_for_event_loop(&self) -> Result<(), String> {
+        if self.drive_event_budget == 0 {
+            return Err("drive_event_budget must be greater than zero".to_owned());
+        }
+        if self.drive_step_budget == 0 {
+            return Err("drive_step_budget must be greater than zero".to_owned());
+        }
+        if self.drive_byte_budget == 0 {
+            return Err("drive_byte_budget must be greater than zero".to_owned());
+        }
+        for (name, capacity) in [
+            ("frame_buffer_capacity", self.frame_buffer_capacity),
+            ("udp_datagram_buffer_capacity", self.udp_datagram_buffer_capacity),
+            (
+                "ingress_udp_datagram_buffer_capacity",
+                self.ingress_udp_datagram_buffer_capacity,
+            ),
+        ] {
+            if self.drive_byte_budget < capacity {
+                return Err(format!(
+                    "drive_byte_budget {} must be at least {name} {capacity}",
+                    self.drive_byte_budget
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for NetworkLimits {
@@ -614,9 +642,17 @@ pub(crate) struct EgressUdpSend {
     pub(crate) is_dns: bool,
 }
 
-pub(crate) struct IngressTcpWrite {
-    pub(crate) connection: HostConnectionId,
-    pub(crate) bytes: ByteBuf,
+pub(crate) enum IngressTcpOutput {
+    Write {
+        connection: HostConnectionId,
+        bytes: ByteBuf,
+    },
+    FinishWrite {
+        connection: HostConnectionId,
+    },
+    Close {
+        connection: HostConnectionId,
+    },
 }
 
 pub(crate) struct IngressUdpSend {
@@ -876,6 +912,50 @@ mod tests {
     fn bytes_to_u64_saturates() {
         assert_eq!(bytes_to_u64(12), 12);
         assert_eq!(bytes_to_u64(usize::MAX), u64::try_from(usize::MAX).unwrap_or(u64::MAX));
+    }
+
+    #[test]
+    fn event_loop_rejects_drive_byte_budget_smaller_than_whole_items() {
+        let mut spec = spec();
+        spec.config.limits.drive_byte_budget = spec.config.limits.udp_datagram_buffer_capacity - 1;
+        let (status_tx, _status_rx) = watch::channel(InstanceNetworkStatus::starting(&spec.config.limits));
+        let (_commands_tx, commands_rx) = mpsc::channel();
+
+        let result = EventLoop::new(
+            spec,
+            FakeTransport::frames_then_wait([]),
+            TestOutputSink {
+                status: status_tx,
+                events: None,
+            },
+            TestCommandSource { receiver: commands_rx },
+        );
+
+        match result {
+            Ok(_) => panic!("event loop accepted impossible whole-item drive byte budget"),
+            Err(InstanceNetworkError::TaskFailed { message, .. }) => {
+                assert!(message.contains("drive_byte_budget"));
+                assert!(message.contains("udp_datagram_buffer_capacity"));
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+    }
+
+    #[test]
+    fn network_limits_reject_zero_drive_byte_budget_even_when_item_capacities_are_zero() {
+        let limits = NetworkLimits {
+            drive_byte_budget: 0,
+            frame_buffer_capacity: 0,
+            udp_datagram_buffer_capacity: 0,
+            ingress_udp_datagram_buffer_capacity: 0,
+            ..NetworkLimits::default()
+        };
+
+        let error = limits
+            .validate_for_event_loop()
+            .expect_err("zero byte budget must be rejected");
+
+        assert!(error.contains("drive_byte_budget"));
     }
 
     #[tokio::test(flavor = "current_thread")]

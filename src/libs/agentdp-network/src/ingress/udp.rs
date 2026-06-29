@@ -16,8 +16,12 @@ impl UdpPeers {
         }
     }
 
+    pub(crate) fn can_open_host_port(&self, port: u16) -> bool {
+        self.peers.get(&port).is_some() || self.peers.len() < self.peers.capacity()
+    }
+
     pub(crate) fn open_host_port(&mut self, port: u16, peer: SocketAddr) -> bool {
-        if self.peers.get(&port).is_none() && self.peers.len() >= self.peers.capacity() {
+        if !self.can_open_host_port(port) {
             return false;
         }
         let _replaced = self.peers.insert(port, peer);

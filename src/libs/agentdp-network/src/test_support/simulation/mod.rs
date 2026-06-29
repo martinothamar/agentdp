@@ -307,8 +307,23 @@ where
     }
 
     pub fn drive_once(&mut self) {
-        self.reactor.push_ready(ReactorItemId::Guest, true, false);
+        self.reactor.push_ready(ReactorItemId::Guest, true, true);
         let _outcome = self.event_loop.drive_once(Some(Duration::ZERO));
+    }
+
+    pub fn drive_once_production_mode(&mut self) {
+        let _outcome = self.event_loop.drive_once(None);
+    }
+
+    pub fn queue_guest_readiness(&self) {
+        self.reactor.push_ready(ReactorItemId::Guest, true, false);
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the simulated network cannot allocate the test frame.
+    pub fn queue_network_to_guest_frame(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.event_loop.queue_guest_frame_for_test(bytes)
     }
 
     pub fn advance_clock(&self, duration: Duration) {
@@ -343,6 +358,11 @@ where
     #[must_use]
     pub fn active_tcp_proxy_slots(&self) -> usize {
         self.event_loop.active_tcp_proxy_slots()
+    }
+
+    #[must_use]
+    pub fn pending_reactor_ready(&self) -> usize {
+        self.reactor.pending_ready_len()
     }
 
     #[must_use]

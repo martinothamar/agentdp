@@ -21,7 +21,8 @@ use super::protocol::websocket::{
     wss_upgrade_request,
 };
 use super::{
-    LinkDirection, LinkFault, LinkTraceEventKind, NetworkUnderTest, ScenarioNetworkConfig, ScenarioReport, SmolTcpGuest,
+    Error, LinkDirection, LinkFault, LinkTraceEventKind, NetworkUnderTest, ScenarioNetworkConfig, ScenarioReport,
+    SmolTcpGuest,
 };
 use super::{Result, Simulator, SteppedNetwork};
 
@@ -58,6 +59,7 @@ enum UpstreamConnection {
 enum HttpsResponseRead {
     Concurrent,
     AfterUpload,
+    AfterBackpressure,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +98,8 @@ pub(super) struct HttpsHttp1Case {
     response_read: HttpsResponseRead,
     expected_outcome: ExpectedOutcome,
     forbidden_upstream: Vec<Vec<u8>>,
+    drive_step_budget: Option<usize>,
+    drive_byte_budget: Option<usize>,
     link_delays: Vec<(LinkDirection, std::time::Duration)>,
     post_connect_link_actions: Vec<LinkAction>,
     post_tls_link_actions: Vec<LinkAction>,
@@ -120,6 +124,8 @@ impl HttpsHttp1Case {
             response_read: HttpsResponseRead::Concurrent,
             expected_outcome: ExpectedOutcome::Success,
             forbidden_upstream: Vec::new(),
+            drive_step_budget: None,
+            drive_byte_budget: None,
             link_delays: Vec::new(),
             post_connect_link_actions: Vec::new(),
             post_tls_link_actions: Vec::new(),
@@ -196,6 +202,11 @@ impl HttpsHttp1Case {
         self
     }
 
+    pub(super) const fn read_response_after_backpressure(mut self) -> Self {
+        self.response_read = HttpsResponseRead::AfterBackpressure;
+        self
+    }
+
     pub(super) const fn upstream_close_after_response(mut self) -> Self {
         self.upstream_connection = UpstreamConnection::CloseAfterResponse;
         self
@@ -213,6 +224,16 @@ impl HttpsHttp1Case {
 
     pub(super) const fn expect_failure(mut self) -> Self {
         self.expected_outcome = ExpectedOutcome::Failure;
+        self
+    }
+
+    pub(super) const fn drive_step_budget(mut self, steps: usize) -> Self {
+        self.drive_step_budget = Some(steps);
+        self
+    }
+
+    pub(super) const fn drive_byte_budget(mut self, bytes: usize) -> Self {
+        self.drive_byte_budget = Some(bytes);
         self
     }
 
@@ -248,6 +269,10 @@ impl HttpsHttp1Case {
         self
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps the HTTPS scenario transcript in one readable setup/assertion flow"
+    )]
     pub(super) fn run<N>(self) -> Result<()>
     where
         N: NetworkUnderTest,
@@ -292,6 +317,17 @@ impl HttpsHttp1Case {
                 roundtrip,
                 apply_tls_actions,
             ),
+            HttpsResponseRead::AfterBackpressure => {
+                super::protocol::http1::https_request_read_after_backpressure_with_hook(
+                    &mut sim,
+                    &mut guest,
+                    &mut running,
+                    &guest_link,
+                    tcp,
+                    roundtrip,
+                    apply_tls_actions,
+                )
+            }
             HttpsResponseRead::Concurrent => https_request_with_hook(
                 &mut sim,
                 &mut guest,
@@ -314,9 +350,10 @@ impl HttpsHttp1Case {
             )?;
         }
         let response_succeeded = response.is_ok();
+        let response_error = response.as_ref().err().map(ToString::to_string);
         let expected_response_len = response_wire_len(&self.upstream_response)?;
         let upstream_request = transcript.borrow().request.clone();
-        let mut report = stop_tcp_report(
+        let mut report = match stop_tcp_report(
             self.name,
             sim,
             guest,
@@ -324,7 +361,17 @@ impl HttpsHttp1Case {
             &guest_link,
             tcp,
             self.expected_outcome == ExpectedOutcome::Success && response_succeeded,
-        )?
+        ) {
+            Ok(report) => report,
+            Err(stop_error) => {
+                let Some(response_error) = response_error else {
+                    return Err(stop_error);
+                };
+                return Err(Error::new(format!(
+                    "{response_error}; stop after response error: {stop_error}"
+                )));
+            }
+        }
         .with_upstream_transcript(UPSTREAM_REQUEST, upstream_request.clone());
 
         report = self.record_response_outcome(
@@ -845,6 +892,14 @@ trait TlsCaseModel {
     fn expected_outcome(&self) -> ExpectedOutcome;
     fn forbidden_upstream(&self) -> &[Vec<u8>];
 
+    fn drive_step_budget(&self) -> Option<usize> {
+        None
+    }
+
+    fn drive_byte_budget(&self) -> Option<usize> {
+        None
+    }
+
     fn network_config(
         &self,
         mediated_ca: &agentdp_crypto::CertificateAuthorityPem,
@@ -860,13 +915,23 @@ trait TlsCaseModel {
         } else {
             Vec::new()
         };
-        tls_network_config_for(
+        let mut config = tls_network_config_for(
             mediated_ca,
             &roots,
             &[self.authority()],
             self.runtime_secrets(),
             &bypass_hosts,
-        )
+        );
+        if let Some(steps) = self.drive_step_budget() {
+            config.limits.drive_step_budget = steps;
+        }
+        if let Some(bytes) = self.drive_byte_budget() {
+            config.limits.drive_byte_budget = bytes;
+            config.limits.udp_datagram_buffer_capacity = config.limits.udp_datagram_buffer_capacity.min(bytes);
+            config.limits.ingress_udp_datagram_buffer_capacity =
+                config.limits.ingress_udp_datagram_buffer_capacity.min(bytes);
+        }
+        config
     }
 
     fn runtime_secrets(&self) -> RuntimeSecrets {
@@ -961,6 +1026,14 @@ impl TlsCaseModel for HttpsHttp1Case {
 
     fn forbidden_upstream(&self) -> &[Vec<u8>] {
         &self.forbidden_upstream
+    }
+
+    fn drive_step_budget(&self) -> Option<usize> {
+        self.drive_step_budget
+    }
+
+    fn drive_byte_budget(&self) -> Option<usize> {
+        self.drive_byte_budget
     }
 }
 

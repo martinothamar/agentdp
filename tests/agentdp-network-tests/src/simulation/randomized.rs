@@ -1197,7 +1197,7 @@ impl BatchRunner {
                         operation.index(),
                         error,
                         self.running.status(),
-                        self.sim.quiescence(&self.guest_link)
+                        self.sim.quiescence(&self.running, &self.guest_link)
                     ))
                 })?;
             pending.push((operation, transcript, tcp));
@@ -1424,7 +1424,11 @@ impl BatchRunner {
         let _ = writeln!(output, "  batch_index: {}", batch.index);
         let _ = writeln!(output, "  operations: {}", batch.operations.len());
         let _ = writeln!(output, "  status: {:?}", self.running.status());
-        let _ = writeln!(output, "  quiescence: {:?}", self.sim.quiescence(&self.guest_link));
+        let _ = writeln!(
+            output,
+            "  quiescence: {:?}",
+            self.sim.quiescence(&self.running, &self.guest_link)
+        );
         let _ = writeln!(output, "  buffer_snapshot: {}", self.running.buffer_snapshot());
         let _ = writeln!(output, "  tcp_snapshot: {}", self.running.tcp_snapshot());
         let _ = writeln!(
