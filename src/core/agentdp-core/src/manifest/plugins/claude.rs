@@ -59,6 +59,7 @@ static CLAUDE_AUTH_TRANSFORM: MediatedJsonAuthTransform = MediatedJsonAuthTransf
     name: "claude-auth",
     prefix: "CLAUDE_AUTH",
     hosts: &CLAUDE_AUTH_HOSTS,
+    normalize_expiry: false,
 };
 
 fn claude_auth_guest_path() -> HostInputGuestPath {

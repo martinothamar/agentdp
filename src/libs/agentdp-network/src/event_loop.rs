@@ -283,7 +283,7 @@ where
         // Commands are the only control-plane input in the hot connected loop.
         // The dataplane itself communicates by filling component_events and
         // component_outputs below.
-        if matches!(self.commands.try_recv(), Some(NetworkCommand::Stop)) {
+        if self.process_commands() {
             return DriveOutcome::Stop;
         }
 
@@ -1029,7 +1029,7 @@ where
 
     fn wait_until_timer_or_stop(&mut self, target: TimerId) -> bool {
         loop {
-            if matches!(self.commands.try_recv(), Some(NetworkCommand::Stop)) {
+            if self.process_commands() {
                 return true;
             }
             if let Err(message) = self.wait_reactor(self.timers.next_timeout()) {
@@ -1053,6 +1053,28 @@ where
                 return false;
             }
         }
+    }
+
+    fn process_commands(&mut self) -> bool {
+        while let Some(command) = self.commands.try_recv() {
+            match command {
+                NetworkCommand::UpdateSecrets(secrets) => {
+                    if let Some(affected_authorities) = self.gateway.update_runtime_secrets(secrets)
+                        && !affected_authorities.is_empty()
+                    {
+                        self.egress_tcp.retire_authorities(
+                            self.gateway.tcp_sockets_mut(),
+                            self.runtime.reactor_mut(),
+                            &affected_authorities,
+                        );
+                        self.timers
+                            .schedule_at(TimerId::GatewayPoll, self.runtime.clock().now());
+                    }
+                }
+                NetworkCommand::Stop => return true,
+            }
+        }
+        false
     }
 
     pub(crate) fn stop(&mut self) -> NetworkExit {

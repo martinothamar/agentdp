@@ -2092,14 +2092,60 @@ spec:
         assert_eq!(file.permissions(), "0600");
         let materialized = file
             .materialize(
-                br#"{"tokens":{"access_token":"access-secret"},"profile":"keep-me"}"#,
+                br#"{"tokens":{"access_token":"access-secret","refresh_token":"refresh-secret","expires_at":1,"expires":"2"},"profile":"keep-me"}"#,
                 crate::provisioning::host_input::MaterializationContext::default(),
             )
             .unwrap();
         let auth_json = String::from_utf8(materialized.contents).unwrap();
         assert!(auth_json.contains("\"profile\": \"keep-me\""));
+        assert!(auth_json.contains("\"expires_at\": 4102444800"));
+        assert!(auth_json.contains("\"expires\": \"4102444800\""));
         assert!(!auth_json.contains("access-secret"));
+        assert!(!auth_json.contains("refresh-secret"));
         assert!(!materialized.secrets.is_empty());
+
+        let auth: serde_json::Value = serde_json::from_str(&auth_json).unwrap();
+        let first_access = auth["tokens"]["access_token"].as_str().unwrap().to_owned();
+        let first_refresh = auth["tokens"]["refresh_token"].as_str().unwrap().to_owned();
+        let persisted_secrets = materialized.secrets.redacted();
+        assert!(persisted_secrets.iter().all(|binding| binding.value().is_none()));
+
+        let nested_expiry_auth = file
+            .materialize(
+                br#"{"tokens":{"expires":{"refresh_token":"nested-secret"}}}"#,
+                crate::provisioning::host_input::MaterializationContext::default(),
+            )
+            .unwrap();
+        let nested_expiry_json = String::from_utf8(nested_expiry_auth.contents).unwrap();
+        assert!(!nested_expiry_json.contains("nested-secret"));
+        assert_eq!(nested_expiry_auth.secrets.iter().count(), 1);
+
+        let rematerialized = file
+            .materialize(
+                br#"{"tokens":{"access_token":"new-access","refresh_token":"new-refresh","expires_at":3},"profile":"keep-me"}"#,
+                crate::provisioning::host_input::MaterializationContext::new(&persisted_secrets),
+            )
+            .unwrap();
+        let refreshed_auth: serde_json::Value = serde_json::from_slice(&rematerialized.contents).unwrap();
+        assert_eq!(refreshed_auth["tokens"]["access_token"], first_access);
+        assert_eq!(refreshed_auth["tokens"]["refresh_token"], first_refresh);
+        assert_eq!(refreshed_auth["tokens"]["expires_at"], 4_102_444_800_u64);
+        assert_eq!(
+            rematerialized
+                .secrets
+                .iter()
+                .find(|binding| binding.placeholder == first_access)
+                .and_then(|binding| binding.value()),
+            Some("new-access")
+        );
+        assert_eq!(
+            rematerialized
+                .secrets
+                .iter()
+                .find(|binding| binding.placeholder == first_refresh)
+                .and_then(|binding| binding.value()),
+            Some("new-refresh")
+        );
     }
 
     #[test]

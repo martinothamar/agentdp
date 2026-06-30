@@ -58,6 +58,16 @@ impl UnixUser {
     pub fn resolve(user: &str) -> Result<Self, CommandUserError> {
         unix::resolve_user(user)
     }
+
+    #[must_use]
+    pub const fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    #[must_use]
+    pub const fn gid(&self) -> u32 {
+        self.gid
+    }
 }
 
 /// Configures a command to run as the resolved Unix user, including

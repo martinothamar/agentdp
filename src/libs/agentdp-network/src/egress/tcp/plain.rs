@@ -130,6 +130,10 @@ where
         )
     }
 
+    pub(super) fn authority(&self) -> Option<&str> {
+        self.authority.as_deref()
+    }
+
     pub(super) fn write(&mut self, bytes: ByteBuf) {
         let PlainTcpProxyState::Open { route, dns_tracker, .. } = &mut self.state else {
             self.pending.push(bytes);

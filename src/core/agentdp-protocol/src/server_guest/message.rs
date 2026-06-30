@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const GUEST_CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const WRITE_USER_FILE_COMMAND: &str = "user_file.write";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GuestMessage {
@@ -65,6 +66,8 @@ pub enum GuestMessageKind {
     BootstrapFinished(BootstrapFinished),
     #[serde(rename = "bootstrap.failed")]
     BootstrapFailed(BootstrapFailed),
+    #[serde(rename = "guest.command_result")]
+    CommandResult(GuestCommandResult),
     #[serde(rename = "guest.error")]
     Error(GuestError),
 }
@@ -157,6 +160,7 @@ const GUEST_MESSAGE_TYPES: &[&str] = &[
     "bootstrap.step_finished",
     "bootstrap.finished",
     "bootstrap.failed",
+    "guest.command_result",
     "guest.error",
 ];
 const HOST_MESSAGE_TYPES: &[&str] = &["host.accept", "host.cancel", "host.command"];
@@ -173,6 +177,7 @@ where
         "bootstrap.step_finished" => Ok(GuestMessageKind::BootstrapStepFinished(decode_payload(payload)?)),
         "bootstrap.finished" => Ok(GuestMessageKind::BootstrapFinished(decode_payload(payload)?)),
         "bootstrap.failed" => Ok(GuestMessageKind::BootstrapFailed(decode_payload(payload)?)),
+        "guest.command_result" => Ok(GuestMessageKind::CommandResult(decode_payload(payload)?)),
         "guest.error" => Ok(GuestMessageKind::Error(decode_payload(payload)?)),
         _ => Err(de::Error::unknown_variant(message_type, GUEST_MESSAGE_TYPES)),
     }
@@ -328,6 +333,21 @@ pub struct GuestError {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct GuestCommandResult {
+    pub command: String,
+    pub updated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WriteUserFileCommand {
+    pub path: String,
+    pub contents: Vec<u8>,
+    pub permissions: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HostAccept {
     pub instance: String,
     pub protocol_version: u16,
@@ -395,7 +415,8 @@ mod tests {
 
     use super::{
         BootstrapLifecycleStatus, BootstrapStatusReport, BootstrapStepPhase, GUEST_CONTROL_PROTOCOL_VERSION,
-        GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostAccept, HostMessage, HostMessageKind,
+        GuestCommandResult, GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostAccept, HostMessage,
+        HostMessageKind,
     };
     use crate::server_guest::{
         decode_guest_message_line, decode_host_message_line, encode_guest_message_line, encode_host_message_line,
@@ -499,6 +520,33 @@ mod tests {
                     "current_step": "system.packages",
                     "completed_steps": ["system.prep", "system.runtime_env"],
                     "pending_steps": ["system.packages", "system.agent_user"]
+                }
+            })
+        );
+        assert_eq!(decode_guest_message_line(&line).expect("decode guest message"), message);
+    }
+
+    #[test]
+    fn guest_command_result_uses_control_channel_json_line() {
+        let message = GuestMessage::new(
+            "cmd_1",
+            GuestMessageKind::CommandResult(GuestCommandResult {
+                command: "user_file.write".to_owned(),
+                updated: true,
+            }),
+        );
+
+        let line = encode_guest_message_line(&message).expect("encode guest message");
+        let value = line_value(&line);
+
+        assert_eq!(
+            value,
+            json!({
+                "id": "cmd_1",
+                "type": "guest.command_result",
+                "payload": {
+                    "command": "user_file.write",
+                    "updated": true
                 }
             })
         );

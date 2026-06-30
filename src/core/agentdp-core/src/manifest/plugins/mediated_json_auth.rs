@@ -9,6 +9,7 @@ pub(super) struct MediatedJsonAuthTransform {
     pub(super) name: &'static str,
     pub(super) prefix: &'static str,
     pub(super) hosts: &'static [&'static str],
+    pub(super) normalize_expiry: bool,
 }
 
 impl HostInputTransform for MediatedJsonAuthTransform {
@@ -55,6 +56,9 @@ impl MediatedJsonAuthTransform {
         match value {
             serde_json::Value::Object(object) => {
                 for (key, child) in object {
+                    if self.normalize_expiry && is_auth_expiry_key(key) && normalize_expiry_value(child) {
+                        continue;
+                    }
                     let child_sensitive = sensitive_context || is_auth_secret_key(key);
                     let child_name = format!("{name_path}_{}", secret_name_component(key));
                     self.placeholderize_auth_value(child, child_sensitive, &child_name, context, secrets)?;
@@ -115,6 +119,28 @@ fn is_auth_secret_key(key: &str) -> bool {
         "token" | "tokens" | "access_token" | "refresh_token" | "id_token" | "api_key"
     ) || key.ends_with("_token")
         || key.ends_with("token")
+}
+
+fn is_auth_expiry_key(key: &str) -> bool {
+    matches!(
+        key,
+        "expires" | "expires_at" | "expiresAt" | "expiry" | "expiration" | "expiration_time" | "expirationTime"
+    )
+}
+
+fn normalize_expiry_value(value: &mut serde_json::Value) -> bool {
+    const NON_EXPIRING_UNIX_SECONDS: u64 = 4_102_444_800;
+    match value {
+        serde_json::Value::Number(_) => {
+            *value = serde_json::Value::Number(serde_json::Number::from(NON_EXPIRING_UNIX_SECONDS));
+            true
+        }
+        serde_json::Value::String(text) => {
+            *text = NON_EXPIRING_UNIX_SECONDS.to_string();
+            true
+        }
+        _ => false,
+    }
 }
 
 fn secret_name_component(input: &str) -> String {

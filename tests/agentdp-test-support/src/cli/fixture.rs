@@ -106,6 +106,7 @@ impl AgentFixture {
         let server = ServerFixture::new(&context);
         let qemu_img = write_fake_qemu_img(&context);
         let qemu_system = write_fake_qemu_system(&context, QemuSystemMode::SpawnSleep);
+        write_fake_custom_env(&context);
         write_cached_base_image(&context);
         Self {
             server,
@@ -478,6 +479,15 @@ fn write_fake_codex_auth(context: &TestContext) -> PathBuf {
         r#"{"tokens":{"access_token":"test-access","refresh_token":"test-refresh"}}
 "#,
     )
+}
+
+fn write_fake_custom_env(context: &TestContext) {
+    context.write(
+        ".env",
+        r"GITHUB_PAT=test-github
+OPENAI_API_KEY=test-openai
+",
+    );
 }
 
 fn write_fake_qemu_system(context: &TestContext, mode: QemuSystemMode) -> PathBuf {

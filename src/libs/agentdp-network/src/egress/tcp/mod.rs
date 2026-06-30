@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 #[cfg(any(test, feature = "simulation"))]
 use std::fmt::Write as _;
 use std::io;
@@ -18,6 +18,7 @@ use crate::drive::{DriveRunnable, DriveSmoltcpTcpRecv, DriveTurn};
 use crate::gateway::Gateway;
 use crate::network::NetworkLimits;
 use crate::network::{TcpEgressRoute, TcpProxyId};
+use crate::policy::Authority;
 use crate::reactor::ReactorItemId;
 use crate::reactor::{ReactorBackend, ReactorReady};
 use crate::readiness::IoSlotState;
@@ -212,6 +213,16 @@ where
 
     pub(crate) fn shutdown(&mut self, runtime: &mut impl NetworkRuntime<Reactor = R>) {
         self.proxies.shutdown(runtime.reactor_mut());
+    }
+
+    pub(crate) fn retire_authorities(
+        &mut self,
+        sockets: &mut SocketSet<'static>,
+        reactor: &mut R,
+        authorities: &BTreeSet<Authority>,
+    ) {
+        self.proxies.retire_authorities(sockets, reactor, authorities);
+        self.poll_scratch.clear();
     }
 }
 
@@ -511,6 +522,41 @@ where
         }
     }
 
+    fn retire_authorities(
+        &mut self,
+        sockets: &mut SocketSet<'static>,
+        reactor: &mut R,
+        authorities: &BTreeSet<Authority>,
+    ) {
+        for slot in self.slots.iter_mut().filter_map(Option::as_mut) {
+            if slot.entry.active.is_none() {
+                continue;
+            }
+            let Some(proxy_authority) = slot
+                .entry
+                .proxy
+                .as_ref()
+                .and_then(TcpProxy::authority)
+                .map(Authority::new)
+            else {
+                continue;
+            };
+            if !authorities.contains(&proxy_authority) {
+                continue;
+            }
+            if let Some(mut proxy) = slot.entry.proxy.take() {
+                #[cfg(any(test, feature = "simulation"))]
+                {
+                    slot.entry.last_proxy_snapshot = Some(proxy.debug_snapshot());
+                }
+                proxy.deregister(reactor);
+            }
+            slot.entry.pending_writes.clear();
+            slot.entry.proxy_closed = true;
+            sockets.get_mut::<tcp::Socket>(slot.handle).abort();
+        }
+    }
+
     fn emit_or_queue(
         &mut self,
         events: &mut Vec<TcpProxyEvent>,
@@ -799,6 +845,13 @@ where
         match self {
             Self::Plain(plain) => plain.deregister(reactor),
             Self::Tls(tls) => tls.deregister(reactor),
+        }
+    }
+
+    fn authority(&self) -> Option<&str> {
+        match self {
+            Self::Plain(plain) => plain.authority(),
+            Self::Tls(tls) => tls.authority(),
         }
     }
 

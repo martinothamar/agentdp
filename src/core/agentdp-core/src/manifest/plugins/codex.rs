@@ -55,6 +55,7 @@ static CODEX_AUTH_TRANSFORM: MediatedJsonAuthTransform = MediatedJsonAuthTransfo
     name: "codex-auth",
     prefix: "CODEX_AUTH",
     hosts: &["api.openai.com", "chatgpt.com"],
+    normalize_expiry: true,
 };
 
 fn codex_auth_guest_path() -> HostInputGuestPath {

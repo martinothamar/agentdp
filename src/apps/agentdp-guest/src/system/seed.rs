@@ -60,6 +60,14 @@ impl SeedSpec {
     pub(super) fn bootstrap_root_path(&self) -> PathBuf {
         PathBuf::from(&self.instance.paths.bootstrap_root)
     }
+
+    pub(super) fn user_name(&self) -> &str {
+        &self.instance.user.name
+    }
+
+    pub(super) fn user_home(&self) -> &str {
+        &self.instance.user.home
+    }
 }
 
 async fn read_bootstrap_plan(path: &Path) -> Result<BootstrapPlan> {

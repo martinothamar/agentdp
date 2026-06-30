@@ -20,7 +20,7 @@ use crate::network::{
     ApplicationPolicy, BlockReason, EgressDecision, EgressUdpSend, HostConnectionId, IngressTcpOutput, IngressUdpSend,
     InstanceMacAddresses, InstanceNetworkConfig, TcpEgressPolicy, TcpEgressRoute, UdpProxyKey,
 };
-use crate::policy::{Authority, NetworkPolicy};
+use crate::policy::{Authority, NetworkPolicy, RuntimeSecrets};
 use crate::reactor::ReactorBackend;
 use crate::tls::TlsIntercept;
 use smoltcp::iface::{Config as SmoltcpConfig, Interface, PollResult, SocketSet};
@@ -127,6 +127,18 @@ impl<C: NetworkClock> Gateway<C> {
 
     pub(crate) fn record_dns_resolution(&mut self, host: &str, addresses: Vec<IpAddr>, ttl: Duration) {
         self.dns.record(host, addresses, ttl, &self.clock);
+    }
+
+    pub(crate) fn update_runtime_secrets(
+        &mut self,
+        secrets: RuntimeSecrets,
+    ) -> Option<std::collections::BTreeSet<Authority>> {
+        if self.config.policy.secrets == secrets {
+            return None;
+        }
+        let affected_authorities = self.config.policy.secrets.changed_authorities(&secrets);
+        self.config.policy.secrets = secrets;
+        Some(affected_authorities)
     }
 
     /// Returns smoltcp's advisory wait time before the gateway should be polled again.
@@ -532,6 +544,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
+    use agentdp_crypto::CertificateAuthorityPem;
     use smoltcp::wire::{
         ETHERNET_HEADER_LEN, EthernetFrame, EthernetProtocol, IPV4_HEADER_LEN, IpAddress, IpProtocol, Ipv4Packet,
         Ipv4Repr, TCP_HEADER_LEN, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
@@ -546,7 +559,7 @@ mod tests {
         ApplicationPolicy, EgressDecision, EgressUdpSend, HostConnectionId, IngressTcpOutput, IngressUdpSend,
         InstanceAddresses, InstanceMacAddresses, InstanceNetworkConfig, MacAddress, NetworkLimits,
     };
-    use crate::policy::{EgressPolicy, NetworkPolicy, RuntimeSecrets};
+    use crate::policy::{Authority, EgressPolicy, NetworkPolicy, RuntimeSecrets};
     use crate::test_support::unit::{dns_a_response, dns_query};
 
     use super::dns::DnsAttribution;
@@ -558,6 +571,7 @@ mod tests {
     use crate::application::ApplicationProtocol;
     use crate::egress::tcp::{TcpProxies, tcp_listen_endpoint};
     use crate::reactor::MioReactor;
+    use crate::tls::TlsInterceptConfig;
 
     const TEST_MAC: InstanceMacAddresses = InstanceMacAddresses {
         gateway: MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
@@ -598,6 +612,31 @@ mod tests {
             .expect("prewarmed byte buffer");
         output.extend_from_slice(bytes);
         output
+    }
+
+    fn runtime_secret(value: &str) -> RuntimeSecrets {
+        let mut secrets = RuntimeSecrets::new();
+        secrets.insert(RuntimeSecret::new(
+            "AGENTDP_SECRET_TOKEN",
+            value,
+            ["allowed.test".to_owned()],
+        ));
+        secrets
+    }
+
+    fn assert_tls_route_secret(route: &TcpEgressRoute, authority: &Authority, expected: &str) {
+        let TcpEgressRoute::Tls(policy) = route else {
+            panic!("expected TLS egress route");
+        };
+        let decision = policy.decision_for(authority).expect("authority decision");
+        let ApplicationPolicy::Http1 { secrets, .. } = &decision.application else {
+            panic!("expected HTTP/1 policy");
+        };
+        assert_eq!(
+            secrets.iter().next().map(RuntimeSecret::value),
+            Some(expected),
+            "TLS route should use latest runtime secrets"
+        );
     }
 
     #[test]
@@ -769,6 +808,36 @@ mod tests {
                 reject_secret_placeholders: false,
             })
         ));
+    }
+
+    #[test]
+    fn gateway_runtime_secret_update_applies_to_new_tls_routes() -> Result<(), Box<dyn std::error::Error>> {
+        let ca = CertificateAuthorityPem::generate()?;
+        let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
+        config.policy = NetworkPolicy::new(EgressPolicy::allow_all()).with_secrets(runtime_secret("old-secret"));
+        config.tls = Some(TlsInterceptConfig {
+            ca_cert_pem: ca.cert_pem,
+            ca_key_pem: ca.key_pem,
+            upstream_root_ca_pems: Vec::new(),
+            intercepted_ports: vec![443],
+            bypass_hosts: Vec::new(),
+        });
+        let buffers = test_buffers();
+        let upstream = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let authority = Authority::new("allowed.test");
+        let mut gateway = Gateway::new(&config, buffers, SystemClock);
+        gateway.record_dns_resolution(authority.as_str(), vec![upstream], Duration::from_mins(1));
+
+        let first = gateway.tcp_egress_route(SocketAddr::new(upstream, 443)).1;
+        assert_tls_route_secret(&first, &authority, "old-secret");
+
+        let affected = gateway
+            .update_runtime_secrets(runtime_secret("new-secret"))
+            .expect("changed secrets");
+        assert_eq!(affected, std::iter::once(authority.clone()).collect());
+        let second = gateway.tcp_egress_route(SocketAddr::new(upstream, 443)).1;
+        assert_tls_route_secret(&second, &authority, "new-secret");
+        Ok(())
     }
 
     #[test]

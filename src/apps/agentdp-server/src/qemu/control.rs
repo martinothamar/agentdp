@@ -8,8 +8,9 @@ use agentdp_protocol::Error as ProtocolError;
 use agentdp_protocol::jsonl::JsonLineReader;
 use agentdp_protocol::server_guest::{
     BootstrapFailed, BootstrapLifecycleStatus, BootstrapStatusReport, BootstrapStepFinished, BootstrapStepStarted,
-    GUEST_CONTROL_PROTOCOL_VERSION, GuestError, GuestHello, GuestMessage, GuestMessageKind, GuestdRole,
-    decode_guest_message_line,
+    GUEST_CONTROL_PROTOCOL_VERSION, GuestCommandResult, GuestError, GuestHello, GuestMessage, GuestMessageKind,
+    GuestdRole, HostCommand, HostMessage, HostMessageKind, WRITE_USER_FILE_COMMAND, WriteUserFileCommand,
+    decode_guest_message_line, encode_host_message_line,
 };
 
 use super::error::{Error, ErrorKind};
@@ -18,13 +19,73 @@ use crate::backend::BootstrapEventSink;
 const BOOTSTRAP_WAIT_TIMEOUT: Duration = Duration::from_mins(45);
 const CONTROL_CONNECT_DELAY: Duration = Duration::from_millis(250);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(super) async fn write_user_file(
+    context: &Context,
+    control_socket: &Path,
+    path: &str,
+    contents: &[u8],
+    permissions: &str,
+) -> Result<bool, Error> {
+    context
+        .logger()
+        .verbose_with(|| format!("writing guest file {path} through {}", control_socket.display()));
+    let mut stream =
+        socket::connect_local_socket(control_socket)
+            .await
+            .map_err(|source| ErrorKind::GuestControlMessage {
+                code: "guest_control_connect".to_owned(),
+                message: format!("failed to connect to {}: {source}", control_socket.display()),
+            })?;
+    let id = "write_user_file";
+    let payload = WriteUserFileCommand {
+        path: path.to_owned(),
+        contents: contents.to_vec(),
+        permissions: permissions.to_owned(),
+    };
+    let message = HostMessage::new(
+        id,
+        HostMessageKind::Command(HostCommand {
+            command: WRITE_USER_FILE_COMMAND.to_owned(),
+            payload: serde_json::to_value(payload).map_err(|source| ErrorKind::GuestControlMessage {
+                code: "guest_control_encode".to_owned(),
+                message: source.to_string(),
+            })?,
+        }),
+    );
+    let line = encode_host_message_line(&message).map_err(|source| ErrorKind::GuestControlDecode {
+        message: "host command".to_owned(),
+        source,
+    })?;
+    stream
+        .write_all(&line)
+        .await
+        .map_err(|source| ErrorKind::GuestControlMessage {
+            code: "guest_control_write".to_owned(),
+            message: source.to_string(),
+        })?;
+    stream.flush().await.map_err(|source| ErrorKind::GuestControlMessage {
+        code: "guest_control_write".to_owned(),
+        message: source.to_string(),
+    })?;
+    let result = tokio::time::timeout(CONTROL_COMMAND_TIMEOUT, read_command_result(&mut stream, id)).await;
+    result.map_err(|_elapsed| ErrorKind::GuestControlMessage {
+        code: "guest_control_timeout".to_owned(),
+        message: format!(
+            "guest did not answer {WRITE_USER_FILE_COMMAND} after {}s",
+            CONTROL_COMMAND_TIMEOUT.as_secs()
+        ),
+    })?
+}
 
 pub(super) async fn wait_bootstrap(
     context: &Context,
     state: &AgentInstanceDocument,
     bootstrap_events: Option<&mut dyn BootstrapEventSink>,
 ) -> Result<(), Error> {
-    let control_socket = guest_control_socket_path(state);
+    let BackendState::Qemu(backend) = &state.status.backend;
+    let control_socket = PathBuf::from(&backend.guest_control_socket);
     context.logger().verbose_with(|| {
         format!(
             "waiting up to {}s for QEMU guest bootstrap on {}",
@@ -154,6 +215,56 @@ async fn read_bootstrap_stream(
     }
 }
 
+async fn read_command_result(stream: &mut AsyncLocalSocket, expected_id: &str) -> Result<bool, Error> {
+    let mut reader = JsonLineReader::default();
+    let mut frame = Vec::new();
+    loop {
+        if !reader
+            .read_line(stream, &mut frame)
+            .await
+            .map_err(|source| ErrorKind::GuestControlDecode {
+                message: "guest control command response".to_owned(),
+                source,
+            })?
+        {
+            return Err(ErrorKind::GuestControlMessage {
+                code: "guest_control_eof".to_owned(),
+                message: "guest closed control channel before command response".to_owned(),
+            }
+            .into());
+        }
+        let message = decode_guest_message_line(&frame).map_err(|source| ErrorKind::GuestControlDecode {
+            message: String::from_utf8_lossy(&frame).trim_end().to_owned(),
+            source,
+        })?;
+        if message.id != expected_id {
+            continue;
+        }
+        return command_result_from_message(message);
+    }
+}
+
+fn command_result_from_message(message: GuestMessage) -> Result<bool, Error> {
+    match message.kind {
+        GuestMessageKind::CommandResult(GuestCommandResult { command, updated })
+            if command == WRITE_USER_FILE_COMMAND =>
+        {
+            Ok(updated)
+        }
+        GuestMessageKind::CommandResult(result) => Err(ErrorKind::GuestControlMessage {
+            code: "guest_control_command_mismatch".to_owned(),
+            message: format!("guest returned result for unexpected command {}", result.command),
+        }
+        .into()),
+        GuestMessageKind::Error(error) => Err(guest_error(error)),
+        other => Err(ErrorKind::GuestControlMessage {
+            code: "guest_control_unexpected_message".to_owned(),
+            message: format!("guest returned unexpected message {other:?}"),
+        }
+        .into()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamResult {
     Finished,
@@ -255,6 +366,12 @@ impl BootstrapObserver {
                 send_failed_bootstrap_event(events, &failed);
                 return Err(bootstrap_failed(failed));
             }
+            GuestMessageKind::CommandResult(result) => {
+                return Err(guest_control_handshake(format!(
+                    "guest sent command result {} during bootstrap",
+                    result.command
+                )));
+            }
             GuestMessageKind::Error(error) => return Err(guest_error(error)),
         }
         Ok(BootstrapStreamStatus::Running)
@@ -306,6 +423,7 @@ impl BootstrapObserver {
                 format!("bootstrap finished {}", step_status_name(finished.status))
             }
             GuestMessageKind::BootstrapFailed(failed) => format!("bootstrap step {} failed", failed.step),
+            GuestMessageKind::CommandResult(result) => format!("guest command {} finished", result.command),
             GuestMessageKind::Error(error) => format!("guest error {}: {}", error.code, error.message),
         }
     }
@@ -421,17 +539,6 @@ fn guest_control_handshake(message: String) -> Error {
         message,
     }
     .into()
-}
-
-fn guest_control_socket_path(state: &AgentInstanceDocument) -> PathBuf {
-    let BackendState::Qemu(qemu) = &state.status.backend;
-    if !qemu.guest_control_socket.is_empty() {
-        return PathBuf::from(&qemu.guest_control_socket);
-    }
-    Path::new(&qemu.qmp_socket)
-        .parent()
-        .map(|path| path.join("guest-control.sock"))
-        .unwrap_or_default()
 }
 
 const fn role_name(role: GuestdRole) -> &'static str {

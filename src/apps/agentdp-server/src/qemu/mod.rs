@@ -23,8 +23,8 @@ use agentdp_qemu::{disk, system};
 use crate::agent::{AgentBaseFiles, AgentBaseKey, AgentManifestContext};
 use crate::backend::{
     Backend, BackendBaseImageIdentity, BackendFuture, BackendValueFuture, BootstrapEventSink, CreateBaseInput,
-    CreateBaseOutput, CreateInstanceInput, CreateInstanceOutput, Error as BackendError, ReconcileOutput, StartOutput,
-    StopInstanceInput, StopOutput,
+    CreateBaseOutput, CreateInstanceInput, CreateInstanceOutput, Error as BackendError, ReconcileHostInputsOutput,
+    ReconcileOutput, StartOutput, StopInstanceInput, StopOutput,
 };
 use crate::host::{HostSshError, execute_host_shell_command, interactive_host_shell_command};
 use crate::services::InstanceNetwork;
@@ -273,6 +273,34 @@ impl Backend for QemuBackend {
                     agent: state.metadata.agent.as_str(),
                     instance: state.metadata.name.as_str(),
                     network: &state.status.network,
+                    manifest,
+                },
+                qemu_state_mut(&mut state.status.backend),
+            )
+            .await
+            .map_err(BackendError::Qemu)
+        })
+    }
+
+    fn reconcile_host_inputs<'a>(
+        &'a self,
+        context: &'a Context,
+        instance_network: &'a InstanceNetwork,
+        manifest: &'a AgentManifestContext,
+        state: &'a mut AgentInstanceDocument,
+    ) -> BackendFuture<'a, ReconcileHostInputsOutput> {
+        Box::pin(async move {
+            let agent = state.metadata.agent.clone();
+            let instance = state.metadata.name.clone();
+            let network = state.status.network.clone();
+            lifecycle::reconcile_host_inputs(
+                lifecycle::RuntimeInput {
+                    context,
+                    instance_network,
+                    instance_status: state.status.phase,
+                    agent: agent.as_str(),
+                    instance: instance.as_str(),
+                    network: &network,
                     manifest,
                 },
                 qemu_state_mut(&mut state.status.backend),

@@ -15,7 +15,9 @@ use agentdp_core::agent::{
     QemuMediatedCaState, QemuState, assign_port_mappings,
 };
 use agentdp_core::doctor::DoctorReport;
-use agentdp_core::manifest::{AgentManifest, AgentPhase, GuestPort, NetworkProtocol};
+use agentdp_core::manifest::plugins::codex::Codex;
+use agentdp_core::manifest::plugins::{AuthMode, codex};
+use agentdp_core::manifest::{AgentManifest, AgentPhase, GuestPort, NetworkMode, NetworkProtocol, Secret};
 use agentdp_core::provisioning::image::CatalogImage;
 use agentdp_core::provisioning::secrets::SecretBindings;
 use agentdp_ds::local::{oneshot, spsc};
@@ -163,6 +165,63 @@ async fn generation_reconcile_preserves_configured_host_ports() {
 }
 
 #[tokio::test(flavor = "local")]
+async fn apply_rejects_mediated_auth_binding_change_after_provisioning() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let (agent, mut stream) = start_agent(&manifest).await;
+    wait_for_ready(&mut stream, 1).await;
+    let mut changed = manifest_with(1);
+    changed.metadata.name.clone_from(&manifest.metadata.name);
+    changed.spec.template.network.mode = NetworkMode::Mediated;
+
+    let error = apply_result(&agent, manifest_context(changed))
+        .await
+        .expect_err("mediated auth binding change should be rejected");
+
+    assert!(error.to_string().contains("mediated auth inputs cannot change"));
+}
+
+#[tokio::test(flavor = "local")]
+async fn apply_allows_mediated_auth_host_policy_change_after_provisioning() {
+    let manifest = manifest_with_top_level_mediated_secret(1, &["api.github.com"]);
+    let (agent, mut stream) = start_agent(&manifest).await;
+    wait_for_ready(&mut stream, 1).await;
+    let changed = manifest_with_top_level_mediated_secret(1, &["api.github.com", "uploads.github.com"]);
+
+    let document = apply_result(&agent, manifest_context(changed))
+        .await
+        .expect("host policy change should be accepted");
+
+    assert_eq!(document.manifest().spec.template.secrets[0].allow_hosts.len(), 2);
+}
+
+#[tokio::test(flavor = "local")]
+async fn apply_allows_top_level_mediated_secret_reordering_after_provisioning() {
+    let manifest = manifest_with_top_level_mediated_secrets(
+        1,
+        &[
+            ("ALTINN_DEV_KEY", &["api.github.com"][..]),
+            ("ALTINN_REFRESH_TOKEN", &["chatgpt.com"][..]),
+        ],
+    );
+    let (agent, mut stream) = start_agent(&manifest).await;
+    wait_for_ready(&mut stream, 1).await;
+    let changed = manifest_with_top_level_mediated_secrets(
+        1,
+        &[
+            ("ALTINN_REFRESH_TOKEN", &["chatgpt.com"][..]),
+            ("ALTINN_DEV_KEY", &["api.github.com"][..]),
+        ],
+    );
+
+    let document = apply_result(&agent, manifest_context(changed))
+        .await
+        .expect("reordering same mediated secrets should be accepted");
+
+    assert_eq!(document.manifest().spec.template.secrets[0].env, "ALTINN_REFRESH_TOKEN");
+    assert_eq!(document.manifest().spec.template.secrets[1].env, "ALTINN_DEV_KEY");
+}
+
+#[tokio::test(flavor = "local")]
 async fn late_watch_receives_current_document_then_live_events() {
     let (agent, mut initial_stream) = start_agent(&manifest_with(1)).await;
     let ready = wait_for_ready(&mut initial_stream, 1).await;
@@ -251,6 +310,218 @@ async fn instance_creation_passes_instance_name_not_agent_qualified_identity() {
         ["replica-0"],
         "backend instance identity must match AgentInstanceDocument metadata"
     );
+}
+
+#[tokio::test(flavor = "local")]
+async fn failed_instance_creation_does_not_retry_in_a_busy_loop() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_instance_creates(1);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        AgentName::new("altinn-studio"),
+        unique_layout(&manifest_with(1)).0,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest_with(1))).await;
+    wait_for_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentEvent::Diagnostic { message, .. } if message.contains("failed to create instance")
+        )
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        backend.created_instances.borrow().len(),
+        1,
+        "creation failure must occupy the instance slot until the retry deadline"
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn failed_base_creation_does_not_retry_in_a_busy_loop() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_base_creates(1);
+    let manifest = manifest_with(1);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        AgentName::new(manifest.name()),
+        unique_layout(&manifest).0,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_event(&mut stream, |event| matches!(event, AgentEvent::AgentBaseFailed { .. })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        *backend.created_bases.borrow(),
+        1,
+        "base setup failure must not retry until desired state changes"
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn failed_host_input_reconcile_does_not_retry_in_a_busy_loop() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_host_input_reconciles(1);
+    let (layout, agent_name) = unique_layout(&manifest_with(1));
+    persist_ready_running_instance(&layout, &agent_name, &manifest_with(1)).await;
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentEvent::Diagnostic { message, .. } if message.contains("failed to reconcile host inputs")
+        )
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        *backend.host_input_reconciles.borrow(),
+        1,
+        "host input failure must wait for retry delay before re-reading host files"
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn apply_after_failed_instance_creation_retries_new_generation() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_instance_creates(1);
+    let initial = manifest_with(1);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        AgentName::new(initial.name()),
+        unique_layout(&initial).0,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentEvent::Diagnostic { message, .. } if message.contains("failed to create instance")
+        )
+    })
+    .await;
+    let mut changed = manifest_with(1);
+    changed.spec.bootstrap.packages.push("htop".to_owned());
+    apply(&agent, manifest_context(changed)).await;
+
+    let ready = wait_for_ready(&mut stream, 1).await;
+
+    assert_eq!(ready.status.replicas.ready, 1);
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+}
+
+#[tokio::test(flavor = "local")]
+async fn delete_after_failed_instance_creation_converges_without_waiting_for_retry() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_instance_creates(1);
+    let manifest = manifest_with(1);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        AgentName::new(manifest.name()),
+        unique_layout(&manifest).0,
+        backend,
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentEvent::Diagnostic { message, .. } if message.contains("failed to create instance")
+        )
+    })
+    .await;
+    delete(&agent).await;
+
+    let deleted = wait_for_document(&mut stream, |document| document.status.deleted).await;
+    assert!(deleted.status.instances.is_empty());
+}
+
+#[tokio::test(flavor = "local")]
+async fn scale_to_zero_after_failed_instance_creation_converges_without_waiting_for_retry() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_instance_creates(1);
+    let manifest = manifest_with(1);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        AgentName::new(manifest.name()),
+        unique_layout(&manifest).0,
+        backend,
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentEvent::Diagnostic { message, .. } if message.contains("failed to create instance")
+        )
+    })
+    .await;
+    let accepted = scale(&agent, 0).await;
+
+    let stopped = wait_for_document(&mut stream, |document| {
+        document.generation() == accepted.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.active == 0
+            && !document.status.reconciling
+    })
+    .await;
+    assert_eq!(stopped.replicas(), 0);
+}
+
+#[tokio::test(flavor = "local")]
+async fn scale_down_after_failed_extra_instance_creation_drops_retry_placeholder() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_instance_creates(2);
+    let manifest = manifest_with(2);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        AgentName::new(manifest.name()),
+        unique_layout(&manifest).0,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    for _ in 0..2 {
+        wait_for_event(&mut stream, |event| {
+            matches!(
+                event,
+                AgentEvent::Diagnostic { message, .. } if message.contains("failed to create instance")
+            )
+        })
+        .await;
+    }
+    scale(&agent, 1).await;
+
+    let ready = wait_for_ready(&mut stream, 1).await;
+
+    assert_eq!(ready.status.replicas.ready, 1);
+    assert_eq!(backend.created_instances.borrow().len(), 3);
 }
 
 #[tokio::test(flavor = "local")]
@@ -642,6 +913,7 @@ async fn persisted_ready_instance_reconciles_after_agent_restart() {
 
     wait_for_ready(&mut stream, 1).await;
     assert_eq!(*backend.instance_reconciles.borrow(), 1);
+    wait_for_host_input_reconcile_count(&backend, 1).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -761,6 +1033,10 @@ async fn recv_stream_item(stream: &mut spsc::Receiver<AgentStreamItem>) -> Agent
 }
 
 async fn apply(agent: &Agent, manifest: AgentManifestContext) -> AgentDocument {
+    apply_result(agent, manifest).await.expect("apply succeeds")
+}
+
+async fn apply_result(agent: &Agent, manifest: AgentManifestContext) -> Result<AgentDocument, Error> {
     let (respond, receive) = oneshot::channel();
     agent
         .send(AgentCommand::Apply {
@@ -768,7 +1044,7 @@ async fn apply(agent: &Agent, manifest: AgentManifestContext) -> AgentDocument {
             respond,
         })
         .expect("agent accepts apply command");
-    receive.await.expect("apply response").expect("apply succeeds")
+    receive.await.expect("apply response")
 }
 
 async fn scale(agent: &Agent, replicas: u16) -> AgentDocument {
@@ -807,6 +1083,20 @@ async fn status(agent: &Agent, id: AgentInstanceId) -> Result<AgentInstanceDocum
         .send(AgentCommand::InstanceStatus { instance: id, respond })
         .expect("agent accepts status command");
     receive.await.expect("status response")
+}
+
+async fn wait_for_host_input_reconcile_count(backend: &FakeBackend, expected: u32) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for host input reconciliation"
+        );
+        if *backend.host_input_reconciles.borrow() >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 async fn exec(
@@ -869,6 +1159,38 @@ fn manifest_with(replicas: u16) -> AgentManifest {
     let mut manifest: AgentManifest = serde_yaml::from_str(agentdp_test_support::manifest::minimal()).unwrap();
     manifest.spec.replicas = replicas;
     manifest.spec.phase = AgentPhase::Running;
+    manifest
+}
+
+fn manifest_with_codex_mediated_auth(replicas: u16) -> AgentManifest {
+    let mut manifest = manifest_with(replicas);
+    manifest.metadata.name = "codex-auth".to_owned();
+    manifest.spec.replicas = replicas;
+    manifest.spec.template.network.mode = NetworkMode::Mediated;
+    manifest.spec.template.plugins.codex = Some(Codex {
+        yolo: false,
+        auth: AuthMode::Mediated,
+        auth_source: Some(codex::CodexAuthSource::HostAuth),
+    });
+    manifest
+}
+
+fn manifest_with_top_level_mediated_secret(replicas: u16, hosts: &[&str]) -> AgentManifest {
+    manifest_with_top_level_mediated_secrets(replicas, &[("ALTINN_DEV_KEY", hosts)])
+}
+
+fn manifest_with_top_level_mediated_secrets(replicas: u16, secrets: &[(&str, &[&str])]) -> AgentManifest {
+    let mut manifest = manifest_with(replicas);
+    manifest.metadata.name = "top-level-secret".to_owned();
+    manifest.spec.template.network.mode = NetworkMode::Mediated;
+    manifest.spec.template.secrets = secrets
+        .iter()
+        .map(|(env, hosts)| Secret {
+            env: (*env).to_owned(),
+            from_env: None,
+            allow_hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+        })
+        .collect();
     manifest
 }
 
@@ -1067,10 +1389,15 @@ async fn write_persisted_instance(
 #[derive(Default)]
 struct FakeBackend {
     fail_next_base_stop: RefCell<bool>,
+    fail_base_creates: RefCell<u32>,
     fail_next_instance_delete: RefCell<bool>,
+    fail_instance_creates: RefCell<u32>,
     pause_next_instance_create: RefCell<Option<oneshot::Receiver<()>>>,
+    created_bases: RefCell<u32>,
     created_instances: RefCell<Vec<String>>,
     instance_reconciles: RefCell<u32>,
+    host_input_reconciles: RefCell<u32>,
+    fail_host_input_reconciles: RefCell<u32>,
     instance_stops: RefCell<u32>,
 }
 
@@ -1079,8 +1406,20 @@ impl FakeBackend {
         *self.fail_next_base_stop.borrow_mut() = true;
     }
 
+    fn fail_base_creates(&self, count: u32) {
+        *self.fail_base_creates.borrow_mut() = count;
+    }
+
     fn fail_next_instance_delete(&self) {
         *self.fail_next_instance_delete.borrow_mut() = true;
+    }
+
+    fn fail_instance_creates(&self, count: u32) {
+        *self.fail_instance_creates.borrow_mut() = count;
+    }
+
+    fn fail_host_input_reconciles(&self, count: u32) {
+        *self.fail_host_input_reconciles.borrow_mut() = count;
     }
 
     fn pause_next_instance_create(&self) -> oneshot::Sender<()> {
@@ -1093,8 +1432,35 @@ impl FakeBackend {
         std::mem::take(&mut *self.fail_next_base_stop.borrow_mut())
     }
 
+    fn take_base_create_failure(&self) -> bool {
+        let mut failures = self.fail_base_creates.borrow_mut();
+        if *failures == 0 {
+            return false;
+        }
+        *failures -= 1;
+        true
+    }
+
     fn take_instance_delete_failure(&self) -> bool {
         std::mem::take(&mut *self.fail_next_instance_delete.borrow_mut())
+    }
+
+    fn take_instance_create_failure(&self) -> bool {
+        let mut failures = self.fail_instance_creates.borrow_mut();
+        if *failures == 0 {
+            return false;
+        }
+        *failures -= 1;
+        true
+    }
+
+    fn take_host_input_reconcile_failure(&self) -> bool {
+        let mut failures = self.fail_host_input_reconciles.borrow_mut();
+        if *failures == 0 {
+            return false;
+        }
+        *failures -= 1;
+        true
     }
 
     fn take_instance_create_pause(&self) -> Option<oneshot::Receiver<()>> {
@@ -1143,7 +1509,12 @@ impl backend::Backend for FakeBackend {
         _context: &'a Context,
         _input: backend::CreateBaseInput<'a>,
     ) -> backend::BackendFuture<'a, backend::CreateBaseOutput> {
-        Box::pin(async {
+        *self.created_bases.borrow_mut() += 1;
+        let fail = self.take_base_create_failure();
+        Box::pin(async move {
+            if fail {
+                return Err(fake_backend_error());
+            }
             Ok(backend::CreateBaseOutput {
                 state: BackendState::Qemu(fake_qemu_state()),
                 image_cache_key: "image".to_owned(),
@@ -1191,10 +1562,14 @@ impl backend::Backend for FakeBackend {
         input: backend::CreateInstanceInput<'a>,
     ) -> backend::BackendFuture<'a, backend::CreateInstanceOutput> {
         let pause = self.take_instance_create_pause();
+        let fail = self.take_instance_create_failure();
         self.created_instances.borrow_mut().push(input.instance);
         Box::pin(async move {
             if let Some(release) = pause {
                 let _result = release.await;
+            }
+            if fail {
+                return Err(fake_backend_error());
             }
             Ok(backend::CreateInstanceOutput {
                 state: fake_mediated_backend_state(),
@@ -1294,6 +1669,30 @@ impl backend::Backend for FakeBackend {
                 backend_changed: false,
                 process: process_status("running"),
                 host_ports: state.status.network.ports.clone(),
+            })
+        })
+    }
+
+    fn reconcile_host_inputs<'a>(
+        &'a self,
+        _context: &'a Context,
+        _network: &'a InstanceNetwork,
+        manifest: &'a AgentManifestContext,
+        state: &'a mut AgentInstanceDocument,
+    ) -> backend::BackendFuture<'a, backend::ReconcileHostInputsOutput> {
+        *self.host_input_reconciles.borrow_mut() += 1;
+        let fail = self.take_host_input_reconcile_failure();
+        if !manifest.value().host_input_requirements().has_mediated_secret_inputs() {
+            let BackendState::Qemu(state) = &mut state.status.backend;
+            state.mediated_secrets = SecretBindings::default();
+        }
+        Box::pin(async move {
+            if fail {
+                return Err(fake_backend_error());
+            }
+            Ok(backend::ReconcileHostInputsOutput {
+                guest_files_updated: 0,
+                guest_file_failures: 0,
             })
         })
     }

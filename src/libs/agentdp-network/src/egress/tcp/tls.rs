@@ -176,6 +176,10 @@ where
         )
     }
 
+    pub(super) fn authority(&self) -> Option<&str> {
+        self.authority.as_deref()
+    }
+
     pub(super) fn write(&mut self, bytes: ByteBuf) {
         self.pending.push(bytes);
     }

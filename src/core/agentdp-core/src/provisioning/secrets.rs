@@ -123,6 +123,13 @@ impl SecretBinding {
             SecretValue::Redacted => None,
         }
     }
+
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut binding = self.clone();
+        binding.value = SecretValue::Redacted;
+        binding
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -185,6 +192,16 @@ impl SecretBindings {
 
     pub fn extend(&mut self, bindings: Self) {
         self.bindings.extend(bindings.bindings);
+    }
+
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let bindings = self
+            .bindings
+            .iter()
+            .map(|(placeholder, binding)| (placeholder.clone(), binding.redacted()))
+            .collect();
+        Self { bindings }
     }
 
     #[must_use]

@@ -83,6 +83,18 @@ pub(super) async fn ensure_instance_network_attached(
     Ok(task.is_some())
 }
 
+pub(super) fn update_instance_network_secrets(
+    runtime: &InstanceNetwork,
+    agent: &str,
+    instance: &str,
+    secrets: &SecretBindings,
+) -> Result<bool, Error> {
+    let label = format!("{agent}/{instance}");
+    runtime
+        .update_secrets(runtime_secrets(secrets))
+        .map_err(|error| instance_network_error(label, &error))
+}
+
 pub(super) async fn instance_network_is_attached(
     runtime: &InstanceNetwork,
     agent: &AgentName,

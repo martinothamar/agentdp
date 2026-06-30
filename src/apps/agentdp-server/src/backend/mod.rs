@@ -136,6 +136,14 @@ pub(crate) trait Backend: fmt::Debug {
         state: &'a mut AgentInstanceDocument,
     ) -> BackendFuture<'a, ReconcileOutput>;
 
+    fn reconcile_host_inputs<'a>(
+        &'a self,
+        context: &'a Context,
+        network: &'a InstanceNetwork,
+        manifest: &'a AgentManifestContext,
+        state: &'a mut AgentInstanceDocument,
+    ) -> BackendFuture<'a, ReconcileHostInputsOutput>;
+
     fn ensure_attached<'a>(
         &'a self,
         context: &'a Context,
@@ -239,6 +247,12 @@ pub(crate) struct ReconcileOutput {
     pub backend_changed: bool,
     pub process: ProcessStatus,
     pub host_ports: std::collections::BTreeMap<String, PortMappingState>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct ReconcileHostInputsOutput {
+    pub guest_files_updated: u16,
+    pub guest_file_failures: u16,
 }
 
 #[cfg(test)]

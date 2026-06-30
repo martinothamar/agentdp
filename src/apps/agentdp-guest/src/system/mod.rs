@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::Result;
 
 use self::bootstrap::BootstrapExecutor;
-use self::control::{ControlChannelSink, open_control_channel, wait_for_host_messages};
+use self::control::{ControlChannelSink, HostCommandContext, open_control_channel, wait_for_host_messages};
 use self::seed::SeedSpec;
 
 #[derive(Debug)]
@@ -36,11 +36,12 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     let plan_id = seed.instance.plan_id();
     let bootstrap_state_path = seed.bootstrap_state_path();
     let bootstrap_root_path = seed.bootstrap_root_path();
+    let host_command_context = HostCommandContext::from_seed(&seed);
     eprintln!("guestd system: running bootstrap");
     Box::pin(BootstrapExecutor::new(seed.plan, plan_id, bootstrap_state_path, bootstrap_root_path).run(&mut sink))
         .await?;
     eprintln!("guestd system: bootstrap finished");
-    wait_for_host_messages(sink.into_inner()).await?;
+    wait_for_host_messages(sink.into_inner(), &host_command_context).await?;
     Ok(())
 }
 

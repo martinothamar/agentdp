@@ -32,6 +32,11 @@ seed_user_data: |
     ssh_authorized_keys:
     - ssh-ed25519 AAAATEST agentdp
   write_files:
+  - path: /etc/agentdp/.env
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: $BASE64_CONTENT
   - path: /run/agentdp/bin/guestctl.gz
     permissions: '0644'
     owner: root:root

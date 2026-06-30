@@ -16,9 +16,9 @@ use agentdp_core::agent::{
     AgentInstanceEventEnvelope, AgentInstanceEventSource, AgentInstanceId, AgentInstanceNetworkEvent,
     AgentInstanceNetworkEventKind, AgentInstanceNetworkStatus, AgentInstancePhase, AgentInstanceSessionsWorkStatus,
     AgentInstanceTarget, AgentInstanceTransitionKind, AgentInstanceTransitionWorkStatus, AgentInstanceWorkStatus,
-    AgentName, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State, NetworkState,
-    OperationResult, PortMappingState, PortRequestError, ReadinessResult, ReadinessState, ServiceStatus, SessionKind,
-    SessionResultSummary, assign_port_mappings,
+    AgentName, BackendState, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State,
+    NetworkState, OperationResult, PortMappingState, PortRequestError, ReadinessResult, ReadinessState, ServiceStatus,
+    SessionKind, SessionResultSummary, assign_port_mappings,
 };
 use agentdp_core::manifest::{AgentPhase, ValidationErrors};
 use agentdp_core::provisioning::bootstrap::BootstrapGraphError;
@@ -50,6 +50,11 @@ use super::event_log::{Error as EventLogError, EventLogWriter, next_sequence as 
 const INPUT_CAPACITY: usize = 256;
 const RECENT_EVENT_CAPACITY: usize = 128;
 const AGENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const HOST_INPUT_RECONCILE_INTERVAL: Duration = Duration::from_mins(15);
+const HOST_INPUT_RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(15);
+const HOST_INPUT_RECONCILE_RETRY_MAX_DELAY: Duration = Duration::from_mins(5);
+const INSTANCE_CREATE_RETRY_DELAY: Duration = Duration::from_secs(15);
+const INSTANCE_CREATE_RETRY_MAX_DELAY: Duration = Duration::from_mins(5);
 const INSTANCE_BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(15);
 const INSTANCE_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_TAIL_CHUNK_BYTES: u64 = 64 * 1024;
@@ -174,6 +179,10 @@ pub(crate) enum Error {
     EmptyExecCommand,
     #[error("exec timeout must be greater than zero")]
     InvalidExecTimeout,
+    #[error(
+        "mediated auth inputs cannot change after provisioning; credential values and host policy may change, but changing auth mode, source, guest path, or transform requires deleting and recreating the agent"
+    )]
+    MediatedAuthBindingsChanged,
 }
 
 pub(crate) enum AgentInstanceSessionOutput {
@@ -358,6 +367,11 @@ enum WorkCompletion {
         generation: u64,
         document: Result<AgentInstanceDocument, String>,
     },
+    HostInputsReconciled {
+        id: AgentInstanceId,
+        generation: u64,
+        result: Result<(BackendState, backend::ReconcileHostInputsOutput), (BackendState, String)>,
+    },
     InstanceStopped {
         id: AgentInstanceId,
         generation: u64,
@@ -455,12 +469,44 @@ pub(super) enum AgentBaseState {
     Stopped,
 }
 
+impl AgentBaseState {
+    const fn has_provisioned_resources(&self) -> bool {
+        matches!(
+            self,
+            Self::Building { .. }
+                | Self::Ready { .. }
+                | Self::Stopping
+                | Self::Stopped
+                | Self::Failed { key: Some(_), .. }
+        )
+    }
+}
+
 pub(super) struct StartingAgentInstanceState {
     generation: u64,
+    retry_at: Option<Instant>,
+    failure_count: u16,
     event_sequence: u64,
     events: EventLogWriter<AgentInstanceEventEnvelope>,
     network_runtime: Rc<InstanceNetwork>,
     network_events: spsc::Receiver<AgentInstanceNetworkEvent>,
+}
+
+impl StartingAgentInstanceState {
+    fn new(context: &Context, layout: &AgentdpLayout, agent: &AgentName, id: AgentInstanceId, generation: u64) -> Self {
+        let instance_layout = layout.instance(agent, id);
+        let events = EventLogWriter::spawn(context, instance_layout.instance_events());
+        let (network_events, network_event_receiver) = spsc::bounded(1024);
+        Self {
+            generation,
+            retry_at: None,
+            failure_count: 0,
+            event_sequence: 1,
+            events,
+            network_runtime: Rc::new(InstanceNetwork::new(network_events)),
+            network_events: network_event_receiver,
+        }
+    }
 }
 
 #[allow(
@@ -514,6 +560,7 @@ pub(super) struct RunningAgentInstanceState {
     work: Option<AgentInstanceWork>,
     network_runtime: Rc<InstanceNetwork>,
     network_events: spsc::Receiver<AgentInstanceNetworkEvent>,
+    host_inputs: HostInputReconcileState,
     session: Option<ForegroundSession>,
 }
 
@@ -535,7 +582,24 @@ impl RunningAgentInstanceState {
             work: None,
             network_runtime,
             network_events,
+            host_inputs: HostInputReconcileState::new(),
             session: None,
+        }
+    }
+}
+
+struct HostInputReconcileState {
+    next_at: Instant,
+    in_flight: bool,
+    failure_count: u16,
+}
+
+impl HostInputReconcileState {
+    fn new() -> Self {
+        Self {
+            next_at: Instant::now(),
+            in_flight: false,
+            failure_count: 0,
         }
     }
 }
@@ -781,7 +845,15 @@ impl RunningAgentState {
 
     fn next_wake(&self) -> Option<Instant> {
         let mut deadline = Some(self.next_reconcile);
-        for instance in self.instances.values().filter_map(AgentInstanceState::running_ref) {
+        for instance in self.instances.values() {
+            let Some(instance) = instance.running_ref() else {
+                if let AgentInstanceState::Starting(starting) = instance
+                    && let Some(retry) = starting.retry_at
+                {
+                    deadline = Some(deadline.map_or(retry, |current| current.min(retry)));
+                }
+                continue;
+            };
             if instance.work.is_none()
                 && instance.session.is_none()
                 && instance.documents.private.spec.target == AgentInstanceTarget::Active
@@ -795,6 +867,11 @@ impl RunningAgentState {
                 && let Some(retry) = instance.bootstrap_retry
             {
                 deadline = Some(deadline.map_or(retry, |current| current.min(retry)));
+            }
+            if should_reconcile_host_inputs(instance) {
+                deadline = Some(deadline.map_or(instance.host_inputs.next_at, |current| {
+                    current.min(instance.host_inputs.next_at)
+                }));
             }
         }
         deadline
@@ -1095,6 +1172,7 @@ impl RunningAgentState {
     }
 
     fn apply_manifest(&mut self, manifest: &AgentManifestContext) -> Result<(), Error> {
+        self.validate_mediated_auth_bindings(manifest.value())?;
         let source_path = manifest.source_path().display().to_string();
         let previous_generation = self.documents.private.generation();
         let updated = if self.documents.private.status.deleted {
@@ -1125,6 +1203,22 @@ impl RunningAgentState {
         Ok(())
     }
 
+    fn validate_mediated_auth_bindings(&self, next: &agentdp_core::manifest::AgentManifest) -> Result<(), Error> {
+        if self.documents.private.status.deleted || !self.has_provisioned_state() {
+            return Ok(());
+        }
+        let current = self.documents.private.manifest().host_input_requirements();
+        let next = next.host_input_requirements();
+        if current.has_same_mediated_auth_bindings(&next) {
+            return Ok(());
+        }
+        Err(Error::MediatedAuthBindingsChanged)
+    }
+
+    fn has_provisioned_state(&self) -> bool {
+        !self.instances.is_empty() || self.base.has_provisioned_resources()
+    }
+
     fn handle_work_completion(&mut self, completion: WorkCompletion) {
         match completion {
             WorkCompletion::BasePrepared { .. }
@@ -1142,6 +1236,7 @@ impl RunningAgentState {
             | WorkCompletion::BootstrapEvent { .. }
             | WorkCompletion::BootstrapFinished { .. } => self.handle_bootstrap_completion(&completion),
             WorkCompletion::TailscaleServeReconciled { .. } => self.handle_tailscale_completion(&completion),
+            WorkCompletion::HostInputsReconciled { .. } => self.handle_host_inputs_completion(&completion),
             WorkCompletion::ExecFinished { .. } => self.handle_exec_completion(&completion),
         }
     }
@@ -1254,6 +1349,7 @@ impl RunningAgentState {
             | WorkCompletion::BootstrapEvent { .. }
             | WorkCompletion::BootstrapFinished { .. }
             | WorkCompletion::TailscaleServeReconciled { .. }
+            | WorkCompletion::HostInputsReconciled { .. }
             | WorkCompletion::InstanceStopped { .. }
             | WorkCompletion::InstanceDeleted { .. }
             | WorkCompletion::InstanceDeleteTimedOut { .. }
@@ -1337,6 +1433,7 @@ impl RunningAgentState {
             | WorkCompletion::BootstrapEvent { .. }
             | WorkCompletion::BootstrapFinished { .. }
             | WorkCompletion::TailscaleServeReconciled { .. }
+            | WorkCompletion::HostInputsReconciled { .. }
             | WorkCompletion::ExecFinished { .. } => {}
         }
     }
@@ -1347,12 +1444,15 @@ impl RunningAgentState {
         generation: u64,
         document: Result<AgentInstanceDocument, String>,
     ) {
+        if !matches!(
+            self.instances.get(&id),
+            Some(AgentInstanceState::Starting(pending)) if pending.generation == generation
+        ) {
+            return;
+        }
         let Some(AgentInstanceState::Starting(pending)) = self.instances.remove(&id) else {
             return;
         };
-        if generation != pending.generation {
-            return;
-        }
         match document {
             Ok(document) => {
                 self.instances.insert(
@@ -1372,6 +1472,10 @@ impl RunningAgentState {
                 );
             }
             Err(error) => {
+                let mut pending = pending;
+                pending.failure_count = pending.failure_count.saturating_add(1);
+                pending.retry_at = Some(Instant::now() + instance_create_retry_delay(pending.failure_count));
+                self.instances.insert(id, AgentInstanceState::Starting(pending));
                 self.emit(
                     AgentEventSource::Controller,
                     AgentEvent::Diagnostic {
@@ -1519,6 +1623,7 @@ impl RunningAgentState {
             | WorkCompletion::InstanceDeleted { .. }
             | WorkCompletion::InstanceDeleteTimedOut { .. }
             | WorkCompletion::TailscaleServeReconciled { .. }
+            | WorkCompletion::HostInputsReconciled { .. }
             | WorkCompletion::ExecFinished { .. } => {}
         }
     }
@@ -1560,6 +1665,71 @@ impl RunningAgentState {
                     level: EventLevel::Warn,
                     message,
                 },
+            );
+        }
+    }
+
+    fn handle_host_inputs_completion(&mut self, completion: &WorkCompletion) {
+        let WorkCompletion::HostInputsReconciled { id, generation, result } = completion else {
+            return;
+        };
+        let mut diagnostic = None;
+        {
+            let Some(instance) = self.instances.get_mut(id).and_then(AgentInstanceState::running_mut) else {
+                return;
+            };
+            if !instance.host_inputs.in_flight {
+                return;
+            }
+            instance.host_inputs.in_flight = false;
+            if *generation != instance.documents.private.spec.desired_generation {
+                instance.host_inputs.next_at = Instant::now();
+                return;
+            }
+            match result {
+                Ok((backend_state, output)) => {
+                    instance.documents.private.status.backend = backend_state.clone();
+                    if output.guest_file_failures > 0 {
+                        instance.host_inputs.failure_count = instance.host_inputs.failure_count.saturating_add(1);
+                        instance.host_inputs.next_at =
+                            Instant::now() + host_input_reconcile_retry_delay(instance.host_inputs.failure_count);
+                        diagnostic = Some((
+                            EventLevel::Warn,
+                            format!(
+                                "{id}: host input guest file writes failed: {}; live network secrets refreshed",
+                                output.guest_file_failures
+                            ),
+                        ));
+                    } else {
+                        instance.host_inputs.failure_count = 0;
+                        instance.host_inputs.next_at = Instant::now() + HOST_INPUT_RECONCILE_INTERVAL;
+                        if output.guest_files_updated > 0 {
+                            diagnostic = Some((
+                                EventLevel::Info,
+                                format!("{id}: wrote host input file updates: {}", output.guest_files_updated),
+                            ));
+                        }
+                    }
+                }
+                Err((backend_state, error)) => {
+                    instance.documents.private.status.backend = backend_state.clone();
+                    instance.host_inputs.failure_count = instance.host_inputs.failure_count.saturating_add(1);
+                    instance.host_inputs.next_at =
+                        Instant::now() + host_input_reconcile_retry_delay(instance.host_inputs.failure_count);
+                    diagnostic = Some((
+                        EventLevel::Warn,
+                        format!(
+                            "{id}: failed to reconcile host inputs (attempt {}): {error}",
+                            instance.host_inputs.failure_count
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some((level, message)) = diagnostic {
+            self.emit(
+                AgentEventSource::Instance { id: *id },
+                AgentEvent::Diagnostic { level, message },
             );
         }
     }
@@ -1703,6 +1873,7 @@ impl RunningAgentState {
     }
 
     fn reconcile_deletion(&mut self) {
+        self.drop_retrying_starting_instances(|_| true);
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
             let services = self.work_services();
@@ -1747,6 +1918,7 @@ impl RunningAgentState {
     }
 
     fn reconcile_inactive_instances(&mut self) {
+        self.drop_retrying_starting_instances(|_| true);
         let agent = self.documents.private.agent().clone();
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
@@ -1805,22 +1977,35 @@ impl RunningAgentState {
             return;
         };
         let manifest = document.manifest();
+        let now = Instant::now();
         for slot in 0..document.replicas() {
             let id = AgentInstanceId::new(u32::from(slot));
-            if self.instances.contains_key(&id) {
-                continue;
+            match self.instances.get_mut(&id) {
+                Some(AgentInstanceState::Running(_)) => continue,
+                Some(AgentInstanceState::Starting(starting)) => {
+                    if starting.generation != document.generation() {
+                        if starting.retry_at.is_none() {
+                            continue;
+                        }
+                        starting.generation = document.generation();
+                        starting.retry_at = None;
+                        starting.failure_count = 0;
+                    } else if starting.retry_at.is_none_or(|retry| now < retry) {
+                        continue;
+                    }
+                    starting.retry_at = None;
+                }
+                None => {
+                    let pending = StartingAgentInstanceState::new(
+                        &self.context,
+                        &self.layout,
+                        document.agent(),
+                        id,
+                        document.generation(),
+                    );
+                    self.instances.insert(id, AgentInstanceState::Starting(pending));
+                }
             }
-            let instance_layout = self.layout.instance(document.agent(), id);
-            let events = EventLogWriter::spawn(&self.context, instance_layout.instance_events());
-            let (network_events, network_event_receiver) = spsc::bounded(1024);
-            let pending = StartingAgentInstanceState {
-                generation: document.generation(),
-                event_sequence: 1,
-                events,
-                network_runtime: Rc::new(InstanceNetwork::new(network_events)),
-                network_events: network_event_receiver,
-            };
-            self.instances.insert(id, AgentInstanceState::Starting(pending));
             spawn_create_instance(
                 self.input.clone(),
                 self.backend.clone(),
@@ -1831,6 +2016,7 @@ impl RunningAgentState {
                 document.generation(),
             );
         }
+        self.drop_retrying_starting_instances(|id| id.as_u32() >= u32::from(document.replicas()));
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
             let warning = {
@@ -1847,9 +2033,15 @@ impl RunningAgentState {
                     || instance.documents.private.spec.agent_base != agent_base
                     || instance.documents.private.spec.target != target
                 {
+                    let generation_changed =
+                        instance.documents.private.spec.desired_generation != document.generation();
                     instance.documents.private.spec.desired_generation = document.generation();
                     instance.documents.private.spec.agent_base = agent_base.clone();
                     instance.documents.private.spec.target = target;
+                    if generation_changed {
+                        instance.host_inputs.next_at = Instant::now();
+                        instance.host_inputs.failure_count = 0;
+                    }
                     instance.documents.private.status.clear_readiness();
                     instance.documents.private.status.reconciliation = None;
                     instance.documents.private.status.network.runtime = None;
@@ -1878,6 +2070,15 @@ impl RunningAgentState {
             }
             self.reconcile_instance(id);
         }
+    }
+
+    fn drop_retrying_starting_instances(&mut self, mut should_drop: impl FnMut(AgentInstanceId) -> bool) {
+        // A retrying Starting slot is an admission placeholder only. It owns no VM yet, so
+        // desired-state changes can drop it instead of waiting for the retry deadline.
+        self.instances.retain(|id, state| {
+            !(should_drop(*id)
+                && matches!(state, AgentInstanceState::Starting(starting) if starting.retry_at.is_some()))
+        });
     }
 
     fn reconcile_instance(&mut self, id: AgentInstanceId) {
@@ -1962,7 +2163,28 @@ impl RunningAgentState {
         } else {
             clear_instance_work(instance);
             instance.documents.private.status.mark_observed_generation(generation);
+            self.reconcile_instance_host_inputs(id);
         }
+    }
+
+    fn reconcile_instance_host_inputs(&mut self, id: AgentInstanceId) {
+        let document = self.documents.private.clone();
+        let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+            return;
+        };
+        if !should_reconcile_host_inputs(instance) || Instant::now() < instance.host_inputs.next_at {
+            return;
+        }
+        instance.host_inputs.in_flight = true;
+        spawn_reconcile_host_inputs(
+            self.input.clone(),
+            self.backend.clone(),
+            Rc::clone(&instance.network_runtime),
+            document,
+            instance.documents.private.clone(),
+            id,
+            instance.documents.private.spec.desired_generation,
+        );
     }
 
     fn reconcile_instance_bootstrap(&mut self, id: AgentInstanceId) {
@@ -2701,6 +2923,31 @@ fn spawn_reconcile_instance(
     });
 }
 
+fn spawn_reconcile_host_inputs(
+    input: inbox::Sender<AgentInput>,
+    backend: backend::BackendRef,
+    network: Rc<InstanceNetwork>,
+    agent_document: AgentDocument,
+    mut document: AgentInstanceDocument,
+    id: AgentInstanceId,
+    generation: u64,
+) {
+    tokio::task::spawn_local(async move {
+        let context = Context::quiet();
+        let result = match manifest_context(&agent_document) {
+            Ok(manifest) => match backend
+                .reconcile_host_inputs(&context, &network, &manifest, &mut document)
+                .await
+            {
+                Ok(output) => Ok((document.status.backend, output)),
+                Err(error) => Err((document.status.backend, error.to_string())),
+            },
+            Err(error) => Err((document.status.backend, error.to_string())),
+        };
+        queue_completion(&input, WorkCompletion::HostInputsReconciled { id, generation, result }).await;
+    });
+}
+
 fn spawn_stop_instance(
     services: AgentWorkServices,
     network: Rc<InstanceNetwork>,
@@ -3145,6 +3392,49 @@ fn clear_instance_work(instance: &mut RunningAgentInstanceState) {
     instance.documents.private.status.work.sessions.active = u16::from(instance.session.is_some());
 }
 
+fn should_reconcile_host_inputs(instance: &RunningAgentInstanceState) -> bool {
+    if instance.host_inputs.in_flight
+        || instance.work.is_some()
+        || instance.session.is_some()
+        || instance.documents.private.spec.target != AgentInstanceTarget::Active
+        || instance.documents.private.status.phase != AgentInstancePhase::Running
+    {
+        return false;
+    }
+    if !instance
+        .documents
+        .private
+        .status
+        .readiness
+        .as_ref()
+        .is_some_and(|readiness| readiness.ready)
+    {
+        return false;
+    }
+    true
+}
+
+fn host_input_reconcile_retry_delay(failure_count: u16) -> Duration {
+    retry_delay(
+        HOST_INPUT_RECONCILE_RETRY_DELAY,
+        HOST_INPUT_RECONCILE_RETRY_MAX_DELAY,
+        failure_count,
+    )
+}
+
+fn instance_create_retry_delay(failure_count: u16) -> Duration {
+    retry_delay(
+        INSTANCE_CREATE_RETRY_DELAY,
+        INSTANCE_CREATE_RETRY_MAX_DELAY,
+        failure_count,
+    )
+}
+
+fn retry_delay(initial: Duration, max: Duration, failure_count: u16) -> Duration {
+    let exponent = u32::from(failure_count.saturating_sub(1)).min(8);
+    initial.saturating_mul(1 << exponent).min(max)
+}
+
 fn work_status(work: AgentInstanceWork, session_active: bool) -> AgentInstanceWorkStatus {
     let mut status = AgentInstanceWorkStatus {
         sessions: AgentInstanceSessionsWorkStatus {
@@ -3456,5 +3746,42 @@ fn reset_loaded_instance_runtime_status(document: &mut AgentInstanceDocument) {
         document.status.reconciliation = None;
         document.status.network.runtime = None;
         document.status.tailscale_serve = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentBaseKey, AgentBaseState};
+
+    #[test]
+    fn base_provisioned_resources_require_external_state_or_base_key() {
+        assert!(!AgentBaseState::Missing.has_provisioned_resources());
+        assert!(!AgentBaseState::Preparing { generation: 1 }.has_provisioned_resources());
+        assert!(
+            !AgentBaseState::Failed {
+                generation: 1,
+                key: None,
+            }
+            .has_provisioned_resources()
+        );
+
+        let key = AgentBaseKey::new("sha256-test");
+        assert!(
+            AgentBaseState::Building {
+                generation: 1,
+                key: key.clone()
+            }
+            .has_provisioned_resources()
+        );
+        assert!(AgentBaseState::Ready { key: key.clone() }.has_provisioned_resources());
+        assert!(
+            AgentBaseState::Failed {
+                generation: 1,
+                key: Some(key),
+            }
+            .has_provisioned_resources()
+        );
+        assert!(AgentBaseState::Stopping.has_provisioned_resources());
+        assert!(AgentBaseState::Stopped.has_provisioned_resources());
     }
 }

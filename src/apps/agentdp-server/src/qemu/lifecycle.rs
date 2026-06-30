@@ -9,6 +9,7 @@ use agentdp_core::agent::{
 };
 use agentdp_core::manifest::{AgentManifest, NetworkMode};
 use agentdp_core::mediated_network::MediatedNetworkProfile;
+use agentdp_core::provisioning::guest_os::GuestOsAdapter;
 use agentdp_core::provisioning::image::{ImageCatalog, ImageRequest};
 use agentdp_core::provisioning::secrets::SecretBindings;
 use agentdp_platform::ssh::SshKeygen;
@@ -20,13 +21,14 @@ use agentdp_qemu::{command, disk, image, qmp, system};
 use crate::agent::{AGENT_BASE_INSTANCE, AgentBaseFiles, AgentBaseKey, AgentInstanceFiles, AgentManifestContext};
 use crate::agent::{AgentName, InstanceName};
 use crate::backend::{self, BackendBaseImageIdentity, CreateBaseInput, CreateBaseOutput};
-use crate::host::collect_mediated_secrets;
+use crate::host::collect_runtime_host_inputs;
 use crate::services::InstanceNetwork;
 
+use super::control;
 use super::error::{Error, ErrorKind};
 use super::network::{
     cleanup_instance_network_for_state, ensure_instance_network_attached, instance_network_is_attached,
-    start_instance_network, terminate_started_qemu, wait_instance_network_ready,
+    start_instance_network, terminate_started_qemu, update_instance_network_secrets, wait_instance_network_ready,
 };
 use super::provisioning::{self, PreparedBaseProvisioning, PreparedProvisioning};
 use super::{ImageState, MediatedCaState, State};
@@ -235,15 +237,25 @@ pub(super) async fn start_instance(
     let agent_name = AgentName::new(agent);
     let instance_name = InstanceName::new(instance);
     let spec = spec_from_state(manifest.value(), agent, instance, network, qemu_state)?;
-    let secrets = collect_mediated_secrets(
+    clear_stored_runtime_secrets_if_unconfigured(manifest.value(), qemu_state);
+    let host_inputs = collect_runtime_host_inputs(
         context,
         manifest.source_path(),
         manifest.value(),
         &qemu_state.mediated_secrets,
     )
     .await?;
-    let network_task =
-        start_instance_network(context, instance_network, agent, instance, network, qemu_state, secrets).await?;
+    qemu_state.mediated_secrets = host_inputs.stored_secrets.clone();
+    let network_task = start_instance_network(
+        context,
+        instance_network,
+        agent,
+        instance,
+        network,
+        qemu_state,
+        host_inputs.runtime_secrets,
+    )
+    .await?;
     let pid = match qemu_system.start(context, &spec).await {
         Ok(pid) => pid,
         Err(error) => {
@@ -476,7 +488,7 @@ pub(super) async fn ensure_attached(input: RuntimeInput<'_>, state: &State) -> R
     let agent = AgentName::new(input.agent);
     let instance = InstanceName::new(input.instance);
     if !instance_network_is_attached(input.instance_network, &agent, &instance, state).await {
-        let secrets = collect_mediated_secrets(
+        let host_inputs = collect_runtime_host_inputs(
             input.context,
             input.manifest.source_path(),
             input.manifest.value(),
@@ -490,7 +502,7 @@ pub(super) async fn ensure_attached(input: RuntimeInput<'_>, state: &State) -> R
             input.instance,
             input.network,
             state,
-            secrets,
+            host_inputs.runtime_secrets,
         )
         .await?;
     }
@@ -509,13 +521,15 @@ pub(super) async fn reconcile(input: RuntimeInput<'_>, state: &mut State) -> Res
         && !inspection.stale
         && !instance_network_is_attached(input.instance_network, &agent, &instance, state).await
     {
-        let secrets = collect_mediated_secrets(
+        clear_live_runtime_secrets_if_unconfigured(&input, state)?;
+        let host_inputs = collect_runtime_host_inputs(
             input.context,
             input.manifest.source_path(),
             input.manifest.value(),
             &state.mediated_secrets,
         )
         .await?;
+        state.mediated_secrets = host_inputs.stored_secrets.clone();
         ensure_instance_network_attached(
             input.context,
             input.instance_network,
@@ -523,7 +537,7 @@ pub(super) async fn reconcile(input: RuntimeInput<'_>, state: &mut State) -> Res
             input.instance,
             input.network,
             state,
-            secrets,
+            host_inputs.runtime_secrets,
         )
         .await?;
     }
@@ -558,6 +572,103 @@ pub(super) async fn reconcile(input: RuntimeInput<'_>, state: &mut State) -> Res
         process,
         host_ports: BTreeMap::new(),
     })
+}
+
+pub(super) async fn reconcile_host_inputs(
+    input: RuntimeInput<'_>,
+    state: &mut State,
+) -> Result<backend::ReconcileHostInputsOutput, Error> {
+    if input.instance_status != AgentInstancePhase::Running {
+        return Ok(backend::ReconcileHostInputsOutput::default());
+    }
+    clear_live_runtime_secrets_if_unconfigured(&input, state)?;
+    let collected = collect_runtime_host_inputs(
+        input.context,
+        input.manifest.source_path(),
+        input.manifest.value(),
+        &state.mediated_secrets,
+    )
+    .await?;
+
+    update_instance_network_secrets(
+        input.instance_network,
+        input.agent,
+        input.instance,
+        &collected.runtime_secrets,
+    )?;
+    let mut guest_files_updated = 0;
+    let mut guest_file_failures = 0;
+    let control_socket = guest_control_socket_path(state);
+    for file in &collected.files {
+        let path = user_home_relative_seed_path(input.manifest.value(), &file.path)?;
+        match control::write_user_file(
+            input.context,
+            &control_socket,
+            &path,
+            &file.contents,
+            file.permissions.as_str(),
+        )
+        .await
+        {
+            Ok(true) => {
+                guest_files_updated += 1;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                guest_file_failures += 1;
+                input
+                    .context
+                    .logger()
+                    .warn(format!("failed to write guest file {}: {error}", file.path));
+            }
+        }
+    }
+    state.mediated_secrets = collected.stored_secrets;
+    Ok(backend::ReconcileHostInputsOutput {
+        guest_files_updated,
+        guest_file_failures,
+    })
+}
+
+fn user_home_relative_seed_path(manifest: &AgentManifest, path: &str) -> Result<String, Error> {
+    let layout = GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout;
+    let prefix = format!("{}/", layout.agent_home.trim_end_matches('/'));
+    path.strip_prefix(&prefix)
+        .filter(|relative| !relative.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ErrorKind::GuestControlMessage {
+                code: "guest_file_path".to_owned(),
+                message: format!("runtime host input file {path} is not under {}", layout.agent_home),
+            }
+            .into()
+        })
+}
+
+fn clear_live_runtime_secrets_if_unconfigured(input: &RuntimeInput<'_>, state: &mut State) -> Result<(), Error> {
+    if !should_clear_runtime_secrets(input.manifest.value(), state) {
+        return Ok(());
+    }
+    update_instance_network_secrets(
+        input.instance_network,
+        input.agent,
+        input.instance,
+        &SecretBindings::default(),
+    )?;
+    state.mediated_secrets = SecretBindings::default();
+    Ok(())
+}
+
+fn clear_stored_runtime_secrets_if_unconfigured(manifest: &AgentManifest, state: &mut State) -> bool {
+    if !should_clear_runtime_secrets(manifest, state) {
+        return false;
+    }
+    state.mediated_secrets = SecretBindings::default();
+    true
+}
+
+fn should_clear_runtime_secrets(manifest: &AgentManifest, state: &State) -> bool {
+    !manifest.host_input_requirements().has_mediated_secret_inputs() && !state.mediated_secrets.is_empty()
 }
 
 #[must_use]
@@ -618,7 +729,7 @@ fn build_state(prepared: &PreparedProvisioning, files: &AgentInstanceFiles) -> S
         qemu_log: path_text(&files.logs_dir.join("qemu.log")),
         instance_network: (prepared.manifest.spec.network.mode == NetworkMode::Mediated)
             .then(|| instance_network_state(&files.run_dir)),
-        mediated_secrets: prepared.mediated_secrets.clone(),
+        mediated_secrets: prepared.mediated_secrets.redacted(),
         mediated_ca: prepared.mediated_ca.clone(),
         pid: None,
         last_start_unix_seconds: None,
@@ -770,13 +881,7 @@ fn command_network_backend(network: &NetworkState, state: &State) -> Result<comm
 }
 
 fn guest_control_socket_path(state: &State) -> PathBuf {
-    if !state.guest_control_socket.is_empty() {
-        return PathBuf::from(&state.guest_control_socket);
-    }
-    Path::new(&state.qmp_socket)
-        .parent()
-        .map(|path| path.join("guest-control.sock"))
-        .unwrap_or_default()
+    PathBuf::from(&state.guest_control_socket)
 }
 
 fn instance_network_state(qemu_runtime_dir: &Path) -> agentdp_core::agent::QemuInstanceNetworkState {

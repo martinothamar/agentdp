@@ -8,6 +8,7 @@ use agentdp_core::provisioning::SeedFile;
 use agentdp_core::provisioning::guest_os::{GuestLayout, GuestOsAdapter, guest_tool_seeds_for_os};
 use agentdp_core::provisioning::host_input::{
     HostInputFile, HostInputFileSource, HostInputGuestPath, HostInputRequirements, MaterializationContext,
+    MaterializedHostInput,
 };
 use agentdp_core::provisioning::secrets::SecretBindings;
 use flate2::Compression;
@@ -21,6 +22,13 @@ const INSTALLED_GUEST_TOOL_DIR: &str = "agentdp-guest-tools";
 pub(crate) struct Collected {
     pub files: Vec<SeedFile>,
     pub secrets: SecretBindings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeHostInputs {
+    pub files: Vec<SeedFile>,
+    pub runtime_secrets: SecretBindings,
+    pub stored_secrets: SecretBindings,
 }
 
 #[derive(Debug, Error)]
@@ -39,8 +47,6 @@ pub(crate) enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("mediated secret {name} is no longer available from host inputs")]
-    MissingMediatedSecret { name: String },
     #[error("failed to inspect seed file {path}: {source}")]
     Metadata {
         path: PathBuf,
@@ -87,17 +93,38 @@ pub(crate) async fn collect(
     files.extend(collect_guest_tool_seeds(context, manifest).await?);
     collect_home_seed(context, &manifest_dir.join("data/home"), layout.agent_home, &mut files).await?;
     collect_ca_seed(context, manifest_dir, manifest, layout, &mut files).await?;
-    collect_host_input_files(context, &requirements, layout, &mut files, &mut secrets).await?;
-    collect_custom_bootstrap(context, manifest_dir, layout, &mut files).await?;
-    if let Some(materialized) = materialize_custom_env(
+    collect_host_input_files(
         context,
-        manifest_dir,
         &requirements,
+        layout,
         MaterializationContext::default(),
-        "custom bootstrap env",
+        &mut files,
+        &mut secrets,
     )
-    .await?
-    {
+    .await?;
+    collect_custom_bootstrap(context, manifest_dir, layout, &mut files).await?;
+    let custom_env = if requirements.has_mediated_env_secret_inputs() {
+        Some(
+            materialize_required_custom_env(
+                context,
+                manifest_dir,
+                &requirements,
+                MaterializationContext::default(),
+                "custom bootstrap env",
+            )
+            .await?,
+        )
+    } else {
+        materialize_custom_env(
+            context,
+            manifest_dir,
+            &requirements,
+            MaterializationContext::default(),
+            "custom bootstrap env",
+        )
+        .await?
+    };
+    if let Some(materialized) = custom_env {
         secrets.extend(materialized.secrets);
         files.push(SeedFile {
             path: layout.persistent_env.to_owned(),
@@ -144,86 +171,59 @@ async fn collect_ca_seed(
     Ok(())
 }
 
-/// Collects only mediated host secret values needed by the runtime stack.
-///
-/// The returned bindings reuse persisted placeholder metadata so restarted or
-/// reattached instance networks match the placeholders already seeded into the
-/// guest.
-///
-/// # Errors
-///
-/// Returns an error if required host input sources cannot be read or transformed.
-pub(crate) async fn collect_mediated_secrets(
+pub(crate) async fn collect_runtime_host_inputs(
     context: &Context,
     manifest_path: &Path,
     manifest: &AgentManifest,
     existing_secrets: &SecretBindings,
-) -> Result<SecretBindings, Error> {
-    let requirements = manifest.host_input_requirements();
-    if !requirements.has_mediated_secret_inputs() {
-        return Ok(SecretBindings::default());
-    }
-
+) -> Result<RuntimeHostInputs, Error> {
     let manifest_dir = manifest_path
         .parent()
         .ok_or_else(|| Error::MissingManifestParent(manifest_path.to_path_buf()))?;
+    let requirements = manifest.host_input_requirements();
+    let layout = GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout;
     let materialization = MaterializationContext::new(existing_secrets);
-    let mut secrets = SecretBindings::default();
-    collect_mediated_host_input_files(context, &requirements, materialization, &mut secrets).await?;
-    if !requirements.mediated_secret_allowed_hosts().is_empty()
-        && let Some(materialized) = materialize_custom_env(
+    let mut files = Vec::new();
+    let mut runtime_secrets = SecretBindings::default();
+    collect_home_seed(context, &manifest_dir.join("data/home"), layout.agent_home, &mut files).await?;
+    collect_host_input_files(
+        context,
+        &requirements,
+        layout,
+        materialization,
+        &mut files,
+        &mut runtime_secrets,
+    )
+    .await?;
+    if requirements.has_mediated_env_secret_inputs() {
+        let materialized = materialize_required_custom_env(
             context,
             manifest_dir,
             &requirements,
             materialization,
-            "mediated custom bootstrap env",
+            "runtime custom env",
         )
-        .await?
-    {
-        secrets.extend(materialized.secrets);
+        .await?;
+        runtime_secrets.extend(materialized.secrets);
     }
-    validate_rehydrated_secrets(existing_secrets, &secrets)?;
-    Ok(secrets)
-}
-
-fn validate_rehydrated_secrets(existing: &SecretBindings, rehydrated: &SecretBindings) -> Result<(), Error> {
-    for binding in existing.iter() {
-        if !rehydrated.contains_placeholder(&binding.placeholder) {
-            return Err(Error::MissingMediatedSecret {
-                name: binding.name.clone(),
-            });
-        }
-    }
-    Ok(())
-}
-
-async fn collect_mediated_host_input_files(
-    context: &Context,
-    requirements: &HostInputRequirements,
-    materialization: MaterializationContext<'_>,
-    secrets: &mut SecretBindings,
-) -> Result<(), Error> {
-    for requirement in requirements
-        .files()
-        .iter()
-        .filter(|requirement| requirement.produces_secrets())
-    {
-        let path = resolve_host_input_file_source(requirement.source());
-        let materialized = materialize_host_input_file(context, requirement, materialization, &path).await?;
-        secrets.extend(materialized.secrets);
-    }
-    Ok(())
+    let stored_secrets = runtime_secrets.redacted();
+    Ok(RuntimeHostInputs {
+        files: dedupe_by_path(files),
+        runtime_secrets,
+        stored_secrets,
+    })
 }
 
 async fn collect_host_input_files(
     context: &Context,
     requirements: &HostInputRequirements,
     layout: GuestLayout,
+    materialization: MaterializationContext<'_>,
     files: &mut Vec<SeedFile>,
     secrets: &mut SecretBindings,
 ) -> Result<(), Error> {
     for requirement in requirements.files() {
-        collect_host_input_file(context, requirement, layout, files, secrets).await?;
+        collect_host_input_file(context, requirement, layout, materialization, files, secrets).await?;
     }
     Ok(())
 }
@@ -232,23 +232,24 @@ async fn collect_host_input_file(
     context: &Context,
     requirement: &HostInputFile,
     layout: GuestLayout,
+    materialization: MaterializationContext<'_>,
     files: &mut Vec<SeedFile>,
     secrets: &mut SecretBindings,
 ) -> Result<(), Error> {
     let path = resolve_host_input_file_source(requirement.source());
-    collect_host_input_file_from_path(context, requirement, layout, &path, files, secrets).await
+    collect_host_input_file_from_path(context, requirement, layout, materialization, &path, files, secrets).await
 }
 
 async fn collect_host_input_file_from_path(
     context: &Context,
     requirement: &HostInputFile,
     layout: GuestLayout,
+    materialization: MaterializationContext<'_>,
     path: &Path,
     files: &mut Vec<SeedFile>,
     secrets: &mut SecretBindings,
 ) -> Result<(), Error> {
-    let materialized =
-        materialize_host_input_file(context, requirement, MaterializationContext::default(), path).await?;
+    let materialized = materialize_host_input_file(context, requirement, materialization, path).await?;
     secrets.extend(materialized.secrets);
     files.push(SeedFile {
         path: resolve_host_input_guest_path(requirement.guest_path(), layout),
@@ -416,7 +417,7 @@ async fn materialize_custom_env(
     requirements: &HostInputRequirements,
     materialization: MaterializationContext<'_>,
     label: &str,
-) -> Result<Option<agentdp_core::provisioning::host_input::MaterializedHostInput>, Error> {
+) -> Result<Option<MaterializedHostInput>, Error> {
     let path = manifest_dir.join(".env");
     if !tokio::fs::try_exists(&path).await.map_err(|source| Error::ReadFile {
         path: path.clone(),
@@ -430,6 +431,22 @@ async fn materialize_custom_env(
     let contents = read_file(&path).await?;
     let materialized = requirements.materialize_custom_env(&contents, materialization)?;
     Ok(Some(materialized))
+}
+
+async fn materialize_required_custom_env(
+    context: &Context,
+    manifest_dir: &Path,
+    requirements: &HostInputRequirements,
+    materialization: MaterializationContext<'_>,
+    label: &str,
+) -> Result<MaterializedHostInput, Error> {
+    materialize_custom_env(context, manifest_dir, requirements, materialization, label)
+        .await?
+        .ok_or_else(|| Error::MissingHostInputFile {
+            label: label.to_owned(),
+            path: manifest_dir.join(".env"),
+            hint: String::new(),
+        })
 }
 
 async fn read_file(path: &Path) -> Result<Vec<u8>, Error> {
@@ -584,8 +601,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        MaterializationContext, SecretBindings, collect, collect_host_input_file_from_path, guest_tool_path,
-        materialize_custom_env,
+        MaterializationContext, SecretBindings, collect, collect_host_input_file_from_path,
+        collect_runtime_host_inputs, guest_tool_path, materialize_custom_env,
     };
     use agentdp_core::Context;
     use agentdp_core::manifest::AgentManifest;
@@ -613,6 +630,29 @@ mod tests {
                 "/usr/local/bin/guestd"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_host_inputs_include_manifest_local_home_seed_files() {
+        let temp = TestTempDir::create("qemu-host-seed-runtime-home");
+        let manifest_path = temp.write("agent.yaml", agentdp_test_support::manifest::minimal());
+        temp.write("data/home/.codex/AGENTS.md", "agent instructions\n");
+        temp.write("data/home/.env", "secret=do-not-copy-as-home\n");
+        let manifest = manifest(&manifest_path);
+
+        let collected =
+            collect_runtime_host_inputs(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
+                .await
+                .unwrap();
+
+        let paths = collected
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/data/home/.codex/AGENTS.md"]);
+        assert!(collected.runtime_secrets.is_empty());
+        assert!(collected.stored_secrets.is_empty());
     }
 
     #[tokio::test]
@@ -674,7 +714,7 @@ spec:
             1,
         );
         let manifest_path = temp.write("agent.yaml", &manifest_yaml);
-        temp.write(".env", "GITHUB_PAT=opaque\n");
+        temp.write(".env", "GITHUB_PAT=opaque\nOPENAI_API_KEY=codex-secret\n");
         temp.write("bootstrap.sh", "gh auth login\n");
         let manifest = manifest(&manifest_path);
 
@@ -788,50 +828,43 @@ spec:
     }
 
     #[tokio::test]
-    async fn rehydrating_mediated_env_requires_existing_seeded_secret() {
-        let temp = TestTempDir::create("qemu-host-seed-rehydrate-missing-env");
-        let manifest_path = temp.write(
-            "agent.yaml",
-            r"
-apiVersion: agentdp.dev/v1alpha1
-kind: Agent
-metadata:
-  name: mediated-auth
-spec:
-  phase: Running
-  replicas: 1
-  template:
-    image:
-      os: archlinux
-    user:
-      name: agent
-    resources:
-      cpus: 1
-      memory: 1G
-      storage: 10G
-    network:
-      mode: mediated
-      ports:
-        ssh:
-          guest: 22
-          protocol: tcp
-    bootstrap: {}
-    plugins:
-      github:
-        auth: mediated
-    secrets: []
-",
-        );
-        temp.write(".env", "GITHUB_TOKEN=github-secret\n");
-        let manifest = manifest(&manifest_path);
-        let seeded = collect(&Context::quiet(), &manifest_path, &manifest).await.unwrap();
+    async fn mediated_env_requires_declared_variable() {
+        let temp = TestTempDir::create("qemu-host-seed-missing-mediated-env");
+        let manifest_path = write_mediated_manifest(&temp, "mediated-auth", GITHUB_MEDIATED_PLUGIN);
         temp.write(".env", "OTHER=value\n");
+        let manifest = manifest(&manifest_path);
 
-        let error = super::collect_mediated_secrets(&Context::quiet(), &manifest_path, &manifest, &seeded.secrets)
-            .await
-            .unwrap_err();
+        let error =
+            collect_runtime_host_inputs(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
+                .await
+                .unwrap_err();
 
         assert!(error.to_string().contains("GITHUB_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn runtime_strict_requires_env_source_for_env_mediated_auth() {
+        let temp = TestTempDir::create("qemu-host-seed-strict-missing-env");
+        let manifest_path = write_mediated_manifest(&temp, "mediated-auth", GITHUB_MEDIATED_PLUGIN);
+        let manifest = manifest(&manifest_path);
+
+        let error =
+            collect_runtime_host_inputs(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("runtime custom env"));
+    }
+
+    #[tokio::test]
+    async fn collect_requires_env_source_for_env_mediated_auth() {
+        let temp = TestTempDir::create("qemu-host-seed-collect-missing-env");
+        let manifest_path = write_mediated_manifest(&temp, "mediated-auth", GITHUB_MEDIATED_PLUGIN);
+        let manifest = manifest(&manifest_path);
+
+        let error = collect(&Context::quiet(), &manifest_path, &manifest).await.unwrap_err();
+
+        assert!(error.to_string().contains("custom bootstrap env"));
     }
 
     #[tokio::test]
@@ -1138,6 +1171,7 @@ spec:
             &Context::quiet(),
             &requirement,
             GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout,
+            MaterializationContext::default(),
             &auth,
             &mut files,
             &mut secrets,
@@ -1201,6 +1235,7 @@ spec:
             &Context::quiet(),
             &requirement,
             GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout,
+            MaterializationContext::default(),
             &auth,
             &mut files,
             &mut secrets,
@@ -1289,6 +1324,7 @@ spec:
             &Context::quiet(),
             &requirement,
             GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout,
+            MaterializationContext::default(),
             &auth,
             &mut files,
             &mut secrets,
@@ -1415,6 +1451,7 @@ spec:
             &Context::quiet(),
             &requirement,
             GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout,
+            MaterializationContext::default(),
             &auth,
             &mut files,
             &mut secrets,
@@ -1520,6 +1557,48 @@ spec:
 
     fn manifest(path: &PathBuf) -> AgentManifest {
         serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    const GITHUB_MEDIATED_PLUGIN: &str = "      github:\n        auth: mediated";
+
+    fn write_mediated_manifest(temp: &TestTempDir, name: &str, plugins: &str) -> PathBuf {
+        let plugins = if plugins.trim() == "{}" {
+            "    plugins: {}".to_owned()
+        } else {
+            format!("    plugins:\n{plugins}")
+        };
+        temp.write(
+            "agent.yaml",
+            &format!(
+                r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: {name}
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        ssh:
+          guest: 22
+          protocol: tcp
+    bootstrap: {{}}
+{plugins}
+    secrets: []
+"
+            ),
+        )
     }
 
     struct TestTempDir {

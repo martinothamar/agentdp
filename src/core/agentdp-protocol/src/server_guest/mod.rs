@@ -9,8 +9,8 @@ pub use framing::{
 pub use message::{
     BootstrapFailed, BootstrapFinished, BootstrapLifecycleStatus, BootstrapOutput, BootstrapOutputStream,
     BootstrapPlan, BootstrapStatusReport, BootstrapStep, BootstrapStepFinished, BootstrapStepPhase,
-    BootstrapStepResource, BootstrapStepStarted, BootstrapStepStatus, GUEST_CONTROL_PROTOCOL_VERSION, GuestError,
-    GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostAccept, HostCancel, HostCommand, HostMessage,
-    HostMessageKind,
+    BootstrapStepResource, BootstrapStepStarted, BootstrapStepStatus, GUEST_CONTROL_PROTOCOL_VERSION,
+    GuestCommandResult, GuestError, GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostAccept, HostCancel,
+    HostCommand, HostMessage, HostMessageKind, WRITE_USER_FILE_COMMAND, WriteUserFileCommand,
 };
 pub use spec::{GUEST_INSTANCE_SPEC_VERSION, GuestInstancePaths, GuestInstanceSpec, GuestInstanceUser, GuestPlatform};

@@ -35,6 +35,14 @@ pub enum PrivatePathError {
     WorldAccessiblePath { kind: &'static str, path: PathBuf },
 }
 
+#[derive(Debug, Error)]
+pub enum UserOwnedFileError {
+    #[error("{0}")]
+    User(#[from] crate::user::CommandUserError),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
 /// Ensures a private directory exists and is not world-accessible.
 ///
 /// # Errors
@@ -187,6 +195,126 @@ pub async fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::R
     drop(file);
     tokio::fs::rename(&tmp, path).await?;
     sync_parent_directory(path)?;
+    Ok(())
+}
+
+/// Writes a user-owned file atomically when contents, mode, or owner differ.
+///
+/// # Errors
+///
+/// Returns an error when the user cannot be resolved, the current process cannot
+/// create or replace the file, or platform ownership/permission updates fail.
+pub async fn write_user_owned_file(
+    path: &Path,
+    contents: &[u8],
+    file_mode: u32,
+    directory_mode: u32,
+    user: &str,
+) -> Result<bool, UserOwnedFileError> {
+    let owner = ResolvedFileOwner::resolve(user)?;
+    if user_owned_file_matches(path, contents, file_mode, owner).await? {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+        set_file_mode(parent, directory_mode).await?;
+        chown_if_needed(parent, owner).await?;
+    }
+    let tmp = atomic_temp_path(path);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .await?;
+    file.write_all(contents).await?;
+    set_file_mode(&tmp, file_mode).await?;
+    chown_if_needed(&tmp, owner).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, path).await?;
+    sync_parent_directory(path)?;
+    Ok(true)
+}
+
+async fn user_owned_file_matches(
+    path: &Path,
+    contents: &[u8],
+    file_mode: u32,
+    owner: ResolvedFileOwner,
+) -> std::io::Result<bool> {
+    let existing = match tokio::fs::read(path).await {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if existing != contents {
+        return Ok(false);
+    }
+    let metadata = tokio::fs::metadata(path).await?;
+    Ok(file_mode_matches(&metadata, file_mode) && file_owner_matches(&metadata, owner))
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedFileOwner {
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+impl ResolvedFileOwner {
+    #[cfg(unix)]
+    fn resolve(user: &str) -> Result<Self, crate::user::CommandUserError> {
+        let user = crate::user::UnixUser::resolve(user)?;
+        Ok(Self {
+            uid: user.uid(),
+            gid: user.gid(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn resolve(_user: &str) -> Result<Self, crate::user::CommandUserError> {
+        Ok(Self {})
+    }
+}
+
+#[cfg(unix)]
+fn file_mode_matches(metadata: &std::fs::Metadata, mode: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o777 == mode
+}
+
+#[cfg(not(unix))]
+fn file_mode_matches(_metadata: &std::fs::Metadata, _mode: u32) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn file_owner_matches(metadata: &std::fs::Metadata, owner: ResolvedFileOwner) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.uid() == owner.uid && metadata.gid() == owner.gid
+}
+
+#[cfg(not(unix))]
+fn file_owner_matches(_metadata: &std::fs::Metadata, _owner: ResolvedFileOwner) -> bool {
+    true
+}
+
+#[cfg(unix)]
+async fn chown_if_needed(path: &Path, owner: ResolvedFileOwner) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = tokio::fs::metadata(path).await?;
+    if metadata.uid() == owner.uid && metadata.gid() == owner.gid {
+        return Ok(());
+    }
+    std::os::unix::fs::chown(path, Some(owner.uid), Some(owner.gid))
+}
+
+#[cfg(not(unix))]
+async fn chown_if_needed(_path: &Path, _owner: ResolvedFileOwner) -> std::io::Result<()> {
     Ok(())
 }
 

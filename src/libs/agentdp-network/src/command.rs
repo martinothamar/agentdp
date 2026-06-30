@@ -1,5 +1,8 @@
+use crate::RuntimeSecrets;
+
 #[derive(Debug)]
 pub enum NetworkCommand {
+    UpdateSecrets(RuntimeSecrets),
     Stop,
 }
 

@@ -483,6 +483,7 @@ mod tests {
             "  codex:\n    yolo: true\n    auth: mediated\n    auth_source: env\n",
         );
         let manifest = temp.write("agent.yaml", &standard_manifest);
+        temp.write(".env", "GITHUB_PAT=github-secret\nOPENAI_API_KEY=codex-secret\n");
         let parsed_manifest = serde_yaml::from_str::<AgentManifest>(&fs::read_to_string(&manifest).unwrap()).unwrap();
         let prepared = prepare_create_for_test(&temp, manifest, parsed_manifest, "pr-0").await;
 
@@ -529,6 +530,7 @@ spec:
     secrets: []
 ",
         );
+        temp.write(".env", "GITHUB_PAT=github-secret\nOPENAI_API_KEY=codex-secret\n");
         let parsed_manifest = serde_yaml::from_str::<AgentManifest>(&fs::read_to_string(&manifest).unwrap()).unwrap();
         let prepared = prepare_create_for_test(&temp, manifest, parsed_manifest, "dev-0").await;
         assert_qemu_provisioning_snapshot("user_network_does_not_seed_generated_mediated_ca", &temp, &prepared);

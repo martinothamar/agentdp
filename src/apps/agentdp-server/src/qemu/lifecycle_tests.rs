@@ -12,6 +12,7 @@ use agentdp_core::agent::{
     AgentInstancePhase, NetworkAllowState, NetworkIpv6State, NetworkModeState, NetworkState, PortMappingState,
     PortProtocolState, QemuInstanceNetworkState,
 };
+use agentdp_core::provisioning::secrets::SecretBinding;
 use agentdp_network::{Authority, HostPortProtocol, HostPortSpec, InstanceNetworkConfig, InstanceNetworkSpec};
 use agentdp_platform::socket::{self, AsyncLocalSocket};
 use agentdp_platform::time;
@@ -222,6 +223,29 @@ async fn reconcile_reattaches_instance_network_without_marking_instance_stale() 
     cleanup_runtime_files(&network_runtime, &agent, &instance, &state)
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "local")]
+async fn unconfigured_runtime_secrets_are_cleared_before_runtime_host_input_collection() {
+    let qemu_dir = test_runtime_dir();
+    let mut state = test_state(&qemu_dir, test_network_in_dir(&qemu_dir));
+    state.mediated_secrets.insert(
+        SecretBinding::new_with_placeholder(
+            "CODEX_AUTH_TOKEN",
+            Some("AGENTDP_SECRET_CODEX_AUTH_TOKEN_TEST".to_owned()),
+            "stored-token",
+            &["chatgpt.com".to_owned()],
+        )
+        .expect("test secret binding"),
+    );
+    let manifest = test_loaded_manifest().await;
+
+    assert!(super::clear_stored_runtime_secrets_if_unconfigured(
+        manifest.value(),
+        &mut state
+    ));
+
+    assert!(state.mediated_secrets.is_empty());
 }
 
 #[tokio::test(flavor = "local")]

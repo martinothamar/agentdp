@@ -3,7 +3,7 @@ mod ssh;
 pub(crate) mod tailscale;
 
 pub(crate) use seed::{
-    Error as HostSeedError, collect as collect_host_seed, collect_guest_tool_seeds, collect_mediated_secrets,
+    Error as HostSeedError, collect as collect_host_seed, collect_guest_tool_seeds, collect_runtime_host_inputs,
 };
 pub(crate) use ssh::{
     Error as HostSshError, GuestAccess, exec as execute_host_shell_command, generate_guest_access,

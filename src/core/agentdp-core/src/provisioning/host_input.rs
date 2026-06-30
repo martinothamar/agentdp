@@ -7,10 +7,16 @@ use super::secrets::{SecretBinding, SecretBindings};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostInputRequirements {
-    mediated_secret_scopes: BTreeMap<String, BTreeSet<String>>,
-    mediated_secret_guest_names: BTreeMap<String, String>,
+    mediated_env_secrets: BTreeMap<String, MediatedEnvSecret>,
+    required_mediated_env_groups: Vec<BTreeSet<String>>,
     copied_env_names: BTreeSet<String>,
     files: Vec<HostInputFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MediatedEnvSecret {
+    guest_name: String,
+    allowed_hosts: BTreeSet<String>,
 }
 
 impl HostInputRequirements {
@@ -19,10 +25,19 @@ impl HostInputRequirements {
         names: impl IntoIterator<Item = &'static str>,
         hosts: impl IntoIterator<Item = &'static str>,
     ) {
+        let names = names.into_iter().map(str::to_owned).collect::<BTreeSet<_>>();
         let hosts = hosts.into_iter().map(str::to_owned).collect::<BTreeSet<_>>();
-        for name in names {
-            self.allow_mediated_secret_hosts_dynamic(name, name, hosts.iter().cloned());
+        for name in &names {
+            self.mediated_env_secrets
+                .entry(name.clone())
+                .or_insert_with(|| MediatedEnvSecret {
+                    guest_name: name.clone(),
+                    allowed_hosts: BTreeSet::new(),
+                })
+                .allowed_hosts
+                .extend(hosts.iter().cloned());
         }
+        self.required_mediated_env_groups.push(names);
     }
 
     pub fn allow_mediated_secret_hosts_dynamic(
@@ -32,12 +47,15 @@ impl HostInputRequirements {
         hosts: impl IntoIterator<Item = String>,
     ) {
         let source_name = source_name.into();
-        self.mediated_secret_guest_names
-            .insert(source_name.clone(), guest_name.into());
-        self.mediated_secret_scopes
-            .entry(source_name)
-            .or_default()
+        self.mediated_env_secrets
+            .entry(source_name.clone())
+            .or_insert_with(|| MediatedEnvSecret {
+                guest_name: guest_name.into(),
+                allowed_hosts: BTreeSet::new(),
+            })
+            .allowed_hosts
             .extend(hosts);
+        self.required_mediated_env_groups.push(BTreeSet::from([source_name]));
     }
 
     pub(crate) fn copy_custom_env(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
@@ -50,9 +68,9 @@ impl HostInputRequirements {
 
     #[must_use]
     pub fn mediated_secret_allowed_hosts(&self) -> Vec<String> {
-        self.mediated_secret_scopes
+        self.mediated_env_secrets
             .values()
-            .flat_map(|hosts| hosts.iter().cloned())
+            .flat_map(|secret| secret.allowed_hosts.iter().cloned())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -60,15 +78,17 @@ impl HostInputRequirements {
 
     #[must_use]
     pub fn mediated_secret_allowed_hosts_for(&self, name: &str) -> Vec<String> {
-        self.mediated_secret_scopes
+        self.mediated_env_secrets
             .get(name)
-            .map(|hosts| hosts.iter().cloned().collect())
+            .map(|secret| secret.allowed_hosts.iter().cloned().collect())
             .unwrap_or_default()
     }
 
     #[must_use]
     pub fn mediated_secret_guest_name_for(&self, name: &str) -> Option<&str> {
-        self.mediated_secret_guest_names.get(name).map(String::as_str)
+        self.mediated_env_secrets
+            .get(name)
+            .map(|secret| secret.guest_name.as_str())
     }
 
     #[must_use]
@@ -86,6 +106,29 @@ impl HostInputRequirements {
         &self.files
     }
 
+    #[must_use]
+    pub fn has_same_mediated_auth_bindings(&self, other: &Self) -> bool {
+        let mut required_env_groups = self.required_mediated_env_groups.clone();
+        required_env_groups.sort();
+        required_env_groups.dedup();
+        let mut other_required_env_groups = other.required_mediated_env_groups.clone();
+        other_required_env_groups.sort();
+        other_required_env_groups.dedup();
+        self.mediated_env_secrets.len() == other.mediated_env_secrets.len()
+            && self.mediated_env_secrets.iter().all(|(source, secret)| {
+                other
+                    .mediated_env_secrets
+                    .get(source)
+                    .is_some_and(|other| secret.guest_name == other.guest_name)
+            })
+            && required_env_groups == other_required_env_groups
+            && self
+                .files
+                .iter()
+                .filter(|file| file.produces_secrets())
+                .eq(other.files.iter().filter(|file| file.produces_secrets()))
+    }
+
     /// Materializes a host `.env` file for guest bootstrap.
     ///
     /// # Errors
@@ -99,6 +142,7 @@ impl HostInputRequirements {
     ) -> Result<MaterializedHostInput, Error> {
         let mut guest_env = Vec::new();
         let mut secrets = SecretBindings::default();
+        let mut materialized_mediated_names = BTreeSet::new();
         for line in String::from_utf8_lossy(contents).lines() {
             let Some(assignment) = parse_custom_env_assignment(line) else {
                 guest_env.extend_from_slice(line.as_bytes());
@@ -106,16 +150,18 @@ impl HostInputRequirements {
                 continue;
             };
             let name = assignment.name;
-            let allowed_hosts = self.mediated_secret_allowed_hosts_for(name);
-            if self.copies_custom_env_name(name) && !allowed_hosts.is_empty() {
+            let mediated = self.mediated_env_secrets.get(name);
+            if self.copies_custom_env_name(name) && mediated.is_some() {
                 return Err(Error::ConflictingCustomEnvAuth { name: name.to_owned() });
             }
-            if allowed_hosts.is_empty() {
+            let Some(mediated) = mediated else {
                 guest_env.extend_from_slice(line.as_bytes());
                 guest_env.push(b'\n');
                 continue;
-            }
-            let guest_name = self.mediated_secret_guest_name_for(name).unwrap_or(name);
+            };
+            materialized_mediated_names.insert(name.to_owned());
+            let allowed_hosts = mediated.allowed_hosts.iter().cloned().collect::<Vec<_>>();
+            let guest_name = mediated.guest_name.as_str();
             let placeholder = context.placeholder_for_name(guest_name).map(str::to_owned);
             let binding = SecretBinding::new_with_placeholder(
                 guest_name,
@@ -130,6 +176,13 @@ impl HostInputRequirements {
             guest_env.push(b'\n');
             secrets.insert(binding);
         }
+        for group in &self.required_mediated_env_groups {
+            if group.is_disjoint(&materialized_mediated_names) {
+                return Err(Error::MissingCustomEnvAuth {
+                    names: group.iter().cloned().collect::<Vec<_>>().join(", "),
+                });
+            }
+        }
         Ok(MaterializedHostInput {
             contents: guest_env,
             secrets,
@@ -138,7 +191,12 @@ impl HostInputRequirements {
 
     #[must_use]
     pub fn has_mediated_secret_inputs(&self) -> bool {
-        !self.mediated_secret_scopes.is_empty() || self.files.iter().any(HostInputFile::produces_secrets)
+        !self.mediated_env_secrets.is_empty() || self.files.iter().any(HostInputFile::produces_secrets)
+    }
+
+    #[must_use]
+    pub fn has_mediated_env_secret_inputs(&self) -> bool {
+        !self.mediated_env_secrets.is_empty()
     }
 }
 
@@ -360,6 +418,8 @@ pub enum Error {
     },
     #[error("custom env variable {name} is requested for both copy-from-host and mediated auth")]
     ConflictingCustomEnvAuth { name: String },
+    #[error("custom env must contain at least one mediated auth variable from: {names}")]
+    MissingCustomEnvAuth { names: String },
     #[error("{0}")]
     Secret(#[from] super::secrets::Error),
 }

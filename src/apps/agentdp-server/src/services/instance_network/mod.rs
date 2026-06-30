@@ -11,7 +11,7 @@ use agentdp_core::agent::{AgentInstanceNetworkEvent, AgentInstanceNetworkStatus,
 use agentdp_ds::{local, sync};
 use agentdp_network::{
     GuestFrameTransport, HostPortProtocol, InstanceNetworkError, InstanceNetworkSpec, InstanceNetworkState,
-    InstanceNetworkStatus as NetworkRuntimeStatus, NetworkCommand, NetworkExit, ProductionWake,
+    InstanceNetworkStatus as NetworkRuntimeStatus, NetworkCommand, NetworkExit, ProductionWake, RuntimeSecrets,
 };
 use tokio::task::JoinHandle as TaskJoinHandle;
 use tokio::time::Instant;
@@ -125,6 +125,18 @@ impl InstanceNetwork {
         self.stop().await
     }
 
+    pub(crate) fn update_secrets(&self, secrets: RuntimeSecrets) -> Result<bool, InstanceNetworkError> {
+        let mut runtime = self.runtime_state.borrow_mut();
+        let Some(network) = runtime.as_mut() else {
+            return Ok(false);
+        };
+        if !network.is_running() {
+            return Ok(false);
+        }
+        network.update_secrets(secrets)?;
+        Ok(true)
+    }
+
     fn existing_network(&self) -> Result<Option<InstanceNetworkHandle>, InstanceNetworkError> {
         let mut runtime = self.runtime_state.borrow_mut();
         let Some(network) = runtime.as_mut() else {
@@ -234,5 +246,24 @@ impl InstanceNetworkRuntime {
                 Err(sync::spsc::TrySendError::Disconnected(_command)) => return,
             }
         }
+    }
+
+    fn update_secrets(&mut self, secrets: RuntimeSecrets) -> Result<(), InstanceNetworkError> {
+        self.commands
+            .try_send(NetworkCommand::UpdateSecrets(secrets))
+            .map_err(|error| match error {
+                sync::spsc::TrySendError::Full(_) => InstanceNetworkError::TaskFailed {
+                    label: self.handle.label().to_owned(),
+                    message: "network command queue is full while updating mediated secrets".to_owned(),
+                },
+                sync::spsc::TrySendError::Disconnected(_) => InstanceNetworkError::TaskFailed {
+                    label: self.handle.label().to_owned(),
+                    message: "network command queue is closed while updating mediated secrets".to_owned(),
+                },
+            })?;
+        self.wake.wake().map_err(|error| InstanceNetworkError::TaskFailed {
+            label: self.handle.label().to_owned(),
+            message: format!("failed to wake network after updating mediated secrets: {error}"),
+        })
     }
 }

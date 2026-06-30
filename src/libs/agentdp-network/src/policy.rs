@@ -188,6 +188,25 @@ impl RuntimeSecrets {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &RuntimeSecret> {
         self.bindings.iter()
     }
+
+    pub(crate) fn changed_authorities(&self, next: &Self) -> BTreeSet<Authority> {
+        let mut changed = BTreeSet::new();
+        for current in &self.bindings {
+            if next.binding_for_placeholder(&current.placeholder) != Some(current) {
+                current.add_authorities_to(&mut changed);
+            }
+        }
+        for next in &next.bindings {
+            if self.binding_for_placeholder(&next.placeholder) != Some(next) {
+                next.add_authorities_to(&mut changed);
+            }
+        }
+        changed
+    }
+
+    fn binding_for_placeholder(&self, placeholder: &str) -> Option<&RuntimeSecret> {
+        self.bindings.iter().find(|secret| secret.placeholder == placeholder)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -230,6 +249,10 @@ impl RuntimeSecret {
     pub(crate) fn value(&self) -> &str {
         &self.value.0
     }
+
+    fn add_authorities_to(&self, authorities: &mut BTreeSet<Authority>) {
+        self.scope.add_authorities_to(authorities);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +271,10 @@ impl SecretScope {
     #[must_use]
     pub fn allows_authority(&self, authority: &Authority) -> bool {
         self.allowed_authorities.contains(authority)
+    }
+
+    fn add_authorities_to(&self, authorities: &mut BTreeSet<Authority>) {
+        authorities.extend(self.allowed_authorities.iter().cloned());
     }
 }
 
@@ -329,7 +356,28 @@ mod tests {
         secrets.insert(RuntimeSecret::new("A", "B", ["allowed.test".to_owned()]));
         assert!(!secrets.is_empty());
         assert_eq!(secrets.iter().count(), 1);
+    }
 
+    #[test]
+    fn runtime_secrets_changed_authorities_only_reports_changed_bindings() {
+        let mut current = RuntimeSecrets::new();
+        current.insert(RuntimeSecret::new("A", "old-a", ["a.test".to_owned()]));
+        current.insert(RuntimeSecret::new("B", "same-b", ["b.test".to_owned()]));
+
+        let mut next = RuntimeSecrets::new();
+        next.insert(RuntimeSecret::new("A", "new-a", ["a.test".to_owned()]));
+        next.insert(RuntimeSecret::new("B", "same-b", ["b.test".to_owned()]));
+        next.insert(RuntimeSecret::new("C", "new-c", ["c.test".to_owned()]));
+
+        let changed = current.changed_authorities(&next);
+
+        assert!(changed.contains(&Authority::new("a.test")));
+        assert!(changed.contains(&Authority::new("c.test")));
+        assert!(!changed.contains(&Authority::new("b.test")));
+    }
+
+    #[test]
+    fn runtime_secret_scope_normalizes_authorities() {
         let scope = SecretScope::new(["Example.TEST.".to_owned()]);
         assert!(scope.allows_authority(&Authority::new("example.test")));
     }
