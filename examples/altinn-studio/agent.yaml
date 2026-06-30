@@ -4,7 +4,7 @@ metadata:
   name: altinn-studio
 spec:
   phase: Running
-  replicas: 5
+  replicas: 6
   template:
   
     image:
