@@ -12,7 +12,7 @@ use smoltcp::socket::tcp;
 ///
 /// - what changed during this turn,
 /// - what external or resource condition prevents more work on the path that stopped,
-/// - what other local work is still safe to attempt without waiting.
+/// - whether local buffer pressure left a local continuation eligible.
 ///
 /// Keeping those facts separate prevents common event-loop bugs where local
 /// backpressure is mistaken for reactor unreadiness, or one blocked direction
@@ -21,7 +21,7 @@ use smoltcp::socket::tcp;
 pub(crate) struct DriveReport {
     progress: DriveProgress,
     wait: DriveWait,
-    runnable: DriveRunnable,
+    local_buffer_continuation: bool,
     budget_exhausted: bool,
 }
 
@@ -42,12 +42,6 @@ pub(crate) struct DriveProgress {
 /// operation returns `WouldBlock`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DriveWait(u16);
-
-/// Turn-local local-work hints for paths that can make progress after another
-/// path frees a bounded resource. This is an audit/retry hint, not permission
-/// to bypass the typed drive operations.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DriveRunnable(u16);
 
 pub(crate) struct DriveTurn<'a> {
     budget: &'a mut DriveBudget,
@@ -185,7 +179,7 @@ impl DriveReport {
         Self {
             progress: DriveProgress::new(),
             wait: DriveWait::NONE,
-            runnable: DriveRunnable::NONE,
+            local_buffer_continuation: false,
             budget_exhausted: false,
         }
     }
@@ -196,8 +190,8 @@ impl DriveReport {
         self.wait
     }
 
-    pub(crate) const fn runnable(&self) -> DriveRunnable {
-        self.runnable
+    pub(crate) const fn has_local_buffer_continuation(&self) -> bool {
+        self.local_buffer_continuation
     }
 
     pub(crate) const fn blocked_on(&self, wait: DriveWait) -> bool {
@@ -375,17 +369,17 @@ impl<'a> DriveTurn<'a> {
         self.block_on(DriveWait::CONNECTION_SLOT);
     }
 
-    pub(crate) const fn wait_for_local_buffer_capacity_and_runnable(&mut self, runnable: DriveRunnable) {
+    pub(crate) const fn wait_for_local_buffer_for_protocol_output(&mut self) {
+        self.wait_for_local_buffer_capacity_with_continuation();
+    }
+
+    const fn wait_for_local_buffer_capacity_with_continuation(&mut self) {
         self.block_on(DriveWait::LOCAL_BUFFER_CAPACITY);
-        self.mark_runnable(runnable);
+        self.report.local_buffer_continuation = true;
     }
 
     const fn block_on(&mut self, wait: DriveWait) {
         self.report.wait.merge(wait);
-    }
-
-    const fn mark_runnable(&mut self, allowed: DriveRunnable) {
-        self.report.runnable.merge(allowed);
     }
 
     pub(crate) fn apply_state_change<T>(&mut self, apply: impl FnOnce() -> T) -> Option<T> {
@@ -543,13 +537,12 @@ impl<'a> DriveTurn<'a> {
         io: &mut IoSlotState,
         buffers: &BufferPool,
         stream: &mut impl Read,
-        runnable_on_local_capacity: DriveRunnable,
     ) -> io::Result<DriveStreamRead> {
         if !io.can_read() {
             self.wait_for_reactor_read();
             return Ok(DriveStreamRead::NotReady);
         }
-        match self.read_stream_unchecked(buffers, stream, runnable_on_local_capacity)? {
+        match self.read_stream_unchecked(buffers, stream)? {
             DriveStreamRead::WouldBlock => {
                 io.clear_read_after_would_block();
                 Ok(DriveStreamRead::WouldBlock)
@@ -558,19 +551,13 @@ impl<'a> DriveTurn<'a> {
         }
     }
 
-    fn read_stream_unchecked(
-        &mut self,
-        buffers: &BufferPool,
-        stream: &mut impl Read,
-        runnable_on_local_capacity: DriveRunnable,
-    ) -> io::Result<DriveStreamRead> {
+    fn read_stream_unchecked(&mut self, buffers: &BufferPool, stream: &mut impl Read) -> io::Result<DriveStreamRead> {
         if self.remaining_bytes() == 0 {
             self.report.mark_budget_exhausted();
             return Ok(DriveStreamRead::Blocked);
         }
         let Ok(mut bytes) = buffers.try_tcp_byte() else {
-            self.block_on(DriveWait::LOCAL_BUFFER_CAPACITY);
-            self.mark_runnable(runnable_on_local_capacity);
+            self.wait_for_local_buffer_capacity_with_continuation();
             return Ok(DriveStreamRead::Blocked);
         };
         if !self.step_or_exhausted() {
@@ -731,7 +718,6 @@ impl<'a> DriveTurn<'a> {
         &mut self,
         buffers: &BufferPool,
         socket: &mut tcp::Socket<'_>,
-        runnable_on_local_capacity: DriveRunnable,
     ) -> DriveSmoltcpTcpRecv {
         if !socket.can_recv() {
             return DriveSmoltcpTcpRecv::Empty;
@@ -740,8 +726,7 @@ impl<'a> DriveTurn<'a> {
             return DriveSmoltcpTcpRecv::Blocked;
         }
         let Ok(mut bytes) = buffers.try_tcp_byte() else {
-            self.block_on(DriveWait::LOCAL_BUFFER_CAPACITY);
-            self.mark_runnable(runnable_on_local_capacity);
+            self.wait_for_local_buffer_capacity_with_continuation();
             return DriveSmoltcpTcpRecv::Blocked;
         };
         if !self.step_or_exhausted() {
@@ -802,13 +787,12 @@ impl<'a> DriveTurn<'a> {
         buffers: &BufferPool,
         socket: &impl ReactorUdpSocket,
         capacity: usize,
-        runnable_on_local_capacity: DriveRunnable,
     ) -> io::Result<DriveDatagramRecv> {
         if !io.can_read() {
             self.wait_for_reactor_read();
             return Ok(DriveDatagramRecv::NotReady);
         }
-        match self.recv_datagram_unchecked(buffers, socket, capacity, runnable_on_local_capacity)? {
+        match self.recv_datagram_unchecked(buffers, socket, capacity)? {
             DriveDatagramRecv::WouldBlock => {
                 io.clear_read_after_would_block();
                 Ok(DriveDatagramRecv::WouldBlock)
@@ -822,7 +806,6 @@ impl<'a> DriveTurn<'a> {
         buffers: &BufferPool,
         socket: &impl ReactorUdpSocket,
         capacity: usize,
-        runnable_on_local_capacity: DriveRunnable,
     ) -> io::Result<DriveDatagramRecv> {
         // UDP receive is whole-datagram work from the scheduler's point of
         // view. If the configured receive buffer cannot fit in this turn's
@@ -832,8 +815,7 @@ impl<'a> DriveTurn<'a> {
             return Ok(DriveDatagramRecv::Budget);
         }
         let Ok(mut bytes) = buffers.try_byte_with_capacity(capacity) else {
-            self.block_on(DriveWait::LOCAL_BUFFER_CAPACITY);
-            self.mark_runnable(runnable_on_local_capacity);
+            self.wait_for_local_buffer_capacity_with_continuation();
             return Ok(DriveDatagramRecv::Blocked);
         };
         bytes.resize_zeroed(capacity);
@@ -858,13 +840,12 @@ impl<'a> DriveTurn<'a> {
         buffers: &BufferPool,
         socket: &impl ReactorUdpSocket,
         capacity: usize,
-        runnable_on_local_capacity: DriveRunnable,
     ) -> io::Result<DriveDatagramRecvFrom> {
         if !io.can_read() {
             self.wait_for_reactor_read();
             return Ok(DriveDatagramRecvFrom::NotReady);
         }
-        match self.recv_datagram_from_unchecked(buffers, socket, capacity, runnable_on_local_capacity)? {
+        match self.recv_datagram_from_unchecked(buffers, socket, capacity)? {
             DriveDatagramRecvFrom::WouldBlock => {
                 io.clear_read_after_would_block();
                 Ok(DriveDatagramRecvFrom::WouldBlock)
@@ -878,7 +859,6 @@ impl<'a> DriveTurn<'a> {
         buffers: &BufferPool,
         socket: &impl ReactorUdpSocket,
         capacity: usize,
-        runnable_on_local_capacity: DriveRunnable,
     ) -> io::Result<DriveDatagramRecvFrom> {
         // See `recv_datagram`: readiness is only consumed after this whole
         // receive operation is admitted by the drive budget.
@@ -886,8 +866,7 @@ impl<'a> DriveTurn<'a> {
             return Ok(DriveDatagramRecvFrom::Budget);
         }
         let Ok(mut bytes) = buffers.try_byte_with_capacity(capacity) else {
-            self.block_on(DriveWait::LOCAL_BUFFER_CAPACITY);
-            self.mark_runnable(runnable_on_local_capacity);
+            self.wait_for_local_buffer_capacity_with_continuation();
             return Ok(DriveDatagramRecvFrom::Blocked);
         };
         bytes.resize_zeroed(capacity);
@@ -1041,8 +1020,7 @@ impl<'a> DriveTurn<'a> {
             return Ok(DriveGuestFrameRead::Blocked);
         }
         let Ok(mut frame) = buffers.try_frame() else {
-            self.block_on(DriveWait::LOCAL_BUFFER_CAPACITY);
-            self.mark_runnable(DriveRunnable::READ_GUEST);
+            self.wait_for_local_buffer_capacity_with_continuation();
             return Ok(DriveGuestFrameRead::Blocked);
         };
         match read(&mut frame)? {
@@ -1128,25 +1106,6 @@ impl DriveWait {
 
     pub(crate) const fn contains(self, wait: Self) -> bool {
         self.0 & wait.0 != 0
-    }
-
-    const fn merge(&mut self, other: Self) {
-        self.0 |= other.0;
-    }
-}
-
-impl DriveRunnable {
-    const READ_UPSTREAM_BITS: u16 = 1 << 0;
-    const WRITE_UPSTREAM_BITS: u16 = 1 << 1;
-    const READ_GUEST_BITS: u16 = 1 << 2;
-
-    pub(crate) const NONE: Self = Self(0);
-    pub(crate) const READ_UPSTREAM: Self = Self(Self::READ_UPSTREAM_BITS);
-    pub(crate) const WRITE_UPSTREAM: Self = Self(Self::WRITE_UPSTREAM_BITS);
-    pub(crate) const READ_GUEST: Self = Self(Self::READ_GUEST_BITS);
-
-    pub(crate) const fn is_empty(self) -> bool {
-        self.0 == 0
     }
 
     const fn merge(&mut self, other: Self) {
@@ -1271,8 +1230,8 @@ mod tests {
 
     use super::{
         DriveApply, DriveBudget, DriveDatagramRecv, DriveDatagramRecvFrom, DriveDatagramSend, DriveGuestFrameEnqueue,
-        DriveGuestFrameRead, DriveGuestFrameWrite, DriveReport, DriveRunnable, DriveStreamWrite, DriveStreamWriteBlock,
-        DriveTurn, DriveWait,
+        DriveGuestFrameRead, DriveGuestFrameWrite, DriveReport, DriveStreamRead, DriveStreamWrite,
+        DriveStreamWriteBlock, DriveTurn, DriveWait,
     };
 
     #[test]
@@ -1306,12 +1265,12 @@ mod tests {
             let mut drive = DriveTurn::new(&mut budget, &mut report);
             let mut events = Vec::new();
             assert!(drive.push_event(&mut events, ()).is_ok());
-            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+            drive.wait_for_local_buffer_for_protocol_output();
         }
 
         assert!(report.made_progress());
         assert!(report.wait().contains(DriveWait::LOCAL_BUFFER_CAPACITY));
-        assert_eq!(report.runnable(), DriveRunnable::WRITE_UPSTREAM);
+        assert!(report.has_local_buffer_continuation());
 
         assert!(report.wait().contains(DriveWait::LOCAL_BUFFER_CAPACITY));
     }
@@ -1406,6 +1365,24 @@ mod tests {
     }
 
     #[test]
+    fn read_stream_buffer_exhaustion_marks_local_buffer_continuation_without_reading() {
+        let buffers = BufferPool::new(NetworkLimits::default());
+        let mut reader = RecordingReader::default();
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let mut report = DriveReport::new();
+
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let read = drive
+            .read_stream_unchecked(&buffers, &mut reader)
+            .expect("buffer exhaustion should not fail");
+
+        assert!(matches!(read, DriveStreamRead::Blocked));
+        assert_eq!(reader.read_calls.get(), 0);
+        assert!(report.wait().contains(DriveWait::LOCAL_BUFFER_CAPACITY));
+        assert!(report.has_local_buffer_continuation());
+    }
+
+    #[test]
     fn send_datagram_to_requires_whole_datagram_byte_budget_before_side_effect() {
         let socket = RecordingUdpSocket::default();
         let target = SocketAddr::from(([127, 0, 0, 1], 4000));
@@ -1439,13 +1416,31 @@ mod tests {
 
         let mut drive = DriveTurn::new(&mut budget, &mut report);
         let recv = drive
-            .recv_datagram_unchecked(&buffers, &socket, 5, DriveRunnable::NONE)
+            .recv_datagram_unchecked(&buffers, &socket, 5)
             .expect("budget block should not fail");
 
         assert!(matches!(recv, DriveDatagramRecv::Budget));
         assert_eq!(socket.recv_calls.get(), 0);
         assert!(report.budget_exhausted());
         assert!(!report.made_progress());
+    }
+
+    #[test]
+    fn recv_datagram_buffer_exhaustion_marks_local_buffer_continuation_without_reading() {
+        let buffers = BufferPool::new(NetworkLimits::default());
+        let socket = RecordingUdpSocket::default();
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let mut report = DriveReport::new();
+
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let recv = drive
+            .recv_datagram_unchecked(&buffers, &socket, 5)
+            .expect("buffer exhaustion should not fail");
+
+        assert!(matches!(recv, DriveDatagramRecv::Blocked));
+        assert_eq!(socket.recv_calls.get(), 0);
+        assert!(report.wait().contains(DriveWait::LOCAL_BUFFER_CAPACITY));
+        assert!(report.has_local_buffer_continuation());
     }
 
     #[test]
@@ -1461,13 +1456,31 @@ mod tests {
 
         let mut drive = DriveTurn::new(&mut budget, &mut report);
         let recv = drive
-            .recv_datagram_from_unchecked(&buffers, &socket, 5, DriveRunnable::NONE)
+            .recv_datagram_from_unchecked(&buffers, &socket, 5)
             .expect("budget block should not fail");
 
         assert!(matches!(recv, DriveDatagramRecvFrom::Budget));
         assert_eq!(socket.recv_calls.get(), 0);
         assert!(report.budget_exhausted());
         assert!(!report.made_progress());
+    }
+
+    #[test]
+    fn recv_datagram_from_buffer_exhaustion_marks_local_buffer_continuation_without_reading() {
+        let buffers = BufferPool::new(NetworkLimits::default());
+        let socket = RecordingUdpSocket::default();
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let mut report = DriveReport::new();
+
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let recv = drive
+            .recv_datagram_from_unchecked(&buffers, &socket, 5)
+            .expect("buffer exhaustion should not fail");
+
+        assert!(matches!(recv, DriveDatagramRecvFrom::Blocked));
+        assert_eq!(socket.recv_calls.get(), 0);
+        assert!(report.wait().contains(DriveWait::LOCAL_BUFFER_CAPACITY));
+        assert!(report.has_local_buffer_continuation());
     }
 
     #[test]
@@ -1584,6 +1597,27 @@ mod tests {
     }
 
     #[test]
+    fn guest_frame_read_buffer_exhaustion_marks_local_buffer_continuation_without_reading() {
+        let buffers = BufferPool::new(NetworkLimits::default());
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let mut called = false;
+
+        let result = drive
+            .read_guest_frame(&buffers, |_frame| -> Result<_, std::convert::Infallible> {
+                called = true;
+                Ok(super::DriveGuestFrameReadStatus::Frame)
+            })
+            .expect("infallible read should not fail");
+
+        assert!(matches!(result, DriveGuestFrameRead::Blocked));
+        assert!(!called);
+        assert!(report.wait().contains(DriveWait::LOCAL_BUFFER_CAPACITY));
+        assert!(report.has_local_buffer_continuation());
+    }
+
+    #[test]
     fn failed_state_change_is_not_reported_as_progress() {
         let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
         let mut report = DriveReport::new();
@@ -1632,6 +1666,18 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingReader {
+        read_calls: Cell<usize>,
+    }
+
+    impl std::io::Read for RecordingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.read_calls.set(self.read_calls.get() + 1);
+            Ok(buffer.len())
         }
     }
 

@@ -10,7 +10,7 @@ use super::{TcpProxyErrorContext, TcpProxyEvent, TcpProxyPermit};
 use crate::application::{Http1Filter, Http1ResponseEof};
 use crate::buffers::{BufferPool, ByteBuf};
 use crate::buffers::{PendingWrite, WriteQueue};
-use crate::drive::{DriveProtocolOp, DriveProtocolOutput, DriveProtocolPoll, DriveRunnable, DriveTurn};
+use crate::drive::{DriveProtocolOp, DriveProtocolOutput, DriveProtocolPoll, DriveTurn};
 use crate::network::{ApplicationPolicy, BlockReason, TcpProxyId, TlsEgressPolicy};
 use crate::policy::Authority;
 use crate::reactor::ReactorBackend;
@@ -95,14 +95,14 @@ enum FlushTls {
 #[derive(Debug, Clone, Copy)]
 enum GuestTlsOutputWait {
     LocalBuffer,
-    UpstreamRunnable,
+    ProtocolOutput,
 }
 
 impl GuestTlsOutputWait {
     const fn record(self, drive: &mut DriveTurn<'_>) {
         match self {
             Self::LocalBuffer => drive.wait_for_local_buffer_capacity(),
-            Self::UpstreamRunnable => drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM),
+            Self::ProtocolOutput => drive.wait_for_local_buffer_for_protocol_output(),
         }
     }
 }
@@ -791,7 +791,7 @@ where
                 proxy_id,
                 buffers,
                 drive,
-                GuestTlsOutputWait::UpstreamRunnable,
+                GuestTlsOutputWait::ProtocolOutput,
             )
         {
             return poll;
@@ -806,7 +806,7 @@ where
         }
         match self.flush_server_plaintext(proxy_id, buffers, reactor, drive) {
             Ok(true) => {
-                drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+                drive.wait_for_local_buffer_for_protocol_output();
                 return TlsProxyPoll::Pending;
             }
             Ok(false) => {}
@@ -826,7 +826,7 @@ where
         }
         match self.flush_server_plaintext(proxy_id, buffers, reactor, drive) {
             Ok(true) => {
-                drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+                drive.wait_for_local_buffer_for_protocol_output();
                 return TlsProxyPoll::Pending;
             }
             Ok(false) => {}
@@ -912,7 +912,7 @@ where
                     if write.offset < write.bytes.len() {
                         pending.push_front(write);
                     }
-                    drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+                    drive.wait_for_local_buffer_for_protocol_output();
                     return TlsProxyPoll::Pending;
                 }
                 Ok(RelayStep::ProgressClosed | RelayStep::Closed) => {
@@ -1016,7 +1016,7 @@ where
             QueueStep::Progress | QueueStep::Empty => {}
             QueueStep::Budget => return TlsProxyPoll::Pending,
             QueueStep::Blocked | QueueStep::ProgressBlocked => {
-                drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+                drive.wait_for_local_buffer_for_protocol_output();
                 return TlsProxyPoll::Pending;
             }
         }
@@ -1028,7 +1028,7 @@ where
             let mut server_buf = match buffers.try_byte_with_capacity(buffers.limits().tls_relay_buffer_capacity) {
                 Ok(buffer) => buffer,
                 Err(_exhausted) => {
-                    drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+                    drive.wait_for_local_buffer_for_protocol_output();
                     return TlsProxyPoll::Pending;
                 }
             };
@@ -1036,7 +1036,7 @@ where
             self.server_buf = Some(server_buf);
         }
         let Some(server_buf) = self.server_buf.as_mut() else {
-            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+            drive.wait_for_local_buffer_for_protocol_output();
             return TlsProxyPoll::Pending;
         };
         server_buf.as_mut_vec().resize(read_limit, 0);
@@ -1184,14 +1184,14 @@ where
                     made_progress = true;
                     self.server_buf_pending_offset += len;
                     if let Some(poll) =
-                        guest.poll_ciphertext_output(proxy_id, buffers, drive, GuestTlsOutputWait::UpstreamRunnable)
+                        guest.poll_ciphertext_output(proxy_id, buffers, drive, GuestTlsOutputWait::ProtocolOutput)
                     {
                         return Some(poll);
                     }
                 }
                 Ok(DriveProtocolPoll::Complete(TlsPlaintextWrite::BlockedByPendingCiphertext)) => {
                     if let Some(poll) =
-                        guest.poll_ciphertext_output(proxy_id, buffers, drive, GuestTlsOutputWait::UpstreamRunnable)
+                        guest.poll_ciphertext_output(proxy_id, buffers, drive, GuestTlsOutputWait::ProtocolOutput)
                     {
                         return Some(poll);
                     }

@@ -14,7 +14,7 @@ use tls::{TlsProxyPoll, TlsTcpProxy};
 use crate::buffers::WriteQueue;
 use crate::buffers::{BufferPool, ByteBuf};
 use crate::clock::NetworkClock;
-use crate::drive::{DriveRunnable, DriveSmoltcpTcpRecv, DriveTurn};
+use crate::drive::{DriveSmoltcpTcpRecv, DriveTurn};
 use crate::gateway::Gateway;
 use crate::network::{NetworkLimits, TcpEgressRoute, TcpProxyId, TcpProxyTelemetry};
 use crate::policy::Authority;
@@ -346,9 +346,7 @@ where
         if let Some(slot) = self.slot_by_proxy_mut(proxy_id) {
             let socket = sockets.get_mut::<tcp::Socket>(slot.handle);
             if let Some(proxy) = slot.entry.proxy.as_mut() {
-                while let DriveSmoltcpTcpRecv::Bytes(bytes) =
-                    drive.recv_smoltcp_tcp(buffers, socket, DriveRunnable::READ_GUEST)
-                {
+                while let DriveSmoltcpTcpRecv::Bytes(bytes) = drive.recv_smoltcp_tcp(buffers, socket) {
                     proxy.write(bytes);
                 }
             }

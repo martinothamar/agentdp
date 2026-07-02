@@ -1130,14 +1130,18 @@ fn consume_events<T>(events: &mut Vec<T>, mut collect: impl FnMut(T)) {
     }
 }
 
-const fn should_retry_local(report: &DriveReport, local_work_pending: bool, followup_progress: bool) -> bool {
+fn should_retry_local(report: &DriveReport, local_work_pending: bool, followup_progress: bool) -> bool {
+    debug_assert!(
+        !report.has_local_buffer_continuation() || report.blocked_on(DriveWait::LOCAL_BUFFER_CAPACITY),
+        "local buffer continuation without local buffer capacity wait"
+    );
     (report.budget_exhausted() && report.made_progress())
         || (local_work_pending && report.made_progress())
-        || (!report.runnable().is_empty() && (report.made_progress() || followup_progress))
+        || (report.has_local_buffer_continuation() && (report.made_progress() || followup_progress))
         || (report.blocked_on(DriveWait::LOCAL_BUFFER_CAPACITY) && followup_progress)
 }
 
-const fn queued_phase_reactor_timeout(
+fn queued_phase_reactor_timeout(
     report: &DriveReport,
     local_work_pending: bool,
     followup_progress: bool,
@@ -1148,13 +1152,10 @@ const fn queued_phase_reactor_timeout(
     if should_retry_local(report, local_work_pending, followup_progress) {
         Some(Duration::ZERO)
     } else {
-        match poll_timeout {
-            Some(timeout) => Some(timeout),
-            None => match timer_timeout {
-                Some(Duration::ZERO) => Some(idle_poll_delay),
-                timeout => timeout,
-            },
-        }
+        poll_timeout.or(match timer_timeout {
+            Some(Duration::ZERO) => Some(idle_poll_delay),
+            timeout => timeout,
+        })
     }
 }
 
@@ -1172,7 +1173,7 @@ fn unix_millis(time: std::time::SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::drive::{DriveBudget, DriveReport, DriveRunnable, DriveTurn};
+    use crate::drive::{DriveBudget, DriveReport, DriveTurn};
     use crate::network::NetworkLimits;
 
     use super::{queued_phase_reactor_timeout, should_retry_local};
@@ -1180,7 +1181,7 @@ mod tests {
     #[test]
     fn local_retry_requires_progress_or_budgeted_work() {
         let mut report = drive_report(|drive| {
-            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+            drive.wait_for_local_buffer_for_protocol_output();
         });
         assert!(!should_retry_local(&report, false, false));
 
@@ -1191,7 +1192,7 @@ mod tests {
 
         report = drive_report(|drive| {
             record_progress(drive);
-            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+            drive.wait_for_local_buffer_for_protocol_output();
         });
         assert!(should_retry_local(&report, false, false));
     }
@@ -1247,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_phase_timeout_does_not_retry_immediately_for_progress_without_runnable_work() {
+    fn queued_phase_timeout_does_not_retry_immediately_for_progress_without_local_continuation() {
         let timer_timeout = Some(std::time::Duration::from_secs(1));
         let report = drive_report(|drive| {
             record_progress(drive);
@@ -1304,11 +1305,32 @@ mod tests {
     }
 
     #[test]
-    fn queued_phase_timeout_keeps_zero_for_runnable_local_retry() {
+    fn queued_phase_timeout_does_not_retry_progress_with_plain_local_buffer_wait() {
+        let timer_timeout = Some(std::time::Duration::from_secs(1));
+        let report = drive_report(|drive| {
+            record_progress(drive);
+            drive.wait_for_local_buffer_capacity();
+        });
+
+        assert_eq!(
+            queued_phase_reactor_timeout(
+                &report,
+                false,
+                false,
+                None,
+                timer_timeout,
+                std::time::Duration::from_secs(1),
+            ),
+            timer_timeout
+        );
+    }
+
+    #[test]
+    fn queued_phase_timeout_keeps_zero_for_local_buffer_continuation() {
         let idle_poll_delay = std::time::Duration::from_secs(1);
         let report = drive_report(|drive| {
             record_progress(drive);
-            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+            drive.wait_for_local_buffer_for_protocol_output();
         });
 
         assert_eq!(

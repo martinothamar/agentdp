@@ -6,7 +6,7 @@ use crate::application::{self, TcpDnsTracker};
 use crate::buffers::WriteQueue;
 use crate::buffers::{BufferPool, ByteBuf};
 use crate::connectors::tcp::TcpConnector;
-use crate::drive::{DriveRunnable, DriveStreamRead, DriveTurn};
+use crate::drive::{DriveStreamRead, DriveTurn};
 use crate::network::{ApplicationPolicy, TcpProxyId};
 use crate::reactor::ReactorItemId;
 use crate::reactor::{ReactorBackend, ReactorInterest, ReactorTcpStream, RegisteredTcpStream, RegisteringTcpStream};
@@ -405,7 +405,7 @@ where
             return None;
         };
         let (stream, io) = stream.source_and_io_mut();
-        match drive.read_stream_ready(io, buffers, stream, DriveRunnable::READ_UPSTREAM) {
+        match drive.read_stream_ready(io, buffers, stream) {
             Ok(DriveStreamRead::Closed) => Some(TcpProxyPoll::Event(TcpProxyEvent::closed(self.proxy))),
             Ok(DriveStreamRead::Bytes(bytes)) => {
                 self.read_pending = true;

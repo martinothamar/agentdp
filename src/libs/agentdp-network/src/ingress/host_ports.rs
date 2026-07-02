@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::buffers::{BufferPool, ByteBuf, WriteQueue};
-use crate::drive::{DriveApply, DriveDatagramRecvFrom, DriveDatagramSend, DriveRunnable, DriveStreamRead, DriveTurn};
+use crate::drive::{DriveApply, DriveDatagramRecvFrom, DriveDatagramSend, DriveStreamRead, DriveTurn};
 use crate::network::{HostConnectionId, HostPortProtocol, HostPortSpec};
 use crate::reactor::ReactorItemId;
 use crate::reactor::{
@@ -556,7 +556,7 @@ where
                     continue;
                 };
                 let (stream, io) = connection_state.stream.source_and_io_mut();
-                drive.read_stream_ready(io, &self.buffers, stream, DriveRunnable::READ_UPSTREAM)
+                drive.read_stream_ready(io, &self.buffers, stream)
             };
             match read {
                 Ok(DriveStreamRead::Bytes(bytes)) => {
@@ -666,7 +666,6 @@ where
                     &self.buffers,
                     socket,
                     self.buffers.limits().ingress_udp_datagram_buffer_capacity,
-                    DriveRunnable::READ_UPSTREAM,
                 ) {
                     Ok(DriveDatagramRecvFrom::Bytes { bytes, peer }) => {
                         let event = HostPortEvent::UdpDatagram {

@@ -18,7 +18,7 @@ use crate::buffers::WriteQueue;
 use crate::clock::SystemClock;
 use crate::connectors::tcp::TcpConnector;
 use crate::connectors::udp::UdpSocketFactory;
-use crate::drive::{DriveBudget, DriveReport, DriveRunnable, DriveTurn};
+use crate::drive::{DriveBudget, DriveReport, DriveTurn};
 use crate::guest::{
     ConnectStatus, FrameRead, FrameWrite, GuestFrameSession, GuestFrameTransport, GuestIoSource, TransportError,
 };
@@ -452,7 +452,7 @@ fn plain_tcp_read_would_block_does_not_retry_on_write_readiness_only() {
 }
 
 #[test]
-fn plain_tcp_read_blocked_on_local_buffer_stays_read_runnable() {
+fn plain_tcp_read_blocked_on_local_buffer_sets_continuation() {
     let buffers = BufferPool::new(NetworkLimits {
         tcp_byte_pool_capacity: 0,
         ..NetworkLimits::default()
@@ -480,7 +480,7 @@ fn plain_tcp_read_blocked_on_local_buffer_stays_read_runnable() {
 
     assert!(matches!(poll, TcpProxyPoll::Pending));
     assert!(report.wait().contains(crate::drive::DriveWait::LOCAL_BUFFER_CAPACITY));
-    assert_eq!(report.runnable(), DriveRunnable::READ_UPSTREAM);
+    assert!(report.has_local_buffer_continuation());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -882,7 +882,7 @@ async fn tls_intercept_not_queued_after_upstream_write_finished() -> Result<(), 
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn tls_guest_close_notify_keeps_upstream_finish_runnable() -> Result<(), Box<dyn std::error::Error>> {
+async fn tls_guest_close_notify_keeps_upstream_finish_continuation() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream = listener.local_addr()?;
     let buffers = test_buffers();

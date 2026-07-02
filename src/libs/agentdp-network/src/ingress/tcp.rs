@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use crate::buffers::WriteQueue;
 use crate::buffers::{BufferPool, ByteBuf};
-use crate::drive::{DriveRunnable, DriveSmoltcpTcpRecv, DriveTurn};
+use crate::drive::{DriveSmoltcpTcpRecv, DriveTurn};
 use crate::network::{HostConnectionId, IngressTcpOutput};
 use agentdp_ds::fixed_table::FixedTable;
 use smoltcp::iface::{SocketHandle, SocketSet};
@@ -100,7 +100,7 @@ impl TcpConnections {
                     drive.wait_for_local_buffer_capacity();
                     break;
                 }
-                match drive.recv_smoltcp_tcp(buffers, socket, DriveRunnable::READ_GUEST) {
+                match drive.recv_smoltcp_tcp(buffers, socket) {
                     DriveSmoltcpTcpRecv::Bytes(bytes) => {
                         let _queued = drive.push_component_output_after_progress(
                             outputs,

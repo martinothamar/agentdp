@@ -6,7 +6,7 @@ use crate::application;
 use crate::buffers::{BufferPool, ByteBuf};
 use crate::clock::NetworkClock;
 use crate::connectors::udp::UdpSocketFactory;
-use crate::drive::{DriveDatagramRecv, DriveDatagramSend, DriveRunnable, DriveTurn};
+use crate::drive::{DriveDatagramRecv, DriveDatagramSend, DriveTurn};
 use crate::network::UdpProxyKey;
 use crate::reactor::ReactorItemId;
 use crate::reactor::{ReactorBackend, ReactorInterest, ReactorReady, RegisteredUdpSocket, RegisteringUdpSocket};
@@ -229,7 +229,6 @@ where
                     &self.buffers,
                     socket,
                     self.buffers.limits().udp_datagram_buffer_capacity,
-                    DriveRunnable::READ_UPSTREAM,
                 ) {
                     Ok(DriveDatagramRecv::Bytes(bytes)) => {
                         udp.expires = clock.now() + self.proxy_timeout;
