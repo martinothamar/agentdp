@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use agentdp_network::test_support::simulation::{SimTcpResponse, SimulationUpstreams};
 use agentdp_rand::Seed;
+use smoltcp::socket::tcp;
 
 use super::case_support::allow_all_network_config;
 use super::fixtures::upstream_addr;
@@ -194,6 +195,253 @@ fn simulated_guest_tcp_backpressured_upstream_read_resumes_after_guest_window_op
     )))
 }
 
+/// Verifies guest abort releases a plain TCP proxy even when upstream response bytes are parked behind guest pressure.
+///
+/// # Errors
+///
+/// Returns an error when the proxy slot remains active after the guest aborts a backpressured connection.
+#[test]
+fn simulated_guest_tcp_abort_releases_backpressured_plain_proxy() -> Result<()> {
+    let mut sim = Simulator::new(Seed::new(0x21b));
+    let guest_link = sim.guest_link()?;
+    let handler = tcp_response_handler(|bytes| {
+        if bytes == b"tcp-abort-under-pressure" {
+            Ok(SimTcpResponse {
+                bytes: vec![b'A'; 2048],
+                followup_bytes: vec![vec![b'B'; 2048], vec![b'C'; 2048], vec![b'D'; 2048]],
+                close: true,
+                reset: false,
+            })
+        } else {
+            Ok(SimTcpResponse::reset())
+        }
+    });
+    let mut network = allow_all_network_config();
+    network.limits.tcp_socket_buffer_capacity = 2048;
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network,
+            upstreams: SimulationUpstreams::default().with_tcp_handler(upstream_addr(), handler),
+        },
+        guest_link.clone(),
+    )?;
+    let mut guest = SmolTcpGuest::with_tcp_buffer_bytes(guest_link, 2048)?;
+    let tcp = guest.connect(&mut running, upstream_addr())?;
+    guest.write_all(&mut running, tcp, b"tcp-abort-under-pressure")?;
+
+    for _step in 0..256 {
+        guest.pump(&mut running)?;
+        if running.tcp_snapshot().contains("socket_can_send: false") {
+            break;
+        }
+    }
+    let pressure_snapshot = running.tcp_snapshot();
+    if !pressure_snapshot.contains("socket_can_send: false") {
+        let _stop = running
+            .stop()
+            .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+        return Err(Error::new(format!(
+            "guest send window did not close before abort; tcp={pressure_snapshot}"
+        )));
+    }
+
+    guest.abort_tcp(&mut running, tcp)?;
+    for _step in 0..256 {
+        guest.pump(&mut running)?;
+        if running.active_tcp_proxy_slots() == 0 {
+            let _stop = running
+                .stop()
+                .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+            return Ok(());
+        }
+    }
+
+    let active = running.active_tcp_proxy_slots();
+    let snapshot = running.tcp_snapshot();
+    let _stop = running
+        .stop()
+        .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+    Err(Error::new(format!(
+        "guest abort left {active} TCP proxy slots active; tcp={snapshot}"
+    )))
+}
+
+/// Verifies TCP proxy capacity exhaustion refuses new connections instead of blackholing SYN packets.
+///
+/// # Errors
+///
+/// Returns an error when a second guest connection remains stuck in SYN-SENT after the proxy table is full.
+#[test]
+fn simulated_guest_tcp_proxy_capacity_does_not_blackhole_syn() -> Result<()> {
+    let mut sim = Simulator::new(Seed::new(0x21c));
+    let guest_link = sim.guest_link()?;
+    let mut network = allow_all_network_config();
+    network.limits.tcp_proxy_limit = 1;
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network,
+            upstreams: SimulationUpstreams::default().with_tcp_handler(
+                upstream_addr(),
+                tcp_response_handler(|_bytes| Ok(SimTcpResponse::default())),
+            ),
+        },
+        guest_link.clone(),
+    )?;
+    let mut guest = SmolTcpGuest::new(guest_link)?;
+    let held = guest.connect(&mut running, upstream_addr())?;
+    let active = running.active_tcp_proxy_slots();
+    if active != 1 {
+        let _stop = running
+            .stop()
+            .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+        return Err(Error::new(format!("expected one held TCP proxy slot, got {active}")));
+    }
+
+    let refused = guest.start_connect(upstream_addr())?;
+    for _step in 0..64 {
+        guest.pump(&mut running)?;
+        if guest.tcp_state(refused) != tcp::State::SynSent {
+            let _closed = guest.abort_tcp(&mut running, held);
+            let _stop = running
+                .stop()
+                .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+            return Ok(());
+        }
+    }
+
+    let state = guest.tcp_state(refused);
+    let snapshot = running.tcp_snapshot();
+    let _closed = guest.abort_tcp(&mut running, held);
+    let _stop = running
+        .stop()
+        .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+    Err(Error::new(format!(
+        "connection remained blackholed after proxy capacity exhaustion; state={state:?}; tcp={snapshot}"
+    )))
+}
+
+/// Verifies default TCP capacity handles package-manager style connection bursts.
+///
+/// # Errors
+///
+/// Returns an error when default limits refuse connections below the expected burst size.
+#[test]
+fn simulated_default_tcp_capacity_handles_package_manager_burst() -> Result<()> {
+    const FLOW_COUNT: usize = 160;
+
+    let mut sim = Simulator::new(Seed::new(0x21e));
+    let guest_link = sim.guest_link()?;
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network: allow_all_network_config(),
+            upstreams: SimulationUpstreams::default().with_tcp_handler(
+                upstream_addr(),
+                tcp_response_handler(|_bytes| Ok(SimTcpResponse::default())),
+            ),
+        },
+        guest_link.clone(),
+    )?;
+    let mut guest = SmolTcpGuest::new(guest_link)?;
+    let mut handles = Vec::with_capacity(FLOW_COUNT);
+
+    for flow in 0..FLOW_COUNT {
+        match guest.connect(&mut running, upstream_addr()) {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                let snapshot = running.tcp_snapshot();
+                for handle in handles {
+                    let _closed = guest.abort_tcp(&mut running, handle);
+                }
+                let _stop = running
+                    .stop()
+                    .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+                return Err(Error::new(format!(
+                    "default TCP capacity refused flow {flow}/{FLOW_COUNT}: {error}; tcp={snapshot}"
+                )));
+            }
+        }
+    }
+
+    for handle in handles {
+        let _closed = guest.abort_tcp(&mut running, handle);
+    }
+    let _stop = running
+        .stop()
+        .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+    Ok(())
+}
+
+/// Verifies bounded TCP proxy driving makes progress across many readable direct upstreams.
+///
+/// # Errors
+///
+/// Returns an error when later concurrent flows receive no bytes while earlier flows keep consuming the drive budget.
+#[test]
+fn simulated_guest_tcp_concurrent_direct_responses_are_fairly_driven() -> Result<()> {
+    const FLOW_COUNT: usize = 32;
+    const RESPONSE_BYTES: usize = 128 * 1024;
+
+    let mut sim = Simulator::new(Seed::new(0x21d));
+    let guest_link = sim.guest_link()?;
+    let handler = tcp_response_handler(|bytes| {
+        let flow = bytes
+            .strip_prefix(b"flow-")
+            .and_then(|suffix| std::str::from_utf8(suffix).ok())
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .unwrap_or(0);
+        Ok(SimTcpResponse::bytes(vec![flow; RESPONSE_BYTES]))
+    });
+    let mut network = allow_all_network_config();
+    network.limits.drive_step_budget = 8;
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network,
+            upstreams: SimulationUpstreams::default().with_tcp_handler(upstream_addr(), handler),
+        },
+        guest_link.clone(),
+    )?;
+    let mut guest = SmolTcpGuest::new(guest_link)?;
+    let mut connections = Vec::with_capacity(FLOW_COUNT);
+    let mut received = vec![0_usize; FLOW_COUNT];
+
+    for flow in 0..FLOW_COUNT {
+        let tcp = guest.connect(&mut running, upstream_addr())?;
+        guest.write_all(&mut running, tcp, format!("flow-{flow}").as_bytes())?;
+        connections.push(tcp);
+    }
+
+    for _step in 0..2048 {
+        for (flow, &handle) in connections.iter().enumerate() {
+            received[flow] = received[flow].saturating_add(guest.read_available_bytes(handle)?.len());
+        }
+        if received.iter().all(|bytes| *bytes > 0) {
+            for handle in connections {
+                let _closed = guest.abort_tcp(&mut running, handle);
+            }
+            let _stop = running
+                .stop()
+                .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+            return Ok(());
+        }
+        guest.pump(&mut running)?;
+    }
+
+    let snapshot = running.tcp_snapshot();
+    for handle in connections {
+        let _closed = guest.abort_tcp(&mut running, handle);
+    }
+    let _stop = running
+        .stop()
+        .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+    Err(Error::new(format!(
+        "not all concurrent TCP flows received data under bounded driving; received={received:?}; tcp={snapshot}"
+    )))
+}
+
 /// Verifies simulated TCP readiness remains advisory when the next read reports `WouldBlock`.
 ///
 /// # Errors
@@ -340,6 +588,41 @@ fn simulated_gateway_timer_preserves_queued_guest_frames() -> Result<()> {
         .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
     if frame != b"queued-before-timer" {
         return Err(Error::new(format!("unexpected guest-bound frame: {frame:02x?}")));
+    }
+    Ok(())
+}
+
+/// Verifies guest-bound frames produced during a local turn are flushed before the loop waits again.
+///
+/// # Errors
+///
+/// Returns an error when newly queued guest-bound frames require an unrelated reactor wake or timer tick.
+#[test]
+fn simulated_production_turn_flushes_new_guest_frames_without_extra_readiness() -> Result<()> {
+    let mut sim = Simulator::new(Seed::new(0x21a));
+    let guest_link = sim.guest_link()?;
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network: allow_all_network_config(),
+            upstreams: SimulationUpstreams::default(),
+        },
+        guest_link.clone(),
+    )?;
+
+    running
+        .queue_network_to_guest_frame(b"guest-bound-without-ready")
+        .map_err(|error| Error::new(format!("queue test guest frame: {error}")))?;
+
+    running.drive_once_production_mode();
+    let pending = guest_link.pending_from_network_frames();
+    let _stop = running
+        .stop()
+        .map_err(|error| Error::new(format!("stop simulated network: {error}")))?;
+    if pending != 1 {
+        return Err(Error::new(format!(
+            "guest-bound frame was not flushed to the link in the same production turn; pending_network_to_guest={pending}"
+        )));
     }
     Ok(())
 }

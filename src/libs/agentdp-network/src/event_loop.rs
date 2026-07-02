@@ -6,7 +6,7 @@ use crate::buffers::BufferPoolSnapshot;
 use crate::buffers::{BufferPool, FrameBuf};
 use crate::clock::NetworkClock as _;
 use crate::command::{NetworkCommand, NetworkCommandSource};
-use crate::drive::{DriveBudget, DriveReport, DriveTurn};
+use crate::drive::{DriveBudget, DriveReport, DriveTurn, DriveWait};
 use crate::egress::tcp::{TcpProxies, TcpProxyEvent};
 use crate::egress::udp::{UdpProxies, UdpProxyEvent};
 use crate::events::{
@@ -20,8 +20,8 @@ use crate::ingress::TcpConnections;
 use crate::ingress::UdpPeers;
 use crate::ingress::{HostPortEvent, HostPorts};
 use crate::network::{
-    EgressUdpSend, HostConnectionId, IngressTcpOutput, IngressUdpSend, InstanceNetworkError, InstanceNetworkSpec,
-    InstanceNetworkState, InstanceNetworkStatus,
+    EgressUdpSend, IngressTcpOutput, IngressUdpSend, InstanceNetworkError, InstanceNetworkSpec, InstanceNetworkState,
+    InstanceNetworkStatus,
 };
 use crate::reactor::{ProductionWake, ReactorBackend, ReactorReady};
 use crate::runtime::{NetworkRuntime, ProductionRuntime, production_runtime};
@@ -105,6 +105,13 @@ impl ComponentEvents {
             egress_udp: Vec::with_capacity(capacity),
         }
     }
+
+    const fn has_pending(&self) -> bool {
+        !self.guest.is_empty()
+            || !self.host_ports.is_empty()
+            || !self.egress_tcp.is_empty()
+            || !self.egress_udp.is_empty()
+    }
 }
 
 struct ComponentOutputQueues {
@@ -131,6 +138,13 @@ impl ComponentOutputQueues {
             ingress_udp_sends: Vec::with_capacity(capacity),
         }
     }
+
+    const fn has_pending(&self) -> bool {
+        !self.guest_frames.is_empty()
+            || !self.egress_udp_sends.is_empty()
+            || !self.ingress_tcp.is_empty()
+            || !self.ingress_udp_sends.is_empty()
+    }
 }
 
 pub(crate) struct EventLoopCore<R, O, C>
@@ -154,7 +168,6 @@ where
     buffers: BufferPool,
     component_outputs: ComponentOutputQueues,
     component_events: ComponentEvents,
-    ingress_tcp_blocked_reads: Vec<HostConnectionId>,
     reactor_ready: Vec<ReactorReady>,
     timers: TimerQueue<R::Clock>,
     expired_timers: Vec<TimerId>,
@@ -209,7 +222,6 @@ where
             buffers,
             component_outputs: ComponentOutputQueues::with_capacity(limits.component_output_batch_capacity),
             component_events: ComponentEvents::with_capacity(limits.component_event_batch_capacity),
-            ingress_tcp_blocked_reads: Vec::with_capacity(limits.ingress_tcp_connection_limit),
             reactor_ready: Vec::with_capacity(limits.component_event_batch_capacity),
             timers,
             expired_timers: Vec::with_capacity(TIMER_QUEUE_REQUIRED_CAPACITY),
@@ -279,6 +291,7 @@ where
         Ok(ConnectOutcome::Connected)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn drive_once(&mut self, poll_timeout: Option<Duration>) -> DriveOutcome {
         // Commands are the only control-plane input in the hot connected loop.
         // The dataplane itself communicates by filling component_events and
@@ -296,19 +309,15 @@ where
         let (queued_timer_progress, queued_output_progress) = {
             let mut drive = DriveTurn::new(&mut budget, &mut queued_report);
             if let Some(guest) = &mut self.guest
-                && let Err(error) = guest.drive_queued(&mut self.component_events.guest, &mut drive, &self.runtime)
+                && let Err(error) = guest.flush_outbound(&mut drive, &self.runtime)
             {
                 self.guest_disconnect = Some((self.generation, error.to_string()));
             }
+            let before_existing_outputs = drive.progress();
+            self.process_component_outputs(&mut drive);
+            let existing_output_progress = drive.progress() != before_existing_outputs;
             if let Some(host_ports) = &mut self.host_ports {
-                self.gateway
-                    .ingress_tcp_guest_send_blocked(&self.ingress_tcp, &mut self.ingress_tcp_blocked_reads);
-                host_ports.drive_queued(
-                    &self.ingress_tcp_blocked_reads,
-                    &mut self.component_events.host_ports,
-                    &mut drive,
-                    &mut self.runtime,
-                );
+                host_ports.drive_queued(&mut self.component_events.host_ports, &mut drive, &mut self.runtime);
             }
             self.egress_udp
                 .drive_queued(&mut self.component_events.egress_udp, &mut drive, &mut self.runtime);
@@ -319,24 +328,30 @@ where
             let before_outputs = drive.progress();
             self.process_component_outputs(&mut drive);
             let output_progress = drive.progress() != before_outputs;
-            (timer_progress, output_progress)
+            if let Some(guest) = &mut self.guest
+                && let Err(error) = guest.drain_ready_reads(&mut self.component_events.guest, &mut drive)
+            {
+                self.guest_disconnect = Some((self.generation, error.to_string()));
+            }
+            (timer_progress, existing_output_progress || output_progress)
         };
+        let queued_local_work_pending = self.has_pending_local_work();
         let followup_progress = queued_output_progress || queued_timer_progress;
-        let made_progress = queued_report.made_progress() || followup_progress;
         if let Some((generation, reason)) = self.got_disconnected() {
             self.backoff_connected(generation, reason);
             return DriveOutcome::Reconnect;
         }
-        // No local work is ready, so publish pending output, wait for reactor
-        // readiness or the next timer, then drive the components that own those
-        // ready items. Any new side effects produced by readiness are flushed at
-        // the end of this same turn.
+        // Decide whether pending local work deserves another immediate turn
+        // before waiting for reactor readiness or the next timer.
         self.refresh_timers();
-        let timeout = if made_progress {
-            Some(Duration::ZERO)
-        } else {
-            poll_timeout.or_else(|| self.timers.next_timeout())
-        };
+        let timeout = queued_phase_reactor_timeout(
+            &queued_report,
+            queued_local_work_pending,
+            followup_progress,
+            poll_timeout,
+            self.timers.next_timeout(),
+            self.spec.config.limits.idle_poll_delay,
+        );
         if let Err(message) = self.wait_reactor(timeout) {
             self.record_reactor_error(message);
             self.publish();
@@ -355,11 +370,8 @@ where
                 self.guest_disconnect = Some((self.generation, error.to_string()));
             }
             if let Some(host_ports) = &mut self.host_ports {
-                self.gateway
-                    .ingress_tcp_guest_send_blocked(&self.ingress_tcp, &mut self.ingress_tcp_blocked_reads);
                 host_ports.drive_ready(
                     &readiness,
-                    &self.ingress_tcp_blocked_reads,
                     &mut self.component_events.host_ports,
                     &mut drive,
                     &mut self.runtime,
@@ -381,11 +393,16 @@ where
             let output_progress = drive.progress() != before_outputs;
             (timer_progress, output_progress)
         };
+        let ready_local_work_pending = self.has_pending_local_work();
         if let Some((generation, reason)) = self.got_disconnected() {
             self.backoff_connected(generation, reason);
             return DriveOutcome::Reconnect;
         }
-        if should_retry_local(&ready_report, ready_output_progress || ready_timer_progress) {
+        if should_retry_local(
+            &ready_report,
+            ready_local_work_pending,
+            ready_output_progress || ready_timer_progress,
+        ) {
             return DriveOutcome::Continue;
         }
         DriveOutcome::Continue
@@ -527,10 +544,19 @@ where
     fn process_component_outputs(&mut self, drive: &mut DriveTurn<'_>) {
         self.process_component_events(drive);
         self.send_guest_frames(drive);
+        if let Some(guest) = &mut self.guest
+            && let Err(error) = guest.flush_outbound(drive, &self.runtime)
+        {
+            self.guest_disconnect = Some((self.generation, error.to_string()));
+        }
         self.send_egress_udp_datagrams(drive);
         self.process_ingress_tcp_outputs(drive);
         self.send_ingress_udp_datagrams(drive);
         self.outputs.flush();
+    }
+
+    const fn has_pending_local_work(&self) -> bool {
+        self.component_events.has_pending() || self.component_outputs.has_pending()
     }
 
     fn process_component_events(&mut self, drive: &mut DriveTurn<'_>) {
@@ -976,6 +1002,10 @@ where
     }
 
     fn publish(&mut self) {
+        self.status.telemetry.record_dataplane(
+            self.buffers.snapshot(),
+            self.egress_tcp.telemetry(self.gateway.tcp_sockets()),
+        );
         self.emit_event(NetworkEvent::Telemetry(NetworkTelemetryEvent::Snapshot(
             NetworkTelemetrySnapshot::from_status(&self.status),
         )));
@@ -1100,9 +1130,32 @@ fn consume_events<T>(events: &mut Vec<T>, mut collect: impl FnMut(T)) {
     }
 }
 
-const fn should_retry_local(report: &DriveReport, followup_progress: bool) -> bool {
+const fn should_retry_local(report: &DriveReport, local_work_pending: bool, followup_progress: bool) -> bool {
     (report.budget_exhausted() && report.made_progress())
+        || (local_work_pending && report.made_progress())
         || (!report.runnable().is_empty() && (report.made_progress() || followup_progress))
+        || (report.blocked_on(DriveWait::LOCAL_BUFFER_CAPACITY) && followup_progress)
+}
+
+const fn queued_phase_reactor_timeout(
+    report: &DriveReport,
+    local_work_pending: bool,
+    followup_progress: bool,
+    poll_timeout: Option<Duration>,
+    timer_timeout: Option<Duration>,
+    idle_poll_delay: Duration,
+) -> Option<Duration> {
+    if should_retry_local(report, local_work_pending, followup_progress) {
+        Some(Duration::ZERO)
+    } else {
+        match poll_timeout {
+            Some(timeout) => Some(timeout),
+            None => match timer_timeout {
+                Some(Duration::ZERO) => Some(idle_poll_delay),
+                timeout => timeout,
+            },
+        }
+    }
 }
 
 fn take_fifo<T>(queue: &mut Vec<T>) -> Vec<T> {
@@ -1122,25 +1175,49 @@ mod tests {
     use crate::drive::{DriveBudget, DriveReport, DriveRunnable, DriveTurn};
     use crate::network::NetworkLimits;
 
-    use super::should_retry_local;
+    use super::{queued_phase_reactor_timeout, should_retry_local};
 
     #[test]
     fn local_retry_requires_progress_or_budgeted_work() {
         let mut report = drive_report(|drive| {
             drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
         });
-        assert!(!should_retry_local(&report, false));
+        assert!(!should_retry_local(&report, false, false));
 
         report = drive_report(|drive| {
             record_progress(drive);
         });
-        assert!(!should_retry_local(&report, false));
+        assert!(!should_retry_local(&report, false, false));
 
         report = drive_report(|drive| {
             record_progress(drive);
             drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
         });
-        assert!(should_retry_local(&report, false));
+        assert!(should_retry_local(&report, false, false));
+    }
+
+    #[test]
+    fn local_buffer_wait_retries_after_followup_output_progress() {
+        let report = drive_report(|drive| {
+            drive.wait_for_local_buffer_capacity();
+        });
+
+        assert!(!should_retry_local(&report, false, false));
+        assert!(should_retry_local(&report, false, true));
+    }
+
+    #[test]
+    fn pending_local_work_after_progress_retries_immediately() {
+        let report = drive_report(|drive| {
+            record_progress(drive);
+        });
+
+        assert!(should_retry_local(&report, true, false));
+    }
+
+    #[test]
+    fn pending_local_work_without_progress_does_not_retry() {
+        assert!(!should_retry_local(&DriveReport::new(), true, false));
     }
 
     #[test]
@@ -1154,7 +1231,7 @@ mod tests {
                 assert!(!drive.can_start_operation());
             },
         );
-        assert!(!should_retry_local(&report, false));
+        assert!(!should_retry_local(&report, true, false));
 
         report = drive_report_with(
             &NetworkLimits {
@@ -1166,7 +1243,85 @@ mod tests {
                 assert!(drive.push_event(&mut Vec::new(), ()).is_err());
             },
         );
-        assert!(should_retry_local(&report, false));
+        assert!(should_retry_local(&report, false, false));
+    }
+
+    #[test]
+    fn queued_phase_timeout_does_not_retry_immediately_for_progress_without_runnable_work() {
+        let timer_timeout = Some(std::time::Duration::from_secs(1));
+        let report = drive_report(|drive| {
+            record_progress(drive);
+        });
+
+        assert_eq!(
+            queued_phase_reactor_timeout(
+                &report,
+                false,
+                false,
+                None,
+                timer_timeout,
+                std::time::Duration::from_secs(1),
+            ),
+            timer_timeout
+        );
+    }
+
+    #[test]
+    fn queued_phase_timeout_retries_pending_local_work_after_progress() {
+        let timer_timeout = Some(std::time::Duration::from_secs(1));
+        let report = drive_report(|drive| {
+            record_progress(drive);
+        });
+
+        assert_eq!(
+            queued_phase_reactor_timeout(
+                &report,
+                true,
+                false,
+                None,
+                timer_timeout,
+                std::time::Duration::from_secs(1),
+            ),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn queued_phase_timeout_defers_zero_timer_after_unproductive_turn() {
+        let idle_poll_delay = std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            queued_phase_reactor_timeout(
+                &DriveReport::new(),
+                false,
+                false,
+                None,
+                Some(std::time::Duration::ZERO),
+                idle_poll_delay,
+            ),
+            Some(idle_poll_delay)
+        );
+    }
+
+    #[test]
+    fn queued_phase_timeout_keeps_zero_for_runnable_local_retry() {
+        let idle_poll_delay = std::time::Duration::from_secs(1);
+        let report = drive_report(|drive| {
+            record_progress(drive);
+            drive.wait_for_local_buffer_capacity_and_runnable(DriveRunnable::WRITE_UPSTREAM);
+        });
+
+        assert_eq!(
+            queued_phase_reactor_timeout(
+                &report,
+                false,
+                false,
+                None,
+                Some(std::time::Duration::ZERO),
+                idle_poll_delay,
+            ),
+            Some(std::time::Duration::ZERO)
+        );
     }
 
     fn record_progress(drive: &mut DriveTurn<'_>) {

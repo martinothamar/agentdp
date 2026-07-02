@@ -184,9 +184,18 @@ fn format_network_event(event: &AgentInstanceNetworkEvent) -> String {
             session_disconnects,
             connect_errors,
             egress_errors,
+            buffer_frame_available,
+            buffer_small_byte_available,
+            buffer_medium_byte_available,
+            buffer_tcp_byte_available,
+            tcp_proxy_active_slots,
+            tcp_proxy_upstream_read_ready,
+            tcp_proxy_upstream_read_masked,
+            tcp_proxy_guest_send_blocked,
+            tcp_proxy_pending_guest_bytes,
             ..
         } => format!(
-            "{prefix} telemetry.snapshot guest_rx={guest_frames_received}/{guest_bytes_received} host_tx={host_frames_sent}/{host_bytes_sent} disconnects={session_disconnects} connect_errors={connect_errors} egress_errors={egress_errors}",
+            "{prefix} telemetry.snapshot guest_rx={guest_frames_received}/{guest_bytes_received} host_tx={host_frames_sent}/{host_bytes_sent} disconnects={session_disconnects} connect_errors={connect_errors} egress_errors={egress_errors} buffers=frame:{buffer_frame_available},small:{buffer_small_byte_available},medium:{buffer_medium_byte_available},tcp:{buffer_tcp_byte_available} tcp=active:{tcp_proxy_active_slots},read_ready:{tcp_proxy_upstream_read_ready},read_masked:{tcp_proxy_upstream_read_masked},guest_blocked:{tcp_proxy_guest_send_blocked},pending_guest_bytes:{tcp_proxy_pending_guest_bytes}",
         ),
         AgentInstanceNetworkEventKind::TransportConnectFailed { transport, error } => {
             format!("{prefix} transport.connect_failed transport={transport} error={error}")

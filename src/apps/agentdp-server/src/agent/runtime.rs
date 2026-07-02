@@ -2105,18 +2105,7 @@ impl RunningAgentState {
             return;
         };
         let generation = instance.documents.private.spec.desired_generation;
-        if instance.documents.private.status.phase == AgentInstancePhase::Stopped
-            && instance
-                .documents
-                .private
-                .status
-                .reconciliation
-                .as_ref()
-                .is_some_and(|state| state.stale)
-        {
-            clear_instance_work(instance);
-            instance.documents.private.status.mark_observed_generation(generation);
-        } else if instance.documents.private.status.phase == AgentInstancePhase::Running
+        if instance.documents.private.status.phase == AgentInstancePhase::Running
             && instance.documents.private.status.reconciliation.is_none()
         {
             admit_instance_work(instance, AgentInstanceWork::Reconciling);
@@ -3555,6 +3544,7 @@ fn apply_network_event(document: &mut AgentInstanceDocument, event: &AgentInstan
                 session_disconnects,
                 connect_errors,
                 egress_errors,
+                ..
             } => {
                 status.started_unix_seconds = *started_unix_seconds;
                 status.last_state_change_unix_seconds = *last_state_change_unix_seconds;

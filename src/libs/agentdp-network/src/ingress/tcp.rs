@@ -135,20 +135,6 @@ impl TcpConnections {
         }
         self.closed_scratch.clear();
     }
-
-    pub(crate) fn guest_send_blocked_connections(
-        &self,
-        sockets: &SocketSet<'static>,
-        output: &mut Vec<HostConnectionId>,
-    ) {
-        output.clear();
-        for (connection, entry) in self.by_connection.iter() {
-            let socket = sockets.get::<tcp::Socket>(entry.handle);
-            if !entry.pending_writes.is_empty() || !socket.can_send() {
-                output.push(connection);
-            }
-        }
-    }
 }
 
 pub(crate) const fn take_ephemeral_port(next_ephemeral_port: &mut u16) -> u16 {

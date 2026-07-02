@@ -142,7 +142,7 @@ where
         Ok(Self {
             source,
             item,
-            io: IoSlotState::registered(interest),
+            io: IoSlotState::registered_with_read_probe(interest),
         })
     }
 

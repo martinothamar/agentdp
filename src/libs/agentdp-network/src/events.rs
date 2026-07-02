@@ -157,6 +157,15 @@ pub struct NetworkTelemetrySnapshot {
     pub connect_errors: u64,
     pub egress_errors: u64,
     pub telemetry_events_dropped: u64,
+    pub buffer_frame_available: u64,
+    pub buffer_small_byte_available: u64,
+    pub buffer_medium_byte_available: u64,
+    pub buffer_tcp_byte_available: u64,
+    pub tcp_proxy_active_slots: u64,
+    pub tcp_proxy_upstream_read_ready: u64,
+    pub tcp_proxy_upstream_read_masked: u64,
+    pub tcp_proxy_guest_send_blocked: u64,
+    pub tcp_proxy_pending_guest_bytes: u64,
 }
 
 impl NetworkTelemetrySnapshot {
@@ -181,6 +190,15 @@ impl NetworkTelemetrySnapshot {
             connect_errors: telemetry.connect_errors,
             egress_errors: telemetry.egress_errors,
             telemetry_events_dropped: telemetry.telemetry_events_dropped,
+            buffer_frame_available: telemetry.buffer_frame_available,
+            buffer_small_byte_available: telemetry.buffer_small_byte_available,
+            buffer_medium_byte_available: telemetry.buffer_medium_byte_available,
+            buffer_tcp_byte_available: telemetry.buffer_tcp_byte_available,
+            tcp_proxy_active_slots: telemetry.tcp_proxy_active_slots,
+            tcp_proxy_upstream_read_ready: telemetry.tcp_proxy_upstream_read_ready,
+            tcp_proxy_upstream_read_masked: telemetry.tcp_proxy_upstream_read_masked,
+            tcp_proxy_guest_send_blocked: telemetry.tcp_proxy_guest_send_blocked,
+            tcp_proxy_pending_guest_bytes: telemetry.tcp_proxy_pending_guest_bytes,
         }
     }
 
@@ -198,6 +216,15 @@ impl NetworkTelemetrySnapshot {
         telemetry.connect_errors = self.connect_errors;
         telemetry.egress_errors = self.egress_errors;
         telemetry.telemetry_events_dropped = self.telemetry_events_dropped;
+        telemetry.buffer_frame_available = self.buffer_frame_available;
+        telemetry.buffer_small_byte_available = self.buffer_small_byte_available;
+        telemetry.buffer_medium_byte_available = self.buffer_medium_byte_available;
+        telemetry.buffer_tcp_byte_available = self.buffer_tcp_byte_available;
+        telemetry.tcp_proxy_active_slots = self.tcp_proxy_active_slots;
+        telemetry.tcp_proxy_upstream_read_ready = self.tcp_proxy_upstream_read_ready;
+        telemetry.tcp_proxy_upstream_read_masked = self.tcp_proxy_upstream_read_masked;
+        telemetry.tcp_proxy_guest_send_blocked = self.tcp_proxy_guest_send_blocked;
+        telemetry.tcp_proxy_pending_guest_bytes = self.tcp_proxy_pending_guest_bytes;
     }
 }
 

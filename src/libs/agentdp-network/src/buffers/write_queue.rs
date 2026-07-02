@@ -69,7 +69,6 @@ impl WriteQueue {
         self.rest.clear();
     }
 
-    #[cfg(any(test, feature = "simulation"))]
     pub(crate) fn pending_bytes(&self) -> usize {
         self.first
             .iter()
@@ -100,7 +99,6 @@ impl PendingWrite {
         (!self.is_empty()).then(|| &self.bytes.as_slice()[self.offset..])
     }
 
-    #[cfg(any(test, feature = "simulation"))]
     const fn remaining_len(&self) -> usize {
         self.bytes.len().saturating_sub(self.offset)
     }

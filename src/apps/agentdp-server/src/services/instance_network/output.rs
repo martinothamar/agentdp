@@ -149,6 +149,7 @@ fn publish_observation(
     let _sent = observation_tx.send(observation.clone());
 }
 
+#[allow(clippy::too_many_lines)]
 fn instance_network_event(event: &NetworkEventEnvelope) -> AgentInstanceNetworkEvent {
     AgentInstanceNetworkEvent {
         sequence: event.sequence,
@@ -174,6 +175,15 @@ fn instance_network_event(event: &NetworkEventEnvelope) -> AgentInstanceNetworkE
                     session_disconnects: snapshot.session_disconnects,
                     connect_errors: snapshot.connect_errors,
                     egress_errors: snapshot.egress_errors,
+                    buffer_frame_available: snapshot.buffer_frame_available,
+                    buffer_small_byte_available: snapshot.buffer_small_byte_available,
+                    buffer_medium_byte_available: snapshot.buffer_medium_byte_available,
+                    buffer_tcp_byte_available: snapshot.buffer_tcp_byte_available,
+                    tcp_proxy_active_slots: snapshot.tcp_proxy_active_slots,
+                    tcp_proxy_upstream_read_ready: snapshot.tcp_proxy_upstream_read_ready,
+                    tcp_proxy_upstream_read_masked: snapshot.tcp_proxy_upstream_read_masked,
+                    tcp_proxy_guest_send_blocked: snapshot.tcp_proxy_guest_send_blocked,
+                    tcp_proxy_pending_guest_bytes: snapshot.tcp_proxy_pending_guest_bytes,
                 }
             }
             NetworkEvent::Transport(NetworkTransportEvent::ConnectFailed { transport, error }) => {

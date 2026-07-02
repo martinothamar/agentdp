@@ -18,7 +18,7 @@ use crate::buffers::WriteQueue;
 use crate::clock::SystemClock;
 use crate::connectors::tcp::TcpConnector;
 use crate::connectors::udp::UdpSocketFactory;
-use crate::drive::{DriveBudget, DriveReport, DriveTurn};
+use crate::drive::{DriveBudget, DriveReport, DriveRunnable, DriveTurn};
 use crate::guest::{
     ConnectStatus, FrameRead, FrameWrite, GuestFrameSession, GuestFrameTransport, GuestIoSource, TransportError,
 };
@@ -449,6 +449,38 @@ fn plain_tcp_read_would_block_does_not_retry_on_write_readiness_only() {
         proxy.drive(&buffers, &mut runtime, drive, TcpProxyPermit::ALL)
     });
     assert_eq!(stats.reads(), 1, "write readiness must not admit another read syscall");
+}
+
+#[test]
+fn plain_tcp_read_blocked_on_local_buffer_stays_read_runnable() {
+    let buffers = BufferPool::new(NetworkLimits {
+        tcp_byte_pool_capacity: 0,
+        ..NetworkLimits::default()
+    });
+    buffers.prewarm_instance_network();
+    let stats = CountingStreamStats::default();
+    let mut runtime = counting_runtime(stats);
+    let proxy_id = TcpProxyId(7103);
+    let dst = test_dst();
+    let mut proxy = TcpProxy::connecting(
+        proxy_id,
+        dst,
+        dst,
+        TcpEgressRoute::Plain(plain_policy(ApplicationPolicy::Raw, false)),
+        &buffers,
+        &mut runtime,
+    )
+    .expect("proxy should connect");
+    proxy.mark_reactor_ready(true, false);
+
+    let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+    let (poll, report) = with_drive(&mut budget, |drive| {
+        proxy.drive(&buffers, &mut runtime, drive, TcpProxyPermit::READ_UPSTREAM)
+    });
+
+    assert!(matches!(poll, TcpProxyPoll::Pending));
+    assert!(report.wait().contains(crate::drive::DriveWait::LOCAL_BUFFER_CAPACITY));
+    assert_eq!(report.runnable(), DriveRunnable::READ_UPSTREAM);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -404,13 +404,8 @@ where
         else {
             return None;
         };
-        let runnable = if self.pending.is_empty() {
-            DriveRunnable::NONE
-        } else {
-            DriveRunnable::WRITE_UPSTREAM
-        };
         let (stream, io) = stream.source_and_io_mut();
-        match drive.read_stream_ready(io, buffers, stream, runnable) {
+        match drive.read_stream_ready(io, buffers, stream, DriveRunnable::READ_UPSTREAM) {
             Ok(DriveStreamRead::Closed) => Some(TcpProxyPoll::Event(TcpProxyEvent::closed(self.proxy))),
             Ok(DriveStreamRead::Bytes(bytes)) => {
                 self.read_pending = true;

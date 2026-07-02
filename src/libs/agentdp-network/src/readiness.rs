@@ -11,6 +11,7 @@ use crate::reactor::ReactorInterest;
 pub(crate) struct IoSlotState {
     readiness: IoReadiness,
     registered_interest: ReactorInterest,
+    read_probe: bool,
     write_probe: bool,
 }
 
@@ -22,6 +23,7 @@ impl IoSlotState {
         Self {
             readiness: IoReadiness::empty(),
             registered_interest,
+            read_probe: false,
             write_probe: false,
         }
     }
@@ -30,6 +32,16 @@ impl IoSlotState {
         Self {
             readiness: IoReadiness::empty(),
             registered_interest: interest,
+            read_probe: false,
+            write_probe: interest_writes(interest),
+        }
+    }
+
+    pub(crate) const fn registered_with_read_probe(interest: ReactorInterest) -> Self {
+        Self {
+            readiness: IoReadiness::empty(),
+            registered_interest: interest,
+            read_probe: interest_reads(interest),
             write_probe: interest_writes(interest),
         }
     }
@@ -42,8 +54,12 @@ impl IoSlotState {
         interest_writes(self.registered_interest)
     }
 
+    pub(crate) const fn watches_read(self) -> bool {
+        interest_reads(self.registered_interest)
+    }
+
     pub(crate) const fn can_read(self) -> bool {
-        interest_reads(self.registered_interest) && self.readiness.readable()
+        interest_reads(self.registered_interest) && (self.readiness.readable() || self.read_probe)
     }
 
     pub(crate) const fn can_write(self) -> bool {
@@ -56,6 +72,7 @@ impl IoSlotState {
 
     pub(crate) const fn clear_read_after_would_block(&mut self) {
         self.readiness.clear_read();
+        self.read_probe = false;
     }
 
     pub(crate) const fn clear_write_after_would_block(&mut self) {
@@ -66,13 +83,21 @@ impl IoSlotState {
     pub(crate) const fn clear_for_drop_or_reset(&mut self) {
         self.readiness = IoReadiness::empty();
         self.registered_interest = ReactorInterest::Disabled;
+        self.read_probe = false;
         self.write_probe = false;
     }
 
     pub(crate) const fn set_registered_interest_after_reregister(&mut self, interest: ReactorInterest) {
+        let previous_readable = interest_reads(self.registered_interest);
+        let next_readable = interest_reads(interest);
         let previous_writable = interest_writes(self.registered_interest);
         let next_writable = interest_writes(interest);
         self.registered_interest = interest;
+        if !next_readable {
+            self.read_probe = false;
+        } else if !previous_readable {
+            self.read_probe = true;
+        }
         if !next_writable {
             self.write_probe = false;
         } else if !previous_writable {
@@ -147,6 +172,15 @@ mod tests {
     }
 
     #[test]
+    fn explicit_read_probe_registration_allows_one_read_probe() {
+        let mut slot = IoSlotState::registered_with_read_probe(ReactorInterest::Readable);
+
+        assert!(slot.can_read());
+        slot.clear_read_after_would_block();
+        assert!(!slot.can_read());
+    }
+
+    #[test]
     fn first_write_probe_is_available_after_enabling_writable_interest() {
         let mut slot = IoSlotState::new(ReactorInterest::Readable);
 
@@ -154,6 +188,28 @@ mod tests {
 
         assert_eq!(slot.registered_interest(), ReactorInterest::ReadWrite);
         assert!(slot.can_write());
+    }
+
+    #[test]
+    fn first_read_probe_is_available_after_enabling_readable_interest() {
+        let mut slot = IoSlotState::new(ReactorInterest::Writable);
+
+        slot.set_registered_interest_after_reregister(ReactorInterest::ReadWrite);
+
+        assert_eq!(slot.registered_interest(), ReactorInterest::ReadWrite);
+        assert!(slot.can_read());
+    }
+
+    #[test]
+    fn read_would_block_disables_probe_until_reactor_reports_readable() {
+        let mut slot = IoSlotState::new(ReactorInterest::Writable);
+        slot.set_registered_interest_after_reregister(ReactorInterest::ReadWrite);
+
+        slot.clear_read_after_would_block();
+
+        assert!(!slot.can_read());
+        slot.mark_reactor_ready(true, false);
+        assert!(slot.can_read());
     }
 
     #[test]

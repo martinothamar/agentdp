@@ -147,7 +147,7 @@ where
                 false
             };
             if self.connection.is_handshaking() {
-                match self.read_ciphertext_ready(drive, TLS_HANDSHAKE_READ_CHUNK_BYTES) {
+                match self.read_ciphertext_ready(reactor, false, drive, TLS_HANDSHAKE_READ_CHUNK_BYTES) {
                     Ok(DriveTransportPoll::Complete(TlsCiphertextRead::Read(_read))) => {
                         step_progress = true;
                     }
@@ -385,7 +385,7 @@ where
             TlsPlaintextRead::Blocked => TlsReadOutcome::blocked(false),
         };
         if outcome.state == TlsReadState::Blocked && !output.is_empty() {
-            match self.read_ciphertext_ready(drive, output.len())? {
+            match self.read_ciphertext_ready(reactor, plaintext_write_pending, drive, output.len())? {
                 DriveTransportPoll::Complete(TlsCiphertextRead::Read(read)) => {
                     outcome.tls_bytes_read = outcome.tls_bytes_read.saturating_add(read);
                     outcome.update_interest = true;
@@ -449,6 +449,13 @@ where
         self.stream.reregister(reactor, interest)
     }
 
+    fn ensure_read_interest(&mut self, reactor: &R, plaintext_write_pending: bool) -> io::Result<()> {
+        if !self.stream.io().watches_read() {
+            self.update_interest(reactor, plaintext_write_pending)?;
+        }
+        Ok(())
+    }
+
     fn drain_ciphertext_ready(
         &mut self,
         drive: &mut DriveTurn<'_>,
@@ -468,9 +475,12 @@ where
 
     fn read_ciphertext_ready(
         &mut self,
+        reactor: &R,
+        plaintext_write_pending: bool,
         drive: &mut DriveTurn<'_>,
         available_bytes: usize,
     ) -> io::Result<DriveTransportPoll<TlsCiphertextRead>> {
+        self.ensure_read_interest(reactor, plaintext_write_pending)?;
         let (stream, io) = self.stream.source_and_io_mut();
         drive.transport_read_ready(io, available_bytes, |limit| {
             self.connection
@@ -736,6 +746,40 @@ mod tests {
             upstream.read_plaintext(&mut output, &reactor, false, drive)
         });
         assert_eq!(stats.reads(), 1, "write readiness must not admit TLS transport reads");
+    }
+
+    #[test]
+    fn tls_read_reenables_parked_read_interest_before_waiting() {
+        let (client, mut server) = connected_tls_pair().expect("TLS pair should connect");
+        let mut inbound_tls = Vec::new();
+        assert_eq!(
+            server
+                .write_plaintext_some(b"response")
+                .expect("server should accept response plaintext"),
+            TlsPlaintextWrite::Accepted(b"response".len())
+        );
+        let _drain = server
+            .drain_ciphertext_to(&mut inbound_tls, usize::MAX)
+            .expect("server should serialize response TLS");
+        let stats = CountingStreamStats::default();
+        let mut upstream = test_upstream(client, CountingTlsStream::with_readable(stats.clone(), inbound_tls));
+        let reactor = TestReactor;
+        upstream
+            .park_read(&reactor, false)
+            .expect("parking read interest should not fail");
+
+        let mut output = [0_u8; 32];
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let (read, _report) = with_drive(&mut budget, |drive| {
+            upstream.read_plaintext(&mut output, &reactor, false, drive)
+        });
+
+        assert!(matches!(
+            read.expect("TLS read drive should not fail"),
+            TlsPlaintextDrive::Plaintext(len) if len == b"response".len()
+        ));
+        assert_eq!(&output[..b"response".len()], b"response");
+        assert_eq!(stats.reads(), 1);
     }
 
     fn with_drive<T>(budget: &mut DriveBudget, f: impl FnOnce(&mut DriveTurn<'_>) -> T) -> (T, DriveReport) {

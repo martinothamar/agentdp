@@ -23,11 +23,10 @@ pub(crate) struct BufferPool {
     limits: Rc<NetworkLimits>,
 }
 
-#[cfg(any(test, feature = "simulation"))]
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BufferPoolSnapshot {
-    pub(crate) frame_checked_out: usize,
-    pub(crate) byte_checked_out: usize,
+    pub(crate) frame_available: usize,
     pub(crate) small_byte_available: usize,
     pub(crate) medium_byte_available: usize,
     pub(crate) tcp_byte_available: usize,
@@ -85,12 +84,11 @@ impl BufferPool {
         self.bytes.assert_drained();
     }
 
-    #[cfg(any(test, feature = "simulation"))]
     pub(crate) fn snapshot(&self) -> BufferPoolSnapshot {
+        let frames = self.frames.inner.borrow();
         let bytes = self.bytes.inner.borrow();
         BufferPoolSnapshot {
-            frame_checked_out: self.frames.checked_out.get(),
-            byte_checked_out: self.bytes.checked_out.get(),
+            frame_available: frames.len(),
             small_byte_available: bytes.small.len(),
             medium_byte_available: bytes.medium.len(),
             tcp_byte_available: bytes.tcp.len(),

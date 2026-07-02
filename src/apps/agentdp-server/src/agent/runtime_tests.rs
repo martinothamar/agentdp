@@ -12,7 +12,7 @@ use agentdp_core::agent::{
     AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind, AgentInstancePhase, AgentInstanceTarget,
     AgentStatusPhase, BackendState, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State,
     NetworkModeState, NetworkState, PortProtocolState, ProcessStatus, QemuImageState, QemuInstanceNetworkState,
-    QemuMediatedCaState, QemuState, assign_port_mappings,
+    QemuMediatedCaState, QemuState, ReconciliationState, assign_port_mappings,
 };
 use agentdp_core::doctor::DoctorReport;
 use agentdp_core::manifest::plugins::codex::Codex;
@@ -917,6 +917,26 @@ async fn persisted_ready_instance_reconciles_after_agent_restart() {
 }
 
 #[tokio::test(flavor = "local")]
+async fn persisted_stale_stopped_active_instance_starts_after_agent_restart() {
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    persist_stale_stopped_active_instance(&layout, &agent_name, &manifest).await;
+    let backend = Rc::new(FakeBackend::default());
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_ready(&mut stream, 1).await;
+
+    assert_eq!(*backend.instance_starts.borrow(), 1);
+}
+
+#[tokio::test(flavor = "local")]
 async fn commit_persistence_failure_answers_pending_command() {
     let manifest = manifest_with(0);
     let (layout, agent_name) = unique_layout(&manifest);
@@ -1323,6 +1343,19 @@ async fn persist_ready_running_instance(layout: &AgentdpLayout, agent: &AgentNam
     write_persisted_instance(layout, agent, AgentInstanceId::new(0), &instance).await;
 }
 
+async fn persist_stale_stopped_active_instance(layout: &AgentdpLayout, agent: &AgentName, manifest: &AgentManifest) {
+    let mut instance = persisted_running_instance(layout, agent, manifest).await;
+    instance.status.phase = AgentInstancePhase::Stopped;
+    instance.status.clear_readiness();
+    instance.status.reconciliation = Some(ReconciliationState {
+        stale: true,
+        observed_status: "missing".to_owned(),
+        observed_pid: Some(3_940_761),
+        reason: Some("runtime status is running but QEMU pid 3940761 is not running".to_owned()),
+    });
+    write_persisted_instance(layout, agent, AgentInstanceId::new(0), &instance).await;
+}
+
 async fn persisted_running_instance(
     layout: &AgentdpLayout,
     agent: &AgentName,
@@ -1395,6 +1428,7 @@ struct FakeBackend {
     pause_next_instance_create: RefCell<Option<oneshot::Receiver<()>>>,
     created_bases: RefCell<u32>,
     created_instances: RefCell<Vec<String>>,
+    instance_starts: RefCell<u32>,
     instance_reconciles: RefCell<u32>,
     host_input_reconciles: RefCell<u32>,
     fail_host_input_reconciles: RefCell<u32>,
@@ -1585,6 +1619,7 @@ impl backend::Backend for FakeBackend {
         _manifest: &'a AgentManifestContext,
         state: &'a mut AgentInstanceDocument,
     ) -> backend::BackendFuture<'a, backend::StartOutput> {
+        *self.instance_starts.borrow_mut() += 1;
         Box::pin(async {
             Ok(backend::StartOutput {
                 process: process_status("running"),

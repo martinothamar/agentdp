@@ -7,7 +7,7 @@ use agentdp_crypto::{TlsClientConfig, TlsServerConfig};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
-use crate::buffers::ByteBuf;
+use crate::buffers::{BufferPoolSnapshot, ByteBuf};
 use crate::clock::{NetworkClock, SystemClock};
 use crate::guest::TransportError;
 use crate::policy::{Authority, EgressPolicy, NetworkPolicy, RuntimeSecrets};
@@ -183,8 +183,8 @@ impl NetworkLimits {
             medium_byte_capacity: 16 * 1024,
             tcp_byte_capacity: 64 * 1024,
             small_byte_pool_capacity: 1024,
-            medium_byte_pool_capacity: 256,
-            tcp_byte_pool_capacity: 128,
+            medium_byte_pool_capacity: 512,
+            tcp_byte_pool_capacity: 512,
             tcp_socket_buffer_capacity: 64 * 1024,
             udp_datagram_buffer_capacity: 65_536,
             ingress_udp_datagram_buffer_capacity: 65_536,
@@ -197,7 +197,7 @@ impl NetworkLimits {
             drive_event_budget: 256,
             drive_step_budget: 8192,
             drive_byte_budget: 64 * 1024 * 1024,
-            tcp_proxy_limit: 128,
+            tcp_proxy_limit: 512,
             ingress_tcp_connection_limit: 128,
             ingress_udp_peer_limit: 128,
             udp_proxy_limit: 128,
@@ -447,7 +447,25 @@ pub struct InstanceNetworkTelemetry {
     pub connect_errors: u64,
     pub egress_errors: u64,
     pub telemetry_events_dropped: u64,
+    pub buffer_frame_available: u64,
+    pub buffer_small_byte_available: u64,
+    pub buffer_medium_byte_available: u64,
+    pub buffer_tcp_byte_available: u64,
+    pub tcp_proxy_active_slots: u64,
+    pub tcp_proxy_upstream_read_ready: u64,
+    pub tcp_proxy_upstream_read_masked: u64,
+    pub tcp_proxy_guest_send_blocked: u64,
+    pub tcp_proxy_pending_guest_bytes: u64,
     pub error_events: InstanceNetworkErrorEvents,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpProxyTelemetry {
+    pub(crate) active_slots: u64,
+    pub(crate) upstream_read_ready: u64,
+    pub(crate) upstream_read_masked: u64,
+    pub(crate) guest_send_blocked: u64,
+    pub(crate) pending_guest_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,6 +549,15 @@ impl InstanceNetworkTelemetry {
             connect_errors: 0,
             egress_errors: 0,
             telemetry_events_dropped: 0,
+            buffer_frame_available: 0,
+            buffer_small_byte_available: 0,
+            buffer_medium_byte_available: 0,
+            buffer_tcp_byte_available: 0,
+            tcp_proxy_active_slots: 0,
+            tcp_proxy_upstream_read_ready: 0,
+            tcp_proxy_upstream_read_masked: 0,
+            tcp_proxy_guest_send_blocked: 0,
+            tcp_proxy_pending_guest_bytes: 0,
             error_events: InstanceNetworkErrorEvents::new(limits.telemetry_event_capacity),
         }
     }
@@ -587,6 +614,18 @@ impl InstanceNetworkTelemetry {
         self.host_frames_sent = self.host_frames_sent.saturating_add(1);
         self.host_bytes_sent = self.host_bytes_sent.saturating_add(bytes_to_u64(bytes));
         self.last_host_frame_unix_seconds = Some(clock.unix_seconds());
+    }
+
+    pub(crate) fn record_dataplane(&mut self, buffers: BufferPoolSnapshot, tcp: TcpProxyTelemetry) {
+        self.buffer_frame_available = usize_to_u64(buffers.frame_available);
+        self.buffer_small_byte_available = usize_to_u64(buffers.small_byte_available);
+        self.buffer_medium_byte_available = usize_to_u64(buffers.medium_byte_available);
+        self.buffer_tcp_byte_available = usize_to_u64(buffers.tcp_byte_available);
+        self.tcp_proxy_active_slots = tcp.active_slots;
+        self.tcp_proxy_upstream_read_ready = tcp.upstream_read_ready;
+        self.tcp_proxy_upstream_read_masked = tcp.upstream_read_masked;
+        self.tcp_proxy_guest_send_blocked = tcp.guest_send_blocked;
+        self.tcp_proxy_pending_guest_bytes = tcp.pending_guest_bytes;
     }
 }
 
@@ -745,7 +784,11 @@ pub(crate) enum BlockReason {
 }
 
 fn bytes_to_u64(bytes: usize) -> u64 {
-    u64::try_from(bytes).unwrap_or(u64::MAX)
+    usize_to_u64(bytes)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1551,7 +1594,7 @@ mod tests {
 
         assert!(config.host_ports.is_empty());
         assert_eq!(config.limits.command_inbox_capacity, 1024);
-        assert_eq!(config.limits.tcp_proxy_limit, 128);
+        assert_eq!(config.limits.tcp_proxy_limit, 512);
         assert!(!config.ipv6_enabled);
         assert_eq!(config.mtu, 1500);
         assert_eq!(config.dns_upstream.port(), 53);

@@ -174,9 +174,8 @@ where
         Ok(GuestFrameEnqueue::Queued)
     }
 
-    pub(crate) fn drive_queued(
+    pub(crate) fn flush_outbound(
         &mut self,
-        events: &mut Vec<GuestEvent>,
         drive: &mut DriveTurn<'_>,
         runtime: &impl NetworkRuntime,
     ) -> Result<(), TransportError> {
@@ -210,7 +209,6 @@ where
         } else if !self.outbound.is_empty() && !self.io.io().can_write() {
             drive.wait_for_guest_send_capacity();
         }
-        self.drain_ready_reads(events, drive)?;
         Ok(())
     }
 
@@ -238,13 +236,14 @@ where
             self.io.mark_reactor_ready(readable, writable);
         }
         if guest_ready {
-            self.drive_queued(events, drive, runtime)
+            self.flush_outbound(drive, runtime)?;
+            self.drain_ready_reads(events, drive)
         } else {
             Ok(())
         }
     }
 
-    fn drain_ready_reads(
+    pub(crate) fn drain_ready_reads(
         &mut self,
         events: &mut Vec<GuestEvent>,
         drive: &mut DriveTurn<'_>,
@@ -324,11 +323,9 @@ mod tests {
             guest.enqueue(frame(&buffers, b"second"), &mut drive, &runtime),
             Ok(GuestFrameEnqueue::Queued)
         ));
-        let mut events = Vec::new();
         guest
-            .drive_queued(&mut events, &mut drive, &runtime)
+            .flush_outbound(&mut drive, &runtime)
             .expect("queued frames should flush");
-        assert!(events.is_empty());
 
         let mut observed = [0_u8; 11];
         guest

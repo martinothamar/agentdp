@@ -173,6 +173,17 @@ impl SmolTcpGuest {
     where
         N: SteppedNetwork,
     {
+        let handle = self.start_connect(dst)?;
+        self.drive_until(running, "guest TCP connect", |guest| {
+            guest.sockets.get::<tcp::Socket>(handle.0).may_send()
+        })?;
+        Ok(handle)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the TCP socket cannot start connecting.
+    pub fn start_connect(&mut self, dst: SocketAddr) -> Result<TcpHandle> {
         let IpAddr::V4(dst_ip) = dst.ip() else {
             return Err(Error::new(format!(
                 "smoltcp guest only supports IPv4 destinations: {dst}"
@@ -191,11 +202,12 @@ impl SmolTcpGuest {
                 local_port,
             )
             .map_err(|error| Error::new(format!("guest TCP connect to {dst}: {error:?}")))?;
-
-        self.drive_until(running, "guest TCP connect", |guest| {
-            guest.sockets.get::<tcp::Socket>(handle).may_send()
-        })?;
         Ok(TcpHandle(handle))
+    }
+
+    #[must_use]
+    pub fn tcp_state(&self, handle: TcpHandle) -> tcp::State {
+        self.sockets.get::<tcp::Socket>(handle.0).state()
     }
 
     /// # Errors

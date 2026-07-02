@@ -16,8 +16,7 @@ use crate::buffers::{BufferPool, ByteBuf};
 use crate::clock::NetworkClock;
 use crate::drive::{DriveRunnable, DriveSmoltcpTcpRecv, DriveTurn};
 use crate::gateway::Gateway;
-use crate::network::NetworkLimits;
-use crate::network::{TcpEgressRoute, TcpProxyId};
+use crate::network::{NetworkLimits, TcpEgressRoute, TcpProxyId, TcpProxyTelemetry};
 use crate::policy::Authority;
 use crate::reactor::ReactorItemId;
 use crate::reactor::{ReactorBackend, ReactorReady};
@@ -209,6 +208,10 @@ where
     #[cfg(any(test, feature = "simulation"))]
     pub(crate) fn active_proxy_slots(&self) -> usize {
         self.proxies.active_proxy_slots()
+    }
+
+    pub(crate) fn telemetry(&self, sockets: &SocketSet<'static>) -> TcpProxyTelemetry {
+        self.proxies.telemetry(sockets)
     }
 
     pub(crate) fn shutdown(&mut self, runtime: &mut impl NetworkRuntime<Reactor = R>) {
@@ -594,6 +597,29 @@ where
     #[cfg(any(test, feature = "simulation"))]
     fn active_proxy_slots(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    fn telemetry(&self, sockets: &SocketSet<'static>) -> TcpProxyTelemetry {
+        let mut telemetry = TcpProxyTelemetry::default();
+        for slot in self.slots.iter().flatten() {
+            telemetry.active_slots = telemetry.active_slots.saturating_add(1);
+            let socket = sockets.get::<tcp::Socket>(slot.handle);
+            if slot.entry.upstream_read_masked {
+                telemetry.upstream_read_masked = telemetry.upstream_read_masked.saturating_add(1);
+            }
+            if !slot.entry.pending_writes.is_empty() {
+                telemetry.pending_guest_bytes = telemetry
+                    .pending_guest_bytes
+                    .saturating_add(u64::try_from(slot.entry.pending_writes.pending_bytes()).unwrap_or(u64::MAX));
+                if !socket.can_send() {
+                    telemetry.guest_send_blocked = telemetry.guest_send_blocked.saturating_add(1);
+                }
+            }
+            if slot.entry.proxy.as_ref().is_some_and(|proxy| proxy.io().can_read()) {
+                telemetry.upstream_read_ready = telemetry.upstream_read_ready.saturating_add(1);
+            }
+        }
+        telemetry
     }
 
     #[cfg(any(test, feature = "simulation"))]

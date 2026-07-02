@@ -200,6 +200,10 @@ impl DriveReport {
         self.runnable
     }
 
+    pub(crate) const fn blocked_on(&self, wait: DriveWait) -> bool {
+        self.wait.contains(wait)
+    }
+
     pub(crate) const fn budget_exhausted(&self) -> bool {
         self.budget_exhausted
     }
@@ -278,6 +282,10 @@ impl<'a> DriveTurn<'a> {
 
     const fn step_or_exhausted(&mut self) -> bool {
         self.budget.step_or_exhausted(self.report)
+    }
+
+    const fn can_emit_event_or_exhausted(&mut self) -> bool {
+        self.budget.can_emit_event_or_exhausted(self.report)
     }
 
     fn event_or_exhausted(&mut self, bytes: usize) -> bool {
@@ -1007,7 +1015,7 @@ impl<'a> DriveTurn<'a> {
         frame_len: usize,
         write: impl FnOnce() -> Result<bool, E>,
     ) -> Result<DriveGuestFrameWrite, E> {
-        if !self.start_whole_item_operation(frame_len) {
+        if !self.can_emit_event_or_exhausted() || !self.start_whole_item_operation(frame_len) {
             return Ok(DriveGuestFrameWrite::Budget);
         }
         if write()? {
@@ -1027,7 +1035,9 @@ impl<'a> DriveTurn<'a> {
         buffers: &BufferPool,
         read: impl FnOnce(&mut FrameBuf) -> Result<DriveGuestFrameReadStatus, E>,
     ) -> Result<DriveGuestFrameRead, E> {
-        if !self.start_whole_item_operation(buffers.limits().frame_buffer_capacity) {
+        if !self.can_emit_event_or_exhausted()
+            || !self.start_whole_item_operation(buffers.limits().frame_buffer_capacity)
+        {
             return Ok(DriveGuestFrameRead::Blocked);
         }
         let Ok(mut frame) = buffers.try_frame() else {
@@ -1194,6 +1204,15 @@ impl DriveBudget {
 
     const fn event_step_or_exhausted(&mut self, report: &mut DriveReport) -> bool {
         if self.events > 0 && self.steps > 0 && self.step() {
+            true
+        } else {
+            report.mark_budget_exhausted();
+            false
+        }
+    }
+
+    const fn can_emit_event_or_exhausted(&self, report: &mut DriveReport) -> bool {
+        if self.events > 0 && self.bytes > 0 {
             true
         } else {
             report.mark_budget_exhausted();
@@ -1491,6 +1510,29 @@ mod tests {
     }
 
     #[test]
+    fn guest_frame_write_requires_event_budget_before_side_effect() {
+        let mut budget = DriveBudget::event_loop(&NetworkLimits {
+            drive_event_budget: 0,
+            ..NetworkLimits::default()
+        });
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let mut called = false;
+
+        let result = drive
+            .write_guest_frame(5, || -> Result<bool, std::convert::Infallible> {
+                called = true;
+                Ok(true)
+            })
+            .expect("infallible write should not fail");
+
+        assert!(matches!(result, DriveGuestFrameWrite::Budget));
+        assert!(!called);
+        assert!(report.budget_exhausted());
+        assert!(!report.made_progress());
+    }
+
+    #[test]
     fn guest_frame_read_requires_frame_capacity_budget_before_side_effect() {
         let buffers = BufferPool::new(NetworkLimits {
             frame_buffer_capacity: 8,
@@ -1498,6 +1540,30 @@ mod tests {
         });
         let mut budget = DriveBudget::event_loop(&NetworkLimits {
             drive_byte_budget: 7,
+            ..NetworkLimits::default()
+        });
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+        let mut called = false;
+
+        let result = drive
+            .read_guest_frame(&buffers, |_frame| -> Result<_, std::convert::Infallible> {
+                called = true;
+                Ok(super::DriveGuestFrameReadStatus::Frame)
+            })
+            .expect("infallible read should not fail");
+
+        assert!(matches!(result, DriveGuestFrameRead::Blocked));
+        assert!(!called);
+        assert!(report.budget_exhausted());
+        assert!(!report.made_progress());
+    }
+
+    #[test]
+    fn guest_frame_read_requires_event_budget_before_side_effect() {
+        let buffers = BufferPool::new(NetworkLimits::default());
+        let mut budget = DriveBudget::event_loop(&NetworkLimits {
+            drive_event_budget: 0,
             ..NetworkLimits::default()
         });
         let mut report = DriveReport::new();

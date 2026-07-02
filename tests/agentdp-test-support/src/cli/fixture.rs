@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::command::{CommandSnapshot, TestContext, agentctl_path_for_support};
-use super::instance_state;
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -71,10 +70,6 @@ impl ServerFixture {
             .env("AGENTDP_GUEST_TOOL_DIR", &self.guest_tool_dir)
             .env("AGENTDP_CODEX_AUTH_PATH", &self.codex_auth)
             .env("AGENTDP_TEST_SERVER_PID", &self.pid_file);
-    }
-
-    fn stop(&self) {
-        self.try_stop().expect("stop test agentdp-server");
     }
 
     fn try_stop(&self) -> Result<(), String> {
@@ -181,12 +176,18 @@ impl AgentFixture {
     pub fn status(&self) -> CommandSnapshot {
         let mut command = self.command();
         command.args(["status", "0", "-f"]).arg(&self.manifest);
+        if let Some(qemu_system) = &self.qemu_system {
+            command.env("AGENTDP_QEMU_SYSTEM_PATH", qemu_system);
+        }
         self.run(command, "run agentctl status")
     }
 
     pub fn agent_status(&self) -> CommandSnapshot {
         let mut command = self.command();
         command.args(["status", "-f"]).arg(&self.manifest);
+        if let Some(qemu_system) = &self.qemu_system {
+            command.env("AGENTDP_QEMU_SYSTEM_PATH", qemu_system);
+        }
         self.run(command, "run agentctl agent status")
     }
 
@@ -322,37 +323,6 @@ impl AgentFixture {
 
     pub fn instance_file(&self, suffix: &str) -> PathBuf {
         self.instance_dir().join(suffix)
-    }
-
-    pub fn instance_state(&self) -> agentdp_core::agent::AgentInstanceDocument {
-        instance_state::read(&self.instance_file("instance.yaml"))
-    }
-
-    pub fn write_instance_state(&self, state: &agentdp_core::agent::AgentInstanceDocument) {
-        instance_state::write(&self.instance_file("instance.yaml"), state);
-    }
-
-    pub fn mark_running(&self) {
-        let mut state = self.instance_state();
-        state.status.phase = agentdp_core::agent::AgentInstancePhase::Running;
-        instance_state::qemu_mut(&mut state).pid = Some(std::process::id());
-        self.write_instance_state(&state);
-        self.server.stop();
-    }
-
-    pub fn mark_running_with_missing_pid(&self) {
-        let mut state = self.instance_state();
-        let pid_file = instance_state::qemu(&state).pid_file.clone();
-        let pid = i32::MAX as u32;
-        state.status.phase = agentdp_core::agent::AgentInstancePhase::Running;
-        instance_state::qemu_mut(&mut state).pid = Some(pid);
-        state.status.reconciliation = None;
-        state.status.readiness = None;
-        state.status.ready_at = None;
-        fs::create_dir_all(Path::new(&pid_file).parent().expect("pid file parent")).expect("create pid file parent");
-        fs::write(pid_file, format!("{pid}\n")).expect("write stale pid file");
-        self.write_instance_state(&state);
-        self.server.stop();
     }
 
     pub fn write_serial_log(&self, contents: &str) {

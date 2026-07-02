@@ -282,7 +282,6 @@ where
 
     pub(crate) fn drive_queued(
         &mut self,
-        blocked_tcp_reads: &[HostConnectionId],
         events: &mut Vec<HostPortEvent>,
         drive: &mut DriveTurn<'_>,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
@@ -327,7 +326,7 @@ where
             }
 
             let before = drive.progress();
-            self.drive_tcp_reads(blocked_tcp_reads, events, drive, runtime.reactor_mut());
+            self.drive_tcp_reads(events, drive, runtime.reactor_mut());
             if drive.progress() != before {
                 continue;
             }
@@ -346,13 +345,12 @@ where
     pub(crate) fn drive_ready(
         &mut self,
         readiness: &[ReactorReady],
-        blocked_tcp_reads: &[HostConnectionId],
         events: &mut Vec<HostPortEvent>,
         drive: &mut DriveTurn<'_>,
         runtime: &mut impl NetworkRuntime<Reactor = R>,
     ) {
         self.latch_ready(readiness);
-        self.drive_queued(blocked_tcp_reads, events, drive, runtime);
+        self.drive_queued(events, drive, runtime);
     }
 
     fn latch_ready(&mut self, readiness: &[ReactorReady]) {
@@ -542,13 +540,7 @@ where
         None
     }
 
-    fn drive_tcp_reads(
-        &mut self,
-        blocked_tcp_reads: &[HostConnectionId],
-        events: &mut Vec<HostPortEvent>,
-        drive: &mut DriveTurn<'_>,
-        reactor: &mut R,
-    ) {
+    fn drive_tcp_reads(&mut self, events: &mut Vec<HostPortEvent>, drive: &mut DriveTurn<'_>, reactor: &mut R) {
         self.connection_scratch.clear();
         self.connection_scratch.extend(
             self.connections
@@ -558,10 +550,6 @@ where
         while let Some(connection) = self.connection_scratch.pop() {
             if !drive.can_start_operation() {
                 break;
-            }
-            if blocked_tcp_reads.contains(&connection) {
-                drive.wait_for_guest_send_capacity();
-                continue;
             }
             let read = {
                 let Some(connection_state) = self.connections.get_mut(&connection) else {
@@ -1107,7 +1095,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn mio_host_ports_hold_tcp_reads_while_guest_send_is_blocked() -> Result<(), Box<dyn std::error::Error>> {
+    async fn mio_host_ports_read_tcp_bytes_through_bounded_buffer_path() -> Result<(), Box<dyn std::error::Error>> {
         let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
         let buffers = test_buffers();
         let mut host_ports = HostPorts::bind([host_port("tcp", HostPortProtocol::Tcp, 3000)], &buffers, &mut runtime)?;
@@ -1132,17 +1120,9 @@ mod tests {
             .ready_into(&mut readiness, Some(Duration::from_secs(1)))?;
         let mut events = Vec::new();
         let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
-        let (_result, report) = with_drive(&mut budget, |drive| {
-            host_ports.drive_ready(&readiness, &[connection], &mut events, drive, &mut runtime);
+        let (_result, _report) = with_drive(&mut budget, |drive| {
+            host_ports.drive_ready(&readiness, &mut events, drive, &mut runtime);
         });
-        assert!(events.is_empty());
-        assert!(report.wait().contains(DriveWait::GUEST_SEND_CAPACITY));
-
-        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
-        let (_result, report) = with_drive(&mut budget, |drive| {
-            host_ports.drive_queued(&[], &mut events, drive, &mut runtime);
-        });
-        assert!(report.made_progress());
         match events.as_slice() {
             [
                 HostPortEvent::TcpBytes {
@@ -1153,8 +1133,47 @@ mod tests {
                 assert_eq!(*event_connection, connection);
                 assert_eq!(bytes.as_slice(), b"backpressured");
             }
-            _ => return Err("expected latched tcp bytes after guest send unblocked".into()),
+            _ => return Err("expected tcp bytes through bounded buffer path".into()),
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mio_host_ports_observe_tcp_close_while_guest_send_is_blocked() -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
+        let buffers = test_buffers();
+        let mut host_ports = HostPorts::bind([host_port("tcp", HostPortProtocol::Tcp, 3000)], &buffers, &mut runtime)?;
+        let tcp_host = host_ports
+            .bound_tcp_host_port(3000)
+            .ok_or("TCP host port was not bound")?;
+        let tcp_peer = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, tcp_host))?;
+        tcp_peer.set_nodelay(true)?;
+
+        let events = wait_until_host_event(&mut runtime, &mut host_ports, |event| {
+            matches!(event, HostPortEvent::TcpAccepted { .. })
+        })?;
+        let connection = match events.as_slice() {
+            [HostPortEvent::TcpAccepted { connection, .. }] => *connection,
+            _ => return Err("expected accepted connection".into()),
+        };
+
+        drop(tcp_peer);
+        let mut readiness = Vec::new();
+        runtime
+            .reactor_mut()
+            .ready_into(&mut readiness, Some(Duration::from_secs(1)))?;
+        let mut events = Vec::new();
+        let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
+        let (_result, _report) = with_drive(&mut budget, |drive| {
+            host_ports.drive_ready(&readiness, &mut events, drive, &mut runtime);
+        });
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HostPortEvent::TcpClosed { connection: closed } if *closed == connection)),
+            "host-port TCP EOF must be observed even when guest send is blocked: {events:?}"
+        );
         Ok(())
     }
 
@@ -1188,7 +1207,7 @@ mod tests {
             ..NetworkLimits::default()
         });
         let (_result, _report) = with_drive(&mut budget, |drive| {
-            host_ports.drive_ready(&readiness, &[], &mut events, drive, &mut runtime);
+            host_ports.drive_ready(&readiness, &mut events, drive, &mut runtime);
         });
 
         match events.as_slice() {
@@ -1378,7 +1397,7 @@ mod tests {
                 ProductionTcpConnector,
                 ProductionUdpSocketFactory,
             );
-            host_ports.drive_queued(&[], &mut Vec::new(), drive, &mut runtime);
+            host_ports.drive_queued(&mut Vec::new(), drive, &mut runtime);
         });
         assert!(!report.made_progress());
         assert_eq!(
@@ -1462,7 +1481,7 @@ mod tests {
                 ProductionTcpConnector,
                 ProductionUdpSocketFactory,
             );
-            host_ports.drive_queued(&[], &mut Vec::new(), drive, &mut runtime);
+            host_ports.drive_queued(&mut Vec::new(), drive, &mut runtime);
         });
         assert!(!report.made_progress());
         assert_eq!(host_ports.udp[0].pending.len(), 2);
@@ -1799,7 +1818,7 @@ mod tests {
                 .ready_into(&mut readiness, Some(Duration::from_millis(20)))?;
             let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
             let (_result, _report) = with_drive(&mut budget, |drive| {
-                host_ports.drive_ready(&readiness, &[], &mut events, drive, &mut runtime);
+                host_ports.drive_ready(&readiness, &mut events, drive, &mut runtime);
             });
             if events.iter().any(|event| {
                 matches!(
@@ -1847,7 +1866,7 @@ mod tests {
         let mut events = Vec::new();
         let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
         let (_result, report) = with_drive(&mut budget, |drive| {
-            host_ports.drive_queued(&[], &mut events, drive, &mut runtime);
+            host_ports.drive_queued(&mut events, drive, &mut runtime);
         });
         assert!(events.is_empty());
         assert!(!report.made_progress());
@@ -1908,7 +1927,7 @@ mod tests {
                 .ready_into(&mut readiness, Some(deadline - tokio::time::Instant::now()))?;
             let mut budget = DriveBudget::event_loop(&crate::network::NetworkLimits::default());
             let (_result, _report) = with_drive(&mut budget, |drive| {
-                host_ports.drive_ready(&readiness, &[], &mut output, drive, runtime);
+                host_ports.drive_ready(&readiness, &mut output, drive, runtime);
             });
             if output.iter().filter(|event| matches_event(event)).count() >= count {
                 return Ok(output);
@@ -1928,7 +1947,7 @@ mod tests {
         let mut events = Vec::new();
         let mut budget = DriveBudget::event_loop(&crate::network::NetworkLimits::default());
         let (_result, report) = with_drive(&mut budget, |drive| {
-            host_ports.drive_queued(&[], &mut events, drive, runtime);
+            host_ports.drive_queued(&mut events, drive, runtime);
         });
         if events.is_empty() {
             Ok(report.made_progress())

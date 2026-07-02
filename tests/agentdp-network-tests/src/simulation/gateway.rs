@@ -65,13 +65,13 @@ fn simulated_delayed_guest_arp_request_is_answered() -> Result<()> {
         .expect_packet_event(
             LinkDirection::NetworkToGuest,
             LinkTraceEventKind::Scheduled,
-            Duration::from_millis(6),
+            Duration::from_millis(5),
             2,
         )
         .expect_packet_event(
             LinkDirection::NetworkToGuest,
             LinkTraceEventKind::Delivered,
-            Duration::from_millis(6),
+            Duration::from_millis(5),
             2,
         )
         .arp_request()
@@ -248,6 +248,51 @@ fn simulated_reordered_duplicated_guest_frames_are_delivered_out_of_order() -> R
             Box::new(Quiescent),
         ],
     )
+}
+
+/// Verifies sustained guest input does not starve already-read gateway work.
+///
+/// # Errors
+///
+/// Returns an error when the event loop keeps draining guest frames without producing gateway replies.
+#[test]
+fn simulated_saturated_guest_reads_do_not_starve_gateway_replies() -> Result<()> {
+    let mut sim = Simulator::new(Seed::new(0x109));
+    let guest_link = sim.guest_link_with(GuestLinkConfig {
+        queue_capacity: 64,
+        ..GuestLinkConfig::default()
+    })?;
+    let mut network = allow_all_network_config();
+    network.limits.drive_event_budget = 4;
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network,
+            upstreams: SimulationUpstreams::default(),
+        },
+        guest_link.clone(),
+    )?;
+    let guest = RawFrameGuest::new(guest_link);
+
+    for _ in 0..32 {
+        guest.send_frame(arp_request())?;
+    }
+
+    let reply = guest.recv_frame(
+        &mut sim,
+        &mut running,
+        "first saturated guest-read ARP reply",
+        DriveBudget {
+            max_steps: 4,
+            step_time: Duration::ZERO,
+        },
+    )?;
+    verify_arp_reply(&reply)?;
+
+    let _stop = running
+        .stop()
+        .map_err(|error| super::Error::new(format!("stop simulated network: {error}")))?;
+    Ok(())
 }
 
 /// Verifies scheduler capacity rejects excess queued guest frames without corrupting the accepted frame.

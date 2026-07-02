@@ -84,7 +84,6 @@ pub(crate) enum UdpFrameWrite {
 pub(crate) enum GuestFrameIngest {
     Queued,
     Blocked(FrameBuf),
-    Dropped,
 }
 
 impl<C: NetworkClock> Gateway<C> {
@@ -211,10 +210,6 @@ impl<C: NetworkClock> Gateway<C> {
         &mut self.sockets
     }
 
-    pub(crate) fn ingress_tcp_guest_send_blocked(&self, tcp: &TcpConnections, output: &mut Vec<HostConnectionId>) {
-        tcp.guest_send_blocked_connections(&self.sockets, output);
-    }
-
     pub(crate) fn relay_ingress_tcp_guest_bytes(
         &mut self,
         tcp: &mut TcpConnections,
@@ -266,9 +261,7 @@ impl<C: NetworkClock> Gateway<C> {
                 drive.wait_for_local_buffer_capacity();
                 return GuestFrameIngest::Blocked(frame);
             }
-            if !tcp.listen(syn.src, syn.dst, &mut self.sockets) {
-                return GuestFrameIngest::Dropped;
-            }
+            let _listening = tcp.listen(syn.src, syn.dst, &mut self.sockets);
         }
 
         if !self.device.can_receive_frame() {
@@ -1128,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_drops_allowed_tcp_syn_when_listener_capacity_is_exhausted() {
+    fn gateway_refuses_allowed_tcp_syn_when_listener_capacity_is_exhausted() {
         let buffers = test_buffers();
         let mut config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
         config.limits = NetworkLimits {
@@ -1161,7 +1154,7 @@ mod tests {
         assert!(!tcp.has_connection(src, dst));
         assert!(egress_udp_sends.is_empty());
         assert!(ingress_udp_sends.is_empty());
-        assert!(guest_frames.is_empty());
+        assert_eq!(guest_frames.len(), 1);
     }
 
     #[test]
