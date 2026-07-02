@@ -58,7 +58,10 @@ mod tests {
 
     async fn run_host_command(message: HostMessage, context: HostCommandContext) -> GuestMessage {
         let (mut host, guest) = tokio::io::duplex(8192);
-        let guest_task = tokio::spawn(async move { wait_for_host_messages(guest, &context).await });
+        let guest_task = tokio::spawn(async move {
+            let mut guest = guest;
+            wait_for_host_messages(&mut guest, &context).await
+        });
         host.write_all(&encode_host_message_line(&message).unwrap())
             .await
             .unwrap();

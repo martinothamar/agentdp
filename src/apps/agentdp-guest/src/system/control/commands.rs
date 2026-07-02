@@ -11,8 +11,8 @@ use super::super::seed::SeedSpec;
 use super::channel::ControlChannelSink;
 
 pub(in crate::system) struct HostCommandContext {
-    pub(super) user: String,
-    pub(super) home: String,
+    pub(in crate::system) user: String,
+    pub(in crate::system) home: String,
 }
 
 impl HostCommandContext {
@@ -24,7 +24,7 @@ impl HostCommandContext {
     }
 }
 
-pub(in crate::system) async fn wait_for_host_messages<W>(control: W, context: &HostCommandContext) -> Result<()>
+pub(in crate::system) async fn wait_for_host_messages<W>(control: &mut W, context: &HostCommandContext) -> Result<()>
 where
     W: AsyncRead + AsyncWrite + Unpin,
 {

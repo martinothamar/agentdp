@@ -346,7 +346,7 @@ impl BootstrapObserver {
                 self.require_accepted_hello()?;
                 send_started_bootstrap_event(events, &started);
             }
-            GuestMessageKind::BootstrapOutput(_) => {
+            GuestMessageKind::BootstrapOutput(_) | GuestMessageKind::CommandResult(_) => {
                 self.require_accepted_hello()?;
             }
             GuestMessageKind::BootstrapStepFinished(finished) => {
@@ -365,12 +365,6 @@ impl BootstrapObserver {
                 self.require_accepted_hello()?;
                 send_failed_bootstrap_event(events, &failed);
                 return Err(bootstrap_failed(failed));
-            }
-            GuestMessageKind::CommandResult(result) => {
-                return Err(guest_control_handshake(format!(
-                    "guest sent command result {} during bootstrap",
-                    result.command
-                )));
             }
             GuestMessageKind::Error(error) => return Err(guest_error(error)),
         }
@@ -570,8 +564,9 @@ mod tests {
     use agentdp_ds::local::spsc;
     use agentdp_protocol::server_guest::{
         BootstrapFinished, BootstrapLifecycleStatus, BootstrapOutput, BootstrapOutputStream, BootstrapStatusReport,
-        BootstrapStepPhase, BootstrapStepStarted, BootstrapStepStatus, GUEST_CONTROL_PROTOCOL_VERSION, GuestHello,
-        GuestMessage, GuestMessageKind, GuestdRole, encode_guest_message_line,
+        BootstrapStepPhase, BootstrapStepStarted, BootstrapStepStatus, GUEST_CONTROL_PROTOCOL_VERSION,
+        GuestCommandResult, GuestHello, GuestMessage, GuestMessageKind, GuestdRole, WRITE_USER_FILE_COMMAND,
+        encode_guest_message_line,
     };
 
     use agentdp_core::agent::BootstrapEvent;
@@ -654,6 +649,24 @@ mod tests {
         .expect_err("bootstrap output before hello must fail");
 
         assert!(error.to_string().contains("before accepted hello"));
+    }
+
+    #[test]
+    fn observer_ignores_command_results_during_bootstrap() {
+        let mut observer = accepted_observer();
+        let status = handle(
+            &mut observer,
+            GuestMessage::new(
+                "write_user_file",
+                GuestMessageKind::CommandResult(GuestCommandResult {
+                    command: WRITE_USER_FILE_COMMAND.to_owned(),
+                    updated: true,
+                }),
+            ),
+        )
+        .expect("command result should not poison bootstrap readiness");
+
+        assert_eq!(status, BootstrapStreamStatus::Running);
     }
 
     #[test]

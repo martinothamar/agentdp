@@ -3,13 +3,18 @@ mod control;
 mod os;
 mod seed;
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::time::Duration;
 
 use crate::Result;
 
 use self::bootstrap::BootstrapExecutor;
 use self::control::{ControlChannelSink, HostCommandContext, open_control_channel, wait_for_host_messages};
 use self::seed::SeedSpec;
+
+const HOST_CONTROL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -36,25 +41,64 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     let plan_id = seed.instance.plan_id();
     let bootstrap_state_path = seed.bootstrap_state_path();
     let bootstrap_root_path = seed.bootstrap_root_path();
+    let control_path = seed.control_path();
     let host_command_context = HostCommandContext::from_seed(&seed);
     eprintln!("guestd system: running bootstrap");
     Box::pin(BootstrapExecutor::new(seed.plan, plan_id, bootstrap_state_path, bootstrap_root_path).run(&mut sink))
         .await?;
     eprintln!("guestd system: bootstrap finished");
-    wait_for_host_messages(sink.into_inner(), &host_command_context).await?;
-    Ok(())
+    serve_host_control_sessions(
+        sink.into_inner(),
+        host_command_context,
+        ControlPathOpener { path: control_path },
+    )
+    .await
+}
+
+async fn serve_host_control_sessions<W, O>(control: W, context: HostCommandContext, mut opener: O) -> Result<()>
+where
+    W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    O: HostControlOpener<W>,
+{
+    let mut session = control;
+    loop {
+        if let Err(error) = wait_for_host_messages(&mut session, &context).await {
+            eprintln!("guestd system: host control session failed: {error}");
+        }
+        drop(session);
+        eprintln!("guestd system: host control session closed; reopening control channel");
+        tokio::time::sleep(HOST_CONTROL_RECONNECT_DELAY).await;
+        session = opener.open().await?;
+    }
+}
+
+trait HostControlOpener<W> {
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = Result<W>> + Send + '_>>;
+}
+
+struct ControlPathOpener {
+    path: PathBuf,
+}
+
+impl HostControlOpener<tokio::fs::File> for ControlPathOpener {
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = Result<tokio::fs::File>> + Send + '_>> {
+        Box::pin(open_control_channel(&self.path))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use agentdp_protocol::server_guest::{
         BootstrapLifecycleStatus, BootstrapPlan, BootstrapStep, BootstrapStepPhase, GUEST_INSTANCE_SPEC_VERSION,
-        GuestInstancePaths, GuestInstanceSpec, GuestInstanceUser, GuestMessageKind, GuestPlatform,
-        decode_guest_message_line,
+        GuestInstancePaths, GuestInstanceSpec, GuestInstanceUser, GuestMessageKind, GuestPlatform, HostCommand,
+        HostMessage, HostMessageKind, WRITE_USER_FILE_COMMAND, WriteUserFileCommand, decode_guest_message_line,
+        encode_host_message_line,
     };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
         Config,
+        control::HostCommandContext,
         seed::{SeedSpec, validate_bootstrap_plan},
     };
 
@@ -96,7 +140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_run_writes_hello_and_bootstrap_lines_to_control_channel() {
+    async fn system_run_keeps_serving_after_bootstrap_control_eof() {
         let paths = SeedFiles::write(BootstrapPlan {
             steps: Vec::new(),
             ..plan("phases/040-packages.sh")
@@ -106,11 +150,16 @@ mod tests {
             .await
             .expect("create control file");
 
-        super::run(Config {
-            instance_spec: paths.instance_spec.clone(),
-        })
-        .await
-        .expect("run system daemon");
+        let instance_spec = paths.instance_spec.clone();
+        let task = tokio::spawn(async move { super::run(Config { instance_spec }).await });
+
+        wait_for_control_lines(&paths.control, 4).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "guestd system exited after bootstrap control EOF instead of staying alive for host commands"
+        );
+        task.abort();
 
         let messages = decode_lines(&tokio::fs::read(&paths.control).await.expect("read control lines"));
         assert_eq!(messages.len(), 4);
@@ -126,6 +175,111 @@ mod tests {
                 if status.status == BootstrapLifecycleStatus::Passed
         ));
         assert!(matches!(&messages[3].kind, GuestMessageKind::BootstrapFinished(_)));
+    }
+
+    #[tokio::test]
+    async fn host_control_reopen_serves_command_without_bootstrap_replay() {
+        let temp = TestTempDir::create("guestd-control-reopen");
+        let (mut first_host, first_guest) = tokio::io::duplex(8192);
+        let (mut second_host, second_guest) = tokio::io::duplex(8192);
+        let context = HostCommandContext {
+            user: current_user(),
+            home: temp.path.display().to_string(),
+        };
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        let mut opener = TestControlOpener {
+            next: Some(second_guest),
+            opened: Some(signal_tx),
+        };
+        let task =
+            tokio::spawn(async move { super::serve_host_control_sessions(first_guest, context, &mut opener).await });
+
+        first_host.shutdown().await.expect("close first host session");
+        signal_rx.await.expect("control session reopened");
+
+        let response = write_user_file_over_host(&mut second_host).await;
+        task.abort();
+
+        assert_user_file_written_response(&response);
+        assert_eq!(
+            tokio::fs::read(temp.path.join(".codex/auth.json")).await.unwrap(),
+            b"{\"tokens\":\"placeholder\"}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_control_session_error_reopens_without_bootstrap_replay() {
+        let temp = TestTempDir::create("guestd-control-reopen-after-error");
+        let (mut first_host, first_guest) = tokio::io::duplex(8192);
+        let (mut second_host, second_guest) = tokio::io::duplex(8192);
+        let context = HostCommandContext {
+            user: current_user(),
+            home: temp.path.display().to_string(),
+        };
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        let mut opener = TestControlOpener {
+            next: Some(second_guest),
+            opened: Some(signal_tx),
+        };
+        let task =
+            tokio::spawn(async move { super::serve_host_control_sessions(first_guest, context, &mut opener).await });
+
+        first_host
+            .write_all(b"{not valid host json}\n")
+            .await
+            .expect("write invalid host frame");
+        first_host.shutdown().await.expect("close first host session");
+        signal_rx.await.expect("control session reopened after invalid frame");
+
+        let response = write_user_file_over_host(&mut second_host).await;
+        task.abort();
+
+        assert_user_file_written_response(&response);
+        assert_eq!(
+            tokio::fs::read(temp.path.join(".codex/auth.json")).await.unwrap(),
+            b"{\"tokens\":\"placeholder\"}\n"
+        );
+    }
+
+    async fn write_user_file_over_host(host: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        host.write_all(
+            &encode_host_message_line(&write_command(
+                "cmd_1",
+                ".codex/auth.json",
+                b"{\"tokens\":\"placeholder\"}\n",
+                "0600",
+            ))
+            .expect("encode command"),
+        )
+        .await
+        .expect("write command");
+        host.shutdown().await.expect("close host write side");
+
+        let mut response = Vec::new();
+        host.read_to_end(&mut response).await.expect("read command response");
+        response
+    }
+
+    fn assert_user_file_written_response(response: &[u8]) {
+        let messages = decode_lines(response);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].kind,
+            GuestMessageKind::CommandResult(result)
+                if result.command == WRITE_USER_FILE_COMMAND && result.updated
+        ));
+    }
+
+    async fn wait_for_control_lines(path: &std::path::Path, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let contents = tokio::fs::read(path).await.expect("read control file");
+            if decode_lines(&contents).len() >= count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {count} control messages");
     }
 
     fn plan(script: &str) -> BootstrapPlan {
@@ -144,6 +298,73 @@ mod tests {
                 working_directory: "/".to_owned(),
                 timeout_seconds: 900,
             }],
+        }
+    }
+
+    fn write_command(id: &str, path: &str, contents: &[u8], permissions: &str) -> HostMessage {
+        HostMessage::new(
+            id,
+            HostMessageKind::Command(HostCommand {
+                command: WRITE_USER_FILE_COMMAND.to_owned(),
+                payload: serde_json::to_value(WriteUserFileCommand {
+                    path: path.to_owned(),
+                    contents: contents.to_vec(),
+                    permissions: permissions.to_owned(),
+                })
+                .unwrap(),
+            }),
+        )
+    }
+
+    fn current_user() -> String {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "agent".to_owned())
+    }
+
+    struct TestControlOpener {
+        next: Option<tokio::io::DuplexStream>,
+        opened: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl super::HostControlOpener<tokio::io::DuplexStream> for &mut TestControlOpener {
+        fn open(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<tokio::io::DuplexStream>> + Send + '_>>
+        {
+            Box::pin(async move {
+                if let Some(opened) = self.opened.take() {
+                    let _ = opened.send(());
+                }
+                self.next
+                    .take()
+                    .ok_or_else(|| crate::Error::Message("no test control session available".to_owned()))
+            })
+        }
+    }
+
+    struct TestTempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TestTempDir {
+        fn create(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "agentdp-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
