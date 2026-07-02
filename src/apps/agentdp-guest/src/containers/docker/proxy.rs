@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use agentdp_platform::ca::{CA_ENV_VARS_KEY, ca_env_vars_csv, ca_env_vars_from_env};
 use serde_json::{Map, Value};
 use tar::{Archive, Builder, Header};
-use tokio::io::{AsyncRead, AsyncReadExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::{Error, Result};
 
@@ -69,7 +69,7 @@ async fn read_request_head(client: &mut (impl AsyncRead + Unpin), pending: &mut 
 }
 
 async fn prepare_request(
-    client: &mut (impl AsyncRead + Unpin),
+    client: &mut impl DockerClient,
     request: RawRequest,
     ca: &CaConfig,
 ) -> Result<PreparedRequest> {
@@ -86,10 +86,11 @@ async fn prepare_request(
                 close_client: true,
             });
         }
+        acknowledge_expect_continue(client, &request, length != 0).await?;
         let (body, trailing) = read_fixed_body(client, &request, length).await?;
         if request.is_hijack() {
             return Ok(PreparedRequest::Forward {
-                bytes: request.with_original_body(&body),
+                bytes: request.with_original_body_without_expect(&body),
                 trailing,
                 tunnel: true,
             });
@@ -111,9 +112,13 @@ async fn prepare_request(
                     close_client: true,
                 });
             }
+            acknowledge_expect_continue(client, &request, length != 0).await?;
             read_fixed_body(client, &request, length).await?
         }
-        None if request.is_chunked() => read_chunked_body(client, &request).await?,
+        None if request.is_chunked() => {
+            acknowledge_expect_continue(client, &request, true).await?;
+            read_chunked_body(client, &request).await?
+        }
         None => {
             return Ok(PreparedRequest::Response {
                 bytes: response(
@@ -163,6 +168,34 @@ async fn prepare_request(
         trailing,
         tunnel: false,
     })
+}
+
+async fn acknowledge_expect_continue(
+    client: &mut impl DockerClient,
+    request: &RawRequest,
+    has_body: bool,
+) -> Result<()> {
+    if has_body && request.expects_continue() {
+        client.write_all_client(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+    }
+    Ok(())
+}
+
+trait DockerClient: AsyncRead + Unpin {
+    async fn write_all_client(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+impl DockerClient for agentdp_platform::socket::AsyncLocalSocket {
+    async fn write_all_client(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes).await
+    }
+}
+
+#[cfg(unix)]
+impl DockerClient for tokio::net::UnixStream {
+    async fn write_all_client(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes).await
+    }
 }
 
 async fn copy_response(
@@ -530,9 +563,20 @@ impl RawRequest {
         bytes
     }
 
-    fn with_original_body(&self, body: &[u8]) -> Vec<u8> {
+    fn with_original_body_without_expect(&self, body: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.head.len() + body.len());
-        bytes.extend_from_slice(&self.head);
+        bytes.extend_from_slice(self.request_line.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        for header in &self.headers {
+            if header.name.eq_ignore_ascii_case("expect") {
+                continue;
+            }
+            bytes.extend_from_slice(header.name.as_bytes());
+            bytes.extend_from_slice(b": ");
+            bytes.extend_from_slice(header.value.as_bytes());
+            bytes.extend_from_slice(b"\r\n");
+        }
+        bytes.extend_from_slice(b"\r\n");
         bytes.extend_from_slice(body);
         bytes
     }
@@ -546,6 +590,7 @@ impl RawRequest {
                 || header.name.eq_ignore_ascii_case("transfer-encoding")
                 || header.name.eq_ignore_ascii_case("trailer")
                 || header.name.eq_ignore_ascii_case("connection")
+                || header.name.eq_ignore_ascii_case("expect")
             {
                 continue;
             }
@@ -587,6 +632,18 @@ impl RawRequest {
                 .headers
                 .iter()
                 .any(|header| header.name.eq_ignore_ascii_case("upgrade"))
+    }
+
+    fn expects_continue(&self) -> bool {
+        self.headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("expect"))
+            .any(|header| {
+                header
+                    .value
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case("100-continue"))
+            })
     }
 }
 
@@ -1024,7 +1081,7 @@ mod tests {
         let body = br#"{"Detach":false,"Tty":true}"#;
         let request = request_with_headers_and_body(
             "POST /v1.44/exec/id/start HTTP/1.1",
-            "Connection: Upgrade\r\nUpgrade: tcp\r\n",
+            "Connection: Upgrade\r\nUpgrade: tcp\r\nExpect: 100-continue \r\n",
             body,
         );
         let (mut client, _server) = UnixStream::pair().expect("stream pair");
@@ -1039,6 +1096,7 @@ mod tests {
                 let text = String::from_utf8(bytes).expect("utf8");
                 assert!(text.contains("Connection: Upgrade"));
                 assert!(text.contains("Upgrade: tcp"));
+                assert!(!text.contains("Expect:"));
             }
             PreparedRequest::Response { .. } => panic!("expected forwarded request"),
         }
@@ -1171,6 +1229,100 @@ mod tests {
             "{}",
             std::str::from_utf8(&response).expect("response utf8")
         );
+        upstream_task.await.expect("upstream task");
+        proxy.abort();
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_answers_expect_continue_before_reading_mutation_body() {
+        let root = test_socket_root("proxy-expect-continue");
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        let listen = root.join("docker.sock");
+        let upstream = root.join("upstream.sock");
+        let ca = root.join("ca.pem");
+        tokio::fs::write(&ca, "CA PEM").await.expect("write ca");
+        let upstream_listener = agentdp_platform::socket::bind_local_socket(&upstream)
+            .await
+            .expect("bind upstream");
+        let proxy = tokio::spawn(os::run(Config {
+            listen: listen.clone(),
+            upstream: upstream.clone(),
+            ca,
+        }));
+        wait_for_socket(&listen).await;
+
+        let upstream_task = tokio::spawn(async move {
+            let mut stream = upstream_listener.accept().await.expect("accept upstream");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 128];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read request");
+                assert_ne!(read, 0, "proxy closed upstream before complete request");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = find_header_end(&request) {
+                    let head = std::str::from_utf8(&request[..header_end])
+                        .expect("request utf8")
+                        .to_owned();
+                    let length = response_content_length(head.as_bytes())
+                        .expect("content length")
+                        .expect("content length");
+                    while request.len() < header_end + length {
+                        let read = stream.read(&mut chunk).await.expect("read request body");
+                        assert_ne!(read, 0, "proxy closed upstream mid-body");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    assert!(!head.contains("Expect:"));
+                    let body = std::str::from_utf8(&request[header_end..]).expect("body utf8");
+                    assert!(body.contains("NODE_EXTRA_CA_CERTS=/run/agentdp/ca/ca-bundle.pem"));
+                    assert!(body.contains("ca.pem:/run/agentdp/ca/ca-bundle.pem:ro"));
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .expect("write response");
+        });
+
+        let mut client = agentdp_platform::socket::connect_local_socket(&listen)
+            .await
+            .expect("connect client");
+        let body = br#"{"Image":"node","Env":[],"HostConfig":{"Binds":[]}}"#;
+        client
+            .write_all(
+                format!(
+                    "POST /v1.44/containers/create HTTP/1.1\r\nHost: docker\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write headers");
+
+        let mut interim = [0_u8; 25];
+        timeout(Duration::from_millis(200), client.read_exact(&mut interim))
+            .await
+            .expect("proxy did not send 100 Continue before waiting for the body")
+            .expect("read interim response");
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+
+        client.write_all(body).await.expect("write body");
+        client.shutdown_write().await.expect("shutdown request");
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("proxy did not return final response")
+            .expect("read final response");
+        assert!(
+            std::str::from_utf8(&response)
+                .expect("response utf8")
+                .starts_with("HTTP/1.1 201 Created"),
+            "{}",
+            std::str::from_utf8(&response).expect("response utf8")
+        );
+
         upstream_task.await.expect("upstream task");
         proxy.abort();
         let _ = tokio::fs::remove_dir_all(root).await;
