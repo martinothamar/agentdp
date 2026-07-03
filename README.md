@@ -3,91 +3,18 @@
 > [!NOTE]
 > This is an experiment in building an agent platform. LLMs have been used in generating code, as such this is part slop.
 > Lots of things have changed and been refactored since the "idea"-stage so things may seem at least in part incosistent.
-> What I consider "good" in terms of design/architecture:
-> - server agent runtime (runtime.rs and related code)
-> - parts of core crate (manifests, desired state, plugin model etc.. The "pure" parts)
-> - network crate (user-space network for MITM, policy, secret injection including the deterministic simulation testing harness)
 >
 > I have currently tested the latest state only on Linux. Been a while since I tested Windows and haven't tested macOS at all.
 
 Agent developer platform for long-running, project-based software engineering agents.
-Agents should be given full VMs (their PCs), full permissions, same tooling and knowledge/context as your human software engineers.
-Example:
-- QEMU for virtualization of full Arch Linux guest VM
-- Codex CLI or other harnesses inside main tmux session as agent loop/harness
-- Guest-side tooling for injecting external prompts/events into agent loop (e.g. GitHub PR CI failures, review comments)
-- code-server (VSCode) as web-based "desktop environment"
-  - Simple integrated browser
-  - Terminal with agent access (`tmux a`)
-  - Possible to use as personal remote devbox or fully autonomous agent depending on configuration
 
-This platform should provide ultimate flexibility, both for agent-builders and agents themselves.
-
-One note on implementation; lots of sandbox/agent tech is optimizing for boottime and scheduling, presumably because they view agents as short-lived or ephemeral.
-That is not something I believe in currently, I've viewed the agent as durable and long-lived, working on tasks continuously and evolving its context, skills and toolset over time.
-In that world, scheduling, boottimes, suspend/resume, fork and related concerns are not hard problems.
-Some might say that with stateful, long-lived agents we now get pets as opposed to cattle, but I'd say that the agent would be the pet-owner in that case...
+Using `agentctl` to manage agents:
 
 ![agentctl](img/agentctl.gif)
 
+Me driving 2 [altinn-studio agent instances](examples/altinn-studio/agent.yaml) (code-server as UI and Codex CLI as harness in tmux session, inside the VM/sandbox):
+
 https://github.com/user-attachments/assets/4f0f7a27-5d3f-4a09-88cf-691574362c19
-
-
-## Background
-
-Lets say we believe AI is here to stay, and that AI agents are going to be part of the workforce of many/most organizations in the future.
-In my case, I work in a team alongside software engineers and designers building a software product. So in that context agents could help with essentially 2 things:
-- Speeding up development by letting agents complete tasks
-- Improving quality by making use of the agents "intelligence"/knowledge
-
-To do that and to do it efficiently the agents would have to operate more autonomously and with the same context and tools that
-the human software engineers and designers have. So for this to work we obviously have to scale beyound individiual team members computers with manual approvals..
-One could consider local sandbox as a stepping stone, but the one should be able to ship the sandbox to the cloud eventually if so.
-Essentially we need agents to have their own computers with the same access to context/knowledge and tools (compiler, container runtime, browser, ...).
-
-At this point one might consider this a build-or-buy decision.
-Putting the software architect hat on, there are important decision drivers/questions:
-- Is this core to the business? How important is it that we own this technology?
-- How hard is it to build ourself? 
-
-My chief complaint with all these cloud agent and sandbox companies relate to these two points. I think that, if the following is true:
-- AI will lead to commoditization of software
-- Agents will be a core part of the modern "AI native" organization
-
-Then buying makes a lot less sense because the software is both a lot easier to build oneself and agents might be
-important value-drivers in organizations, in that they represent increasingly large parts of production.
-So if AI agents amplify the human output, it makes a lot of sense to own it, control it and make sure it gets integrated
-in such a way that there is maximum flexibility and utility both in the short term and long term.
-
-To try to answer the second question I started working on this repo.
-I think a lot of sandbox and cloud agent companies are composing building blocks out of already open source software.
-There may be gaps, but then I believe and hope that the open source ecosystem can fill it.
-So the initial question for this repo was:
-
-> How little code is needed to get my personal little cloud agent going?
-
-Started with this thinking of what the building blocks of an agent were:
-- Compute orchestration (Kubernetes, Nomad, ...)
-- VM/VMM/sandboxing tech (QEMU, cloud-hypervisor, libkrun, firecracker, containers,  ...)
-- Harness (Claude Code, Codex CLI or their SDK/app-server counterparts with essentially `--yolo` mode)
-- Custom networking with policy engine and secret injection (?)
-
-
-So the code in this repo tries to compose some custom implementation and some existing OS software to be able to run what looks like "cloud agents", specifically "virtual softwar engineers" to run on both:
-- My local dev machine (32 cores, 128GB RAM)
-- Kubernetes in the cloud (just need the controller on top)
-
-A very basic version of what is now in this repo took 2 full days to build. That was essentially a manifest-driven
-way to describe and agent, the PC and its tools. Consted of a QEMU VM with Code Server for editor/IDE and Codex CLI in a tmux session,
-with a little JS glue to poll github PR events into the tmux Codex CLI session through `send-keys`.
-
-What followed were 2-3 weeks of afternoon work to try to get this looking more like an actual "agent developer platform",
-which you are now free to explore here in this repository.
-
-
-## TODO
-
-- [ ] k8s controller, kind-cluster
 
 
 ## Features
@@ -107,8 +34,12 @@ Current:
 - OS-agnostic runtime, provisioning and guest-side modules to allow for future crossplatform support host- and guest-side for Windows, macOS and Linux
   - Windows and Linux tested host-side, only Linux guest-side
 
-Planned:
+Ideas:
 
+- Extensibility around network MITM
+  - Essentially some form of middleware perhaps in various parts of the ingress/egress stack, e.g. for auditability or blocking
+  - Auditability: seeing which hosts or endpoints the agent communicates with, or doing some prompt/context analysis (is Anthropic trying to exfiltrate data through Claude Code?)
+  - Blocking: detecting sensitive data in context/prompt, though never going to be bulletproof
 - Support for multiple OSes both guest- and host-side; Windows, Linux distros, macOS (?)
 - Support for multiple types of virtualization/runtime backends; QEMU, cloud-hypervisor, containers, lima, ...
 - Richer reverse proxying for serving instance tools through stable per-agent/per-instance tailnet subdomains with host-header routing
@@ -145,6 +76,13 @@ Planned:
   - agentdp-network-tests   Harness for deterministic simulation testing for the user-space networking stack (agentdp-network)
   - agentdp-test-support    Shared modules/fixtures for testing
 ```
+
+### Building blocks
+
+* Client (cli, frontend)
+* Server (controller/manager of agents)
+* Sandbox (e.g. QEMU VM)
+* Harness (e.g. Codex CLI + tmux + tooling in guestd/guestctl)
 
 ### General
 
@@ -212,3 +150,27 @@ There are also benchmarks measuring ~2-4 gbps no my machine, which is pretty ter
 #### IPC
 
 Mostly chosen JSONL over Unix Domain Sockets, as it is supported on all Windows 11 versions even (unified API in platform-crate).
+
+
+## Background
+
+This project started in part due to curiosity and as a learning experiment, and partly due to some frustration
+with startups, "frontier labs" and "big tech" trying to capture/own both the creation of intelligence (models)
+and the agents making use of them.
+
+It seemed weird to me that in a world where agents are "virtual employees", that someone else should be
+managing and running them, especially in medium/large companies where there is existing infrastructure, access control etc..
+Wouldn't that be effectively like outsourcing your core value production?
+When faced with build-or-buy decisions, one of the most important decision drivers are the consideration of whether
+the thing to build/buy is "core to the organization". To me, if agents are "virtual employees", 
+then they certainly are a core part of the organization and so I would be biased towards "build" for sure.
+
+So this was an effort to learn more about the underpinnings and (potential) building blocks of agents,
+and an attempt to show that companies and organizations can and should own their own agents.
+
+A very basic version of what is now in this repo took 2 full days to build. That was essentially a manifest-driven
+way to describe an agent, the PC/VM and its tools. Consisted of a QEMU VM with Code Server for editor/IDE and Codex CLI in a tmux session,
+with a little JS glue to poll github PR events into the tmux Codex CLI session through `send-keys`.
+
+What followed were 2-3 weeks of afternoon work to try to get this looking more like an actual "agent developer platform",
+which you are now free to explore here in this repository.
