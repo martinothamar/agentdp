@@ -52,6 +52,30 @@ Ideas:
   - Could GH PR component in guestd become a plugin?
 
 
+## Altinn Studio example
+
+The [altinn-studio agent example](examples/altinn-studio/agent.yaml) has been the main driver/user of the code in this repo.
+I personally use it installed on a cachyOS desktop PC with 6 replicas running. Reflections:
+* Its a very technically capable agent, can take full advantage of "computer use" advances in models
+  * Debugging and taking process dumps to [root-cause and fix hangs/deadlocks](https://github.com/Altinn/app-lib-dotnet/pull/1798)
+  * Use advanced tools like [`strace` to debug and prove various facts important to decision-making](https://github.com/Altinn/app-lib-dotnet/pull/1811#issuecomment-4716265043)
+  * Use browsers to do [complex e2e-testing](https://github.com/Altinn/altinn-studio/pull/19078#issuecomment-4632994414) and [provide screenshots to visualize changes](https://github.com/Altinn/altinn-studio-docs/pull/2939)
+  * In one instance the agent independently installed Podman itself so it could verify some behavior between Docker and Podman on Linux
+  * [Analyze deeply diffs/changes when updating dependencies](https://github.com/Altinn/altinn-studio/pull/19283#issuecomment-4753967011)
+  * Takeaway: running agents in proper VM sandboxes is has major benefits; it can both run --yolo and make use of tools and APIs not accessible in lesser sandboxes like container or microVMs
+* There are benefits to driving agents through public interfaces like GH issues/PRs; the prompting becomes visible to team-members and anyone involved, which means that the understanding of why some end result was reached is made clear, and team-members can cooperate in prompting to improve designs and decision-making. While we do also use ADRs for tracking important decisions, this is also very useful for the portion of works that is not architectural but still carries important historical and domain/project context. I suspect software-archeology will be more pleasant in these cases where agents are used (though it can be verbose and have a lot of back-and-forth)
+* I'm still the bottleneck, rarely able to keep more than 3 agents running contiuously at the same time (though its nice to have more instances available for the occasional side-quest)
+* Giving the agents broader context including full set of relevant repos where session cwd = entire code directory and describing the "state of the world" in terms of what the team is focusing on and rough architectural descriptions goes a long way. For instance, we have been doing a poly-repo -> monorepo migration and so providing this information in AGENTS.md has led to me having to explain things a lot less. Its also more self-driven in explorying the various contracts and coupling between modules and services across repositories which is very useful
+* Using open source infra and having IaC like e.g. GitOps is a major benefit. Both agents and human engineers do a lot better when there is awareness of the infastructure that binds and underpins the software they write
+
+Configuration
+* Codex as harness
+* Mediated/MITM auth and networking, no access to secrets for gh, codex, studioctl
+* code-server as UI
+* tailscale serve for remote access (coding on the laptop/phone while away for instance)
+* lots of tools: browser, playwright, languages/compilers/toolchains, docker (normal install including daemon and systemd), kind (Kubernetes In Docker)
+
+
 ## Architecture
 
 ```
