@@ -262,7 +262,7 @@ async fn pr_view(target: &str) -> Result<Value> {
             "view",
             target,
             "--json",
-            "number,url,headRefName,baseRefName,title,state,updatedAt,reviewDecision,statusCheckRollup,reviews,comments",
+            "number,url,headRefName,baseRefName,title,state,updatedAt,mergedAt,mergedBy,reviewDecision,statusCheckRollup,reviews,comments",
         ],
         None,
     )
@@ -294,10 +294,31 @@ fn value_string(value: &Value, field: &str) -> String {
 
 fn pr_events(view: &Value, self_login: &str) -> Vec<PrEvent> {
     let mut events = Vec::new();
+    events.extend(merged_event(view));
     events.extend(failed_check_events(view));
     events.extend(review_events(view, self_login));
     events.extend(comment_events(view, self_login));
     events
+}
+
+fn merged_event(view: &Value) -> Option<PrEvent> {
+    let merged_at = json_string(view, "mergedAt");
+    if value_string(view, "state") != "MERGED" && merged_at.is_none() {
+        return None;
+    }
+    let merged_at = merged_at
+        .or_else(|| json_string(view, "updatedAt"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let merged_by = view
+        .get("mergedBy")
+        .and_then(|author| author.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let identity = format!("merged:{}:{merged_at}:{merged_by}", value_string(view, "url"));
+    Some(PrEvent {
+        id: stable_hash_hex(&identity),
+        line: format!("{} event=merged at={merged_at} by={merged_by}", pr_prefix(view)),
+    })
 }
 
 fn failed_check_events(view: &Value) -> Vec<PrEvent> {
@@ -523,7 +544,9 @@ fn now_marker() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_text, stable_hash_hex};
+    use serde_json::json;
+
+    use super::{compact_text, pr_events, stable_hash_hex};
 
     #[test]
     fn compact_text_removes_html_and_limits_length() {
@@ -547,5 +570,25 @@ mod tests {
     fn stable_hash_is_deterministic() {
         assert_eq!(stable_hash_hex("same"), stable_hash_hex("same"));
         assert_ne!(stable_hash_hex("same"), stable_hash_hex("different"));
+    }
+
+    #[test]
+    fn pr_events_reports_merged_pull_request() {
+        let view = json!({
+            "number": 1016,
+            "url": "https://github.com/Altinn/altinn-storage/pull/1016",
+            "state": "MERGED",
+            "mergedAt": "2026-06-19T07:13:58Z",
+            "mergedBy": {
+                "login": "martinothamar"
+            }
+        });
+
+        let events = pr_events(&view, "martinothamar-agent");
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].line.contains("event=merged"));
+        assert!(events[0].line.contains("by=martinothamar"));
+        assert!(!events[0].line.contains("unregister"));
     }
 }
