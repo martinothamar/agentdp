@@ -145,15 +145,13 @@ impl TailscaleService {
         let desired = TailscaleServeState {
             routes: resolved_routes(plugin, manifest, document, &root_host)?,
         };
-        if document.status.tailscale_serve.as_ref() == Some(&desired) {
-            return Ok(Some(desired));
-        }
+        let plan = instance_route_reconcile_plan(document.status.tailscale_serve.as_ref(), &desired);
         let _guard = self.serve_mutations.lock().await;
-        if let Some(observed) = &document.status.tailscale_serve {
+        if let Some(observed) = plan.remove {
             remove_observed_routes(context, observed).await?;
         }
         let proxy_target = format!("http://127.0.0.1:{}", config.web.port);
-        for route in &desired.routes {
+        for route in plan.apply {
             match route.mode.as_str() {
                 "direct" => {
                     let https_arg = format!("--https={}", route.https_port.unwrap_or(443));
@@ -432,6 +430,21 @@ struct Detection {
     dns_name: Option<String>,
 }
 
+struct InstanceRouteReconcilePlan<'a> {
+    remove: Option<&'a TailscaleServeState>,
+    apply: &'a [TailscaleServeRouteState],
+}
+
+fn instance_route_reconcile_plan<'a>(
+    observed: Option<&'a TailscaleServeState>,
+    desired: &'a TailscaleServeState,
+) -> InstanceRouteReconcilePlan<'a> {
+    InstanceRouteReconcilePlan {
+        remove: observed.filter(|state| *state != desired),
+        apply: &desired.routes,
+    }
+}
+
 fn parse_status(stdout: &[u8]) -> Detection {
     let Ok(value) = serde_json::from_slice::<Value>(stdout) else {
         return Detection {
@@ -462,12 +475,13 @@ mod tests {
 
     use agentdp_core::agent::{
         NetworkAllowState, NetworkIpv6State, NetworkModeState, NetworkState, PortMappingState, PortProtocolState,
+        TailscaleServeRouteState, TailscaleServeState,
     };
     use agentdp_core::manifest::plugins::tailscale_serve::{Route, RouteMode, TailscaleServe};
 
     use super::{
-        dns_fragment, is_missing_serve_handler, is_serve_config_conflict, parse_status, render_host,
-        resolved_routes_for_network, validate_host,
+        dns_fragment, instance_route_reconcile_plan, is_missing_serve_handler, is_serve_config_conflict, parse_status,
+        render_host, resolved_routes_for_network, validate_host,
     };
 
     #[test]
@@ -512,6 +526,29 @@ mod tests {
         assert!(!is_serve_config_conflict(
             "failed to remove web serve: handler does not exist"
         ));
+    }
+
+    #[test]
+    fn persisted_matching_tailscale_serve_status_still_applies_desired_routes() {
+        let route = TailscaleServeRouteState {
+            service: "code_server".to_owned(),
+            mode: "direct".to_owned(),
+            host: "dev.tail.ts.net".to_owned(),
+            https_port: Some(4090),
+            path: "/".to_owned(),
+            url: "https://dev.tail.ts.net:4090".to_owned(),
+            target: "http://127.0.0.1:4090".to_owned(),
+            status: "applied".to_owned(),
+        };
+        let observed = TailscaleServeState {
+            routes: vec![route.clone()],
+        };
+        let desired = TailscaleServeState { routes: vec![route] };
+
+        let plan = instance_route_reconcile_plan(Some(&observed), &desired);
+
+        assert!(plan.remove.is_none());
+        assert_eq!(plan.apply, desired.routes);
     }
 
     #[test]
