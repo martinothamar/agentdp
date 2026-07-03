@@ -65,6 +65,7 @@ async fn ensure_session(code_dir: &Path, pane_file: &Path, command: &str) -> Res
         if command == CODEX_SESSION_COMMAND {
             dismiss_known_codex_update_prompt().await?;
         }
+        let login_command = login_shell_command(command);
         run_capture(
             "tmux",
             &[
@@ -76,7 +77,7 @@ async fn ensure_session(code_dir: &Path, pane_file: &Path, command: &str) -> Res
                 code_dir
                     .to_str()
                     .ok_or_else(|| Error::Message("AGENTDP_CODE_DIR is not valid UTF-8".to_owned()))?,
-                command,
+                &login_command,
             ],
             None,
         )
@@ -94,6 +95,14 @@ async fn ensure_session(code_dir: &Path, pane_file: &Path, command: &str) -> Res
 
 pub(crate) const CLAUDE_SESSION_COMMAND: &str = "claude --continue || claude";
 pub(crate) const CODEX_SESSION_COMMAND: &str = r#"if find "$HOME/.codex/sessions" -type f -name '*.jsonl' -print -quit 2>/dev/null | grep -q .; then exec codex resume --last; else exec codex; fi"#;
+
+fn login_shell_command(command: &str) -> String {
+    format!("exec bash --login -c {}", shell_single_quote(command))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
 
 async fn dismiss_known_codex_update_prompt() -> Result<()> {
     let path = codex_version_file()?;
@@ -194,14 +203,43 @@ async fn inject_prompt(state_dir: &Path, pane: &str, events: &[PrEvent]) -> Resu
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use std::process::Command;
 
-    use super::{CODEX_SESSION_COMMAND, dismiss_known_codex_update_prompt_in};
+    use super::{CLAUDE_SESSION_COMMAND, CODEX_SESSION_COMMAND, dismiss_known_codex_update_prompt_in};
 
     #[test]
     fn codex_session_command_only_starts_fresh_without_saved_sessions() {
         assert!(CODEX_SESSION_COMMAND.contains("codex resume --last"));
         assert!(CODEX_SESSION_COMMAND.contains("else exec codex"));
         assert!(!CODEX_SESSION_COMMAND.contains("|| codex"));
+    }
+
+    #[test]
+    fn managed_sessions_start_through_login_shell() {
+        let command = super::login_shell_command(CODEX_SESSION_COMMAND);
+
+        assert!(command.starts_with("exec bash --login -c "));
+        assert!(command.contains("codex resume --last"));
+        assert!(command.contains("'\"'\"'*.jsonl'\"'\"'"));
+    }
+
+    #[test]
+    fn login_shell_command_quotes_agent_commands() {
+        for command in [CODEX_SESSION_COMMAND, CLAUDE_SESSION_COMMAND] {
+            let quoted = super::shell_single_quote(command);
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {quoted}"))
+                .output()
+                .expect("run shell");
+
+            assert!(
+                output.status.success(),
+                "shell failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).expect("stdout is utf8"), command);
+        }
     }
 
     #[test]

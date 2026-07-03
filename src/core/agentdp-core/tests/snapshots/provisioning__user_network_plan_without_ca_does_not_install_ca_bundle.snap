@@ -66,7 +66,10 @@ base:
         agentdp_prepend_path "/data/home/.cargo/bin"
         agentdp_prepend_path "/data/home/go/bin"
         agentdp_prepend_path "/data/home/.local/bin"
+        export MISE_GO_SET_GOBIN=false
+        export MISE_GO_SET_GOROOT=false
         agentdp_prepend_path '/data/home/.local/share/mise/shims'
+        unset GOBIN GOROOT GOTOOLCHAIN
 
         if [ -d '/data/home/.local/share/mise/installs/dotnet' ]; then
           agentdp_dotnet_root="$(find '/data/home/.local/share/mise/installs/dotnet' -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
@@ -356,7 +359,25 @@ base:
 
       if command -v mise >/dev/null 2>&1; then
         mise use --global 'node@lts'
-        mise reshim
+        mise reshim --force
+        if [ "${GOENV:-}" != "off" ]; then
+          agentdp_goenv="${GOENV:-}"
+          if [ -z "$agentdp_goenv" ]; then
+            agentdp_goenv="${XDG_CONFIG_HOME:-$HOME/.config}/go/env"
+          fi
+          if [ -f "$agentdp_goenv" ]; then
+            agentdp_goenv_tmp="$agentdp_goenv.agentdp.$$.tmp"
+            grep -Ev '^(GOBIN|GOROOT|GOTOOLCHAIN)=' "$agentdp_goenv" >"$agentdp_goenv_tmp" || true
+            install -m 0600 "$agentdp_goenv_tmp" "$agentdp_goenv"
+            rm -f "$agentdp_goenv_tmp"
+          fi
+          unset agentdp_goenv agentdp_goenv_tmp
+        fi
+        if command -v go >/dev/null 2>&1; then
+          go env -u GOBIN || true
+          go env -u GOROOT || true
+          go env -u GOTOOLCHAIN || true
+        fi
       fi
 instance:
   packages: []
