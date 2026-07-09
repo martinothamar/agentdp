@@ -1,28 +1,16 @@
-model = "gpt-5.5"
-model_reasoning_effort = "high"
-tool_output_token_limit = 25000
-# Leave room for native compaction near the 272-273k context window.
-# Formula: 273000 - (tool_output_token_limit + 15000)
-# With tool_output_token_limit=25000 => 273000 - (25000 + 15000) = 233000
-model_auto_compact_token_limit = 233000
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
 web_search = "cached"
 
-[agents]
-max_threads = 6
-max_depth = 1
-
-[features]
-unified_exec = true
-apply_patch_freeform = true
-shell_snapshot = true
-multi_agent = true
-collaboration_modes = true
-steer=true
-terminal_resize_reflow = true
-goals = true
-
 [tui]
-status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used", "five-hour-limit", "weekly-limit"]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used", "five-hour-limit", "weekly-limit", "codex-version", "context-window-size", "fast-mode"]
+status_line_use_colors = true
 
 [tui.keymap.editor]
 insert_newline = ["ctrl-j", "ctrl-m", "enter", "shift-enter", "alt-enter"]
+
+[tui.model_availability_nux]
+"gpt-5.6-sol" = 1
+
+[projects."/data/home/code"]
+trust_level = "trusted"

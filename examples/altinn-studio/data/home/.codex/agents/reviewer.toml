@@ -1,6 +1,6 @@
 name = "reviewer"
 description = "Reviewer"
-model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "max"
 sandbox_mode = "read-only"
 developer_instructions = "Review according to instructions. If anything is unclear, ask for clarification before reviewing. Be thorough."
