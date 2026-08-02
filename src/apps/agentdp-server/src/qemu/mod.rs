@@ -7,6 +7,7 @@ mod provisioning;
 pub(crate) use agentdp_core::agent::{
     QemuImageState as ImageState, QemuMediatedCaState as MediatedCaState, QemuState as State,
 };
+pub(crate) use control::Session as InstanceControl;
 pub(crate) use error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use agentdp_core::Context;
 use agentdp_core::agent::{AgentInstanceDocument, BackendState};
 use agentdp_core::doctor::DoctorReport;
+use agentdp_core::provisioning::SeedFile;
 use agentdp_core::provisioning::image::CatalogImage;
 use agentdp_platform::ssh::{CommandOutput, OutputSink, SshKeygen};
 use agentdp_protocol::client_server::{HostCommandResult, LogFile};
@@ -22,9 +24,10 @@ use agentdp_qemu::{disk, system};
 
 use crate::agent::{AgentBaseFiles, AgentBaseKey, AgentManifestContext};
 use crate::backend::{
-    Backend, BackendBaseImageIdentity, BackendFuture, BackendValueFuture, BootstrapEventSink, CreateBaseInput,
-    CreateBaseOutput, CreateInstanceInput, CreateInstanceOutput, Error as BackendError, ReconcileHostInputsOutput,
-    ReconcileOutput, StartOutput, StopInstanceInput, StopOutput,
+    Backend, BackendBaseImageIdentity, BackendFuture, BackendValueFuture, BootstrapEventSink, BootstrapOutcome,
+    CreateBaseInput, CreateBaseOutput, CreateInstanceInput, CreateInstanceOutput, Error as BackendError,
+    ReconcileHostInputsOutput, ReconcileOutput, ReconcileRuntimeSecretsOutput, StartOutput, StopInstanceInput,
+    StopOutput,
 };
 use crate::host::{HostSshError, execute_host_shell_command, interactive_host_shell_command};
 use crate::services::InstanceNetwork;
@@ -144,6 +147,7 @@ impl Backend for QemuBackend {
         &'a self,
         context: &'a Context,
         state: &'a mut AgentInstanceDocument,
+        control: &'a mut Option<InstanceControl>,
     ) -> BackendFuture<'a, StopOutput> {
         Box::pin(async move {
             lifecycle::stop_base(
@@ -151,6 +155,7 @@ impl Backend for QemuBackend {
                 &state.metadata.agent,
                 &state.metadata.name,
                 qemu_state_mut(&mut state.status.backend),
+                control,
             )
             .await
             .map_err(BackendError::Qemu)
@@ -234,12 +239,21 @@ impl Backend for QemuBackend {
         &'a self,
         context: &'a Context,
         state: &'a AgentInstanceDocument,
+        control: &'a mut Option<InstanceControl>,
+        retry_epoch: Option<u64>,
         bootstrap_events: Option<&'a mut dyn BootstrapEventSink>,
-    ) -> BackendFuture<'a, ()> {
+    ) -> BackendFuture<'a, BootstrapOutcome> {
         Box::pin(async move {
-            control::wait_bootstrap(context, state, bootstrap_events)
-                .await
-                .map_err(BackendError::Qemu)
+            control::wait_bootstrap(
+                context,
+                state,
+                control,
+                retry_epoch,
+                bootstrap_events,
+                control::BOOTSTRAP_WAIT_TIMEOUT,
+            )
+            .await
+            .map_err(BackendError::Qemu)
         })
     }
 
@@ -249,9 +263,10 @@ impl Backend for QemuBackend {
         instance_network: &'a InstanceNetwork,
         input: StopInstanceInput<'a>,
         backend_state: &'a mut BackendState,
+        control: &'a mut Option<InstanceControl>,
     ) -> BackendFuture<'a, StopOutput> {
         Box::pin(async move {
-            lifecycle::stop_instance(context, instance_network, input, qemu_state_mut(backend_state))
+            lifecycle::stop_instance(context, instance_network, input, qemu_state_mut(backend_state), control)
                 .await
                 .map_err(BackendError::Qemu)
         })
@@ -282,14 +297,44 @@ impl Backend for QemuBackend {
         })
     }
 
-    fn reconcile_host_inputs<'a>(
+    fn reconcile_runtime_secrets<'a>(
         &'a self,
         context: &'a Context,
         instance_network: &'a InstanceNetwork,
         manifest: &'a AgentManifestContext,
         state: &'a mut AgentInstanceDocument,
+    ) -> BackendFuture<'a, ReconcileRuntimeSecretsOutput> {
+        Box::pin(async move {
+            lifecycle::reconcile_runtime_secrets(
+                lifecycle::RuntimeInput {
+                    context,
+                    instance_network,
+                    instance_status: state.status.phase,
+                    agent: state.metadata.agent.as_str(),
+                    instance: state.metadata.name.as_str(),
+                    network: &state.status.network,
+                    manifest,
+                },
+                qemu_state_mut(&mut state.status.backend),
+            )
+            .await
+            .map_err(BackendError::Qemu)
+        })
+    }
+
+    fn reconcile_host_inputs<'a>(
+        &'a self,
+        context: &'a Context,
+        instance_network: &'a InstanceNetwork,
+        manifest: &'a AgentManifestContext,
+        state: &'a AgentInstanceDocument,
+        secret_files: &'a [SeedFile],
+        control: &'a mut Option<InstanceControl>,
     ) -> BackendFuture<'a, ReconcileHostInputsOutput> {
         Box::pin(async move {
+            control::wait_bootstrap(context, state, control, None, None, control::CONTROL_RECONNECT_TIMEOUT)
+                .await
+                .map_err(BackendError::Qemu)?;
             let agent = state.metadata.agent.clone();
             let instance = state.metadata.name.clone();
             let network = state.status.network.clone();
@@ -303,7 +348,9 @@ impl Backend for QemuBackend {
                     network: &network,
                     manifest,
                 },
-                qemu_state_mut(&mut state.status.backend),
+                qemu_state(&state.status.backend),
+                secret_files,
+                control,
             )
             .await
             .map_err(BackendError::Qemu)
@@ -346,5 +393,220 @@ impl Backend for QemuBackend {
                 .map_err(Error::from)
                 .map_err(BackendError::Qemu)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use agentdp_core::Context;
+    use agentdp_core::agent::{
+        AgentInstanceDocument, AgentInstanceId, AgentInstancePhase, AgentInstanceTarget, BackendState,
+        NetworkAllowState, NetworkIpv6State, NetworkModeState, NetworkState, QemuImageState,
+    };
+    use agentdp_core::manifest::AgentManifest;
+    use agentdp_core::provisioning::SeedFile;
+    use agentdp_core::provisioning::secrets::SecretBindings;
+    use agentdp_ds::local::spsc;
+    use agentdp_platform::socket;
+    use agentdp_protocol::jsonl::JsonLineReader;
+    use agentdp_protocol::server_guest::{
+        BootstrapFinished, BootstrapLifecycleStatus, BootstrapStatusReport, BootstrapStepPhase,
+        GUEST_CONTROL_PROTOCOL_VERSION, GuestCommandResult, GuestHello, GuestMessage, GuestMessageKind, GuestdRole,
+        HostMessageKind, WRITE_USER_FILE_COMMAND, decode_host_message_line, encode_guest_message_line,
+    };
+
+    use crate::agent::{AgentBaseKey, AgentManifestContext, AgentName, InstanceName};
+    use crate::backend::Backend as _;
+    use crate::services::InstanceNetwork;
+
+    use super::{MediatedCaState, QemuBackend, State};
+
+    #[tokio::test]
+    async fn host_input_retry_reconnects_after_lost_retained_session() {
+        let temp = std::env::temp_dir().join(format!(
+            "agentdp-host-input-reconnect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let socket_path = temp.join("guest-control.sock");
+        let listener = socket::bind_local_socket(&socket_path).await.unwrap();
+        let manifest = serde_yaml::from_str::<AgentManifest>(agentdp_test_support::manifest::minimal()).unwrap();
+        let manifest_context =
+            AgentManifestContext::from_existing_value(&temp.join("agent.yaml"), manifest.clone()).unwrap();
+        let state = instance_document(&manifest, &socket_path);
+        let (events, _event_rx) = spsc::bounded(4);
+        let network = InstanceNetwork::new(events);
+        let backend = QemuBackend::for_host();
+        let context = Context::quiet();
+        let mut control = None;
+        let host_files = [SeedFile {
+            path: "/data/home/.codex/auth.json".to_owned(),
+            contents: b"auth\n".to_vec(),
+            permissions: "0600".to_owned(),
+            owner: Some("agent".to_owned()),
+        }];
+
+        let first_guest = async {
+            let mut guest = listener.accept().await.unwrap();
+            write_terminal_replay(&mut guest).await;
+            let command = read_host_command(&mut guest).await;
+            assert_eq!(command, WRITE_USER_FILE_COMMAND);
+        };
+        let first_host =
+            backend.reconcile_host_inputs(&context, &network, &manifest_context, &state, &host_files, &mut control);
+        let (first, ()) = tokio::join!(first_host, first_guest);
+        let first = first.expect("first reconciliation reports the lost command session");
+        assert_eq!(first.file_failures, 1);
+        assert!(control.is_none());
+
+        let second_guest = async {
+            let mut guest = listener.accept().await.unwrap();
+            write_terminal_replay(&mut guest).await;
+            let mut reader = JsonLineReader::default();
+            let mut frame = Vec::new();
+            assert!(reader.read_line(&mut guest, &mut frame).await.unwrap());
+            let request = decode_host_message_line(&frame).unwrap();
+            let HostMessageKind::Command(command) = request.kind;
+            assert_eq!(command.command, WRITE_USER_FILE_COMMAND);
+            guest
+                .write_all(
+                    &encode_guest_message_line(&GuestMessage::new(
+                        request.id,
+                        GuestMessageKind::CommandResult(GuestCommandResult {
+                            command: WRITE_USER_FILE_COMMAND.to_owned(),
+                            updated: false,
+                        }),
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        };
+        let second_host =
+            backend.reconcile_host_inputs(&context, &network, &manifest_context, &state, &host_files, &mut control);
+        let (second, ()) = tokio::join!(second_host, second_guest);
+        let second = second.expect("next reconciliation reconnects through terminal replay");
+
+        assert_eq!(second.file_failures, 0);
+        assert!(control.is_some());
+        drop(listener);
+        let _removed = std::fs::remove_dir_all(temp);
+    }
+
+    fn instance_document(manifest: &AgentManifest, socket_path: &std::path::Path) -> AgentInstanceDocument {
+        AgentInstanceDocument::new(
+            AgentName::new("altinn-studio"),
+            AgentInstanceId::new(0),
+            InstanceName::new("altinn-studio-0"),
+            1,
+            AgentBaseKey::new("sha256:test"),
+            manifest.spec.template.clone(),
+            AgentInstanceTarget::Active,
+            AgentInstancePhase::Running,
+            NetworkState {
+                mode: NetworkModeState::Mediated,
+                allow: NetworkAllowState::default(),
+                ipv6: NetworkIpv6State::default(),
+                ports: BTreeMap::new(),
+                runtime: None,
+            },
+            Vec::new(),
+            None,
+            BackendState::Qemu(State {
+                image: QemuImageState {
+                    os: "test".to_owned(),
+                    architecture: "x86_64".to_owned(),
+                    variant: "cloud".to_owned(),
+                    source_url: String::new(),
+                    cache_key: String::new(),
+                    cache_path: String::new(),
+                    download_path: String::new(),
+                    format: String::new(),
+                },
+                disk: String::new(),
+                work_dir: String::new(),
+                seed_media: String::new(),
+                seed_meta_data: String::new(),
+                seed_network_config: String::new(),
+                seed_user_data: String::new(),
+                monitor_socket: String::new(),
+                qmp_socket: String::new(),
+                guest_control_socket: socket_path.display().to_string(),
+                pid_file: String::new(),
+                serial_log: String::new(),
+                qemu_log: String::new(),
+                instance_network: None,
+                mediated_secrets: SecretBindings::default(),
+                mediated_ca: MediatedCaState::default(),
+                pid: None,
+                last_start_unix_seconds: None,
+            }),
+        )
+    }
+
+    async fn write_terminal_replay(guest: &mut agentdp_platform::socket::AsyncLocalSocket) {
+        let messages = [
+            GuestMessage::new(
+                "hello",
+                GuestMessageKind::Hello(GuestHello {
+                    protocol_version: GUEST_CONTROL_PROTOCOL_VERSION,
+                    guestd_role: GuestdRole::System,
+                    guestd_version: "test".to_owned(),
+                    manifest: "altinn-studio".to_owned(),
+                    instance: "altinn-studio-0".to_owned(),
+                    os: "linux".to_owned(),
+                    hostname: "altinn-studio-0".to_owned(),
+                    user: "agent".to_owned(),
+                }),
+            ),
+            GuestMessage::new(
+                "status",
+                GuestMessageKind::BootstrapStatus(BootstrapStatusReport {
+                    plan_id: "altinn-studio/altinn-studio-0".to_owned(),
+                    plan_hash: "sha256:test".to_owned(),
+                    attempt_epoch: 0,
+                    phase: BootstrapStepPhase::User,
+                    status: BootstrapLifecycleStatus::Passed,
+                    current_step: None,
+                    completed_steps: Vec::new(),
+                    failed_step: None,
+                    pending_steps: Vec::new(),
+                }),
+            ),
+            GuestMessage::new(
+                "finished",
+                GuestMessageKind::BootstrapFinished(BootstrapFinished {
+                    plan_hash: "sha256:test".to_owned(),
+                    attempt_epoch: 0,
+                }),
+            ),
+        ];
+        for message in messages {
+            guest
+                .write_all(&encode_guest_message_line(&message).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn read_host_command(guest: &mut agentdp_platform::socket::AsyncLocalSocket) -> String {
+        let mut reader = JsonLineReader::default();
+        let mut frame = Vec::new();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(guest, &mut frame))
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let request = decode_host_message_line(&frame).unwrap();
+        let HostMessageKind::Command(command) = request.kind;
+        command.command
     }
 }

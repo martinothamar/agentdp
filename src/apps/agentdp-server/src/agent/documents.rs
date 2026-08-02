@@ -49,9 +49,8 @@ impl AgentDocuments {
                 continue;
             };
             instance.documents.write(instance.documents.private.clone());
-            let target = instance.documents.private.spec.target;
             let status = instance.documents.public.status.clone();
-            if target == AgentInstanceTarget::Deleting {
+            if matches!(status.phase, AgentInstancePhase::Deleting | AgentInstancePhase::Deleted) {
                 deleting = deleting.saturating_add(1);
             }
             if status.phase == AgentInstancePhase::Running {
@@ -60,9 +59,10 @@ impl AgentDocuments {
             if status.phase != AgentInstancePhase::Running {
                 stopped = stopped.saturating_add(1);
             }
-            if target == AgentInstanceTarget::Active
+            if instance.documents.private.spec.target == AgentInstanceTarget::Active
                 && status.observed_generation == private.generation()
                 && status.readiness.as_ref().is_some_and(|state| state.ready)
+                && status.host_inputs.is_ready_for(private.generation())
             {
                 ready = ready.saturating_add(1);
             }
@@ -78,6 +78,13 @@ impl AgentDocuments {
             AgentInstanceState::Starting(_) => false,
             AgentInstanceState::Running(instance) => {
                 instance.documents.private.status.observed_generation == private.generation()
+                    && (instance.documents.private.spec.target != AgentInstanceTarget::Active
+                        || instance
+                            .documents
+                            .private
+                            .status
+                            .host_inputs
+                            .is_ready_for(private.generation()))
             }
         });
         let inactive_converged = (private.phase() == AgentPhase::Paused || private.replicas() == 0)
@@ -103,7 +110,7 @@ impl AgentDocuments {
             AgentStatusPhase::Running
         };
         private.status.deleted = deleted;
-        private.status.reconciling = private.observed_generation() != private.generation();
+        private.status.reconciling = !observed;
         private.status.replicas = ReplicaStatus {
             desired: private.replicas(),
             active,

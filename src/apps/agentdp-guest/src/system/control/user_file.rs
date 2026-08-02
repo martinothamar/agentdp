@@ -1,47 +1,117 @@
-use std::path::{Component, Path, PathBuf};
-
 use agentdp_protocol::server_guest::WriteUserFileCommand;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::process::Command;
 
-use crate::{Error, Result};
+use crate::Error;
+use crate::daemon::user_file as worker;
 
-use super::commands::HostCommandContext;
+use super::commands::{HostCommandContext, HostCommandFailure};
 
-pub(super) async fn write(payload: serde_json::Value, context: &HostCommandContext) -> Result<bool> {
-    let request = serde_json::from_value::<WriteUserFileCommand>(payload)?;
-    let relative = validate_user_home_relative_path(&request.path)?;
-    let mode = parse_octal_mode(&request.permissions)?;
-    let target = Path::new(&context.home).join(relative);
-    agentdp_platform::fs::write_user_owned_file(&target, &request.contents, mode, 0o700, &context.user)
-        .await
-        .map_err(|source| Error::Message(source.to_string()))
+pub(super) async fn write(
+    payload: serde_json::Value,
+    context: &HostCommandContext,
+) -> Result<bool, HostCommandFailure> {
+    let request = serde_json::from_value::<WriteUserFileCommand>(payload).map_err(Error::from)?;
+    worker::validate_relative_path(&request.path)?;
+    worker::parse_octal_mode(&request.permissions)?;
+    execute(context, request.path, request.permissions, &request.contents).await
 }
 
-fn validate_user_home_relative_path(path: &str) -> Result<PathBuf> {
-    let path = Path::new(path);
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(Error::Message(
-            "user file path must be relative to the agent home".to_owned(),
-        ));
+async fn execute(
+    context: &HostCommandContext,
+    path: String,
+    permissions: String,
+    contents: &[u8],
+) -> Result<bool, HostCommandFailure> {
+    match tokio::fs::metadata(&context.home).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(HostCommandFailure::not_ready("agent home is not a directory")),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(HostCommandFailure::not_ready("agent home does not exist"));
+        }
+        Err(source) => return Err(Error::from(source).into()),
     }
-    if !path
-        .components()
-        .all(|component| matches!(component, Component::Normal(_)))
-    {
-        return Err(Error::Message(
-            "user file path must not contain . or .. components".to_owned(),
-        ));
-    }
-    Ok(path.to_path_buf())
-}
 
-fn parse_octal_mode(mode: &str) -> Result<u32> {
-    let Some(mode) = mode.strip_prefix('0') else {
-        return Err(Error::Message(format!("file mode {mode} must be octal")));
+    let mut command = Command::new(&context.worker_executable);
+    command
+        .arg("write-user-file")
+        .arg("--user")
+        .arg(&context.user)
+        .arg("--home")
+        .arg(&context.home)
+        .arg(format!("--path={path}"))
+        .arg("--permissions")
+        .arg(permissions);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    agentdp_platform::user::run_as_user(&mut command, &context.user)
+        .map_err(|source| HostCommandFailure::not_ready(source.to_string()))?;
+    let mut child = command.spawn().map_err(Error::from)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Message("user file worker stdin was not piped".to_owned()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Message("user file worker stdout was not piped".to_owned()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Message("user file worker stderr was not piped".to_owned()))?;
+    let exchange = async {
+        let write_stdin = async move {
+            stdin.write_all(contents).await?;
+            stdin.shutdown().await?;
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        };
+        let read_stdout = async {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await?;
+            Ok::<_, std::io::Error>(output)
+        };
+        let read_stderr = async {
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output).await?;
+            Ok::<_, std::io::Error>(output)
+        };
+        let ((), status, stdout, stderr) = tokio::try_join!(write_stdin, child.wait(), read_stdout, read_stderr)?;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
     };
-    let value = u32::from_str_radix(mode, 8)
-        .map_err(|source| Error::Message(format!("failed to parse file mode 0{mode}: {source}")))?;
-    if value > 0o777 {
-        return Err(Error::Message(format!("file mode 0{mode} is too broad")));
+    let (status, stdout, stderr) = match tokio::time::timeout(context.worker_timeout, exchange).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(source)) => {
+            terminate_and_reap(&mut child).await;
+            return Err(Error::from(source).into());
+        }
+        Err(_elapsed) => {
+            terminate_and_reap(&mut child).await;
+            return Err(Error::Message(format!(
+                "user file worker timed out after {}s",
+                context.worker_timeout.as_secs_f64()
+            ))
+            .into());
+        }
+    };
+    if !status.success() {
+        return Err(Error::Message(format!(
+            "user file worker failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ))
+        .into());
     }
-    Ok(value)
+    match String::from_utf8_lossy(&stdout).trim() {
+        "updated" => Ok(true),
+        "unchanged" => Ok(false),
+        output => Err(Error::Message(format!("user file worker returned invalid output {output:?}")).into()),
+    }
+}
+
+async fn terminate_and_reap(child: &mut tokio::process::Child) {
+    let _kill_result = child.start_kill();
+    let _wait_result = child.wait().await;
 }

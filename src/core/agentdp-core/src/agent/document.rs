@@ -350,6 +350,8 @@ impl AgentInstanceDocument {
         backend: BackendState,
     ) -> Self {
         let now = agentdp_platform::time::rfc3339_utc_now();
+        let materialized_agent_base = agent_base.clone();
+        let materialized_template = template.clone();
         Self {
             api_version: AGENTDP_API_VERSION.to_owned(),
             kind: AgentInstanceDocumentKind::AgentInstance,
@@ -367,6 +369,8 @@ impl AgentInstanceDocument {
             status: AgentInstanceStatus {
                 phase,
                 observed_generation: 0,
+                materialized_agent_base,
+                materialized_template,
                 created_at: now,
                 ready_at: None,
                 bootstrap: None,
@@ -374,6 +378,7 @@ impl AgentInstanceDocument {
                 healthchecks,
                 guest_access,
                 readiness: None,
+                host_inputs: super::AgentInstanceHostInputsState::default(),
                 work: super::AgentInstanceWorkStatus::default(),
                 reconciliation: None,
                 tailscale_serve: None,

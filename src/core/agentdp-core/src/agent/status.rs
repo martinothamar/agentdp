@@ -4,7 +4,7 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{NetworkAllow, NetworkIpv6};
+use crate::manifest::{AgentSpec, NetworkAllow, NetworkIpv6};
 use crate::provisioning::bootstrap::HealthcheckPlan;
 use crate::provisioning::secrets::SecretBindings;
 use agentdp_protocol::server_guest::{BootstrapLifecycleStatus, BootstrapStepPhase};
@@ -73,6 +73,10 @@ pub struct AgentInstanceStatus {
     pub phase: AgentInstancePhase,
     #[serde(rename = "observedGeneration")]
     pub observed_generation: u64,
+    #[serde(rename = "materializedAgentBase")]
+    pub materialized_agent_base: AgentBaseKey,
+    #[serde(rename = "materializedTemplate")]
+    pub materialized_template: AgentSpec,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "readyAt")]
@@ -84,11 +88,67 @@ pub struct AgentInstanceStatus {
     #[serde(rename = "guestAccess")]
     pub guest_access: Option<GuestAccessState>,
     pub readiness: Option<ReadinessState>,
+    #[serde(rename = "hostInputs")]
+    pub host_inputs: AgentInstanceHostInputsState,
     pub work: AgentInstanceWorkStatus,
     pub reconciliation: Option<ReconciliationState>,
     #[serde(rename = "tailscaleServe")]
     pub tailscale_serve: Option<TailscaleServeState>,
     pub backend: BackendState,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstanceHostInputsState {
+    #[serde(rename = "observedGeneration")]
+    pub observed_generation: u64,
+    pub phase: AgentInstanceHostInputsPhase,
+    #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl AgentInstanceHostInputsState {
+    #[must_use]
+    pub const fn is_ready_for(&self, generation: u64) -> bool {
+        self.observed_generation == generation && matches!(self.phase, AgentInstanceHostInputsPhase::Ready)
+    }
+
+    pub fn mark_pending(&mut self) {
+        self.phase = AgentInstanceHostInputsPhase::Pending;
+        self.last_error = None;
+    }
+
+    pub fn mark_ready(&mut self, generation: u64) {
+        self.observed_generation = generation;
+        self.phase = AgentInstanceHostInputsPhase::Ready;
+        self.last_error = None;
+    }
+
+    pub fn record_failure(&mut self, generation: u64, error: String) {
+        self.observed_generation = generation;
+        self.phase = AgentInstanceHostInputsPhase::Failed;
+        self.last_error = Some(error);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentInstanceHostInputsPhase {
+    #[default]
+    Pending,
+    Ready,
+    Failed,
+}
+
+impl AgentInstanceHostInputsPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 impl AgentInstanceStatus {
@@ -178,6 +238,8 @@ impl AgentInstanceTarget {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentInstanceBootstrapState {
+    #[serde(rename = "attemptEpoch", skip_serializing_if = "Option::is_none")]
+    pub attempt_epoch: Option<u64>,
     #[serde(rename = "failureCount")]
     pub failure_count: u32,
     #[serde(rename = "lastFailureUnixSeconds")]

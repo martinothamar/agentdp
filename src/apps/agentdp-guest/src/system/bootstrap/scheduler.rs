@@ -329,6 +329,7 @@ mod tests {
     fn state() -> BootstrapState {
         BootstrapState {
             plan_hash: "test".to_owned(),
+            attempt_epoch: 0,
             steps: BTreeMap::default(),
         }
     }

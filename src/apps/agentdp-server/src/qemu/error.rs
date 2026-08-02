@@ -62,6 +62,8 @@ pub(super) enum ErrorKind {
     ProcessStillRunning { pid: u32 },
     #[error("failed to establish mediated QEMU stream for {instance}: {message}")]
     InstanceNetworkConnect { instance: String, message: String },
+    #[error("mediated network is not running for {instance}")]
+    InstanceNetworkNotRunning { instance: String },
     #[error(
         "mediated CA state is incomplete: cert_pem configured={cert_configured}, key_path configured={key_path_configured}"
     )]

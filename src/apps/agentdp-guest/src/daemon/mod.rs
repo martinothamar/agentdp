@@ -1,5 +1,6 @@
 mod system;
 mod user;
+pub(crate) mod user_file;
 
 use std::path::PathBuf;
 
@@ -13,6 +14,7 @@ pub async fn run() -> Result<()> {
     match cli.command {
         None | Some(Command::User) => user::run().await,
         Some(Command::DockerProxy(args)) => Box::pin(docker::proxy::run(args.into())).await,
+        Some(Command::WriteUserFile(args)) => user_file::run(args.into()).await,
         Some(Command::System(args)) => Box::pin(system::run(args.into())).await,
     }
 }
@@ -31,8 +33,34 @@ enum Command {
     User,
     /// Proxy the Docker Engine socket and inject container CA trust.
     DockerProxy(DockerProxyArgs),
+    /// Internal worker for writing user-owned files.
+    #[command(hide = true)]
+    WriteUserFile(WriteUserFileArgs),
     /// Run the root-owned host control-channel daemon.
     System(SystemArgs),
+}
+
+#[derive(Debug, Parser)]
+struct WriteUserFileArgs {
+    #[arg(long)]
+    user: String,
+    #[arg(long)]
+    home: PathBuf,
+    #[arg(long)]
+    path: String,
+    #[arg(long)]
+    permissions: String,
+}
+
+impl From<WriteUserFileArgs> for user_file::Config {
+    fn from(args: WriteUserFileArgs) -> Self {
+        Self {
+            user: args.user,
+            home: args.home,
+            path: args.path,
+            permissions: args.permissions,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -73,7 +101,7 @@ impl From<SystemArgs> for system::Config {
 mod tests {
     use clap::{CommandFactory, Parser, error::ErrorKind};
 
-    use super::{Cli, Command, docker};
+    use super::{Cli, Command, WriteUserFileArgs, docker};
 
     #[test]
     fn system_lifecycle_requires_instance_spec_path() {
@@ -94,8 +122,61 @@ mod tests {
                     std::path::PathBuf::from("/run/agentdp/spec/instance.json")
                 );
             }
-            Command::User | Command::DockerProxy(_) => panic!("expected system subcommand"),
+            Command::User | Command::DockerProxy(_) | Command::WriteUserFile(_) => {
+                panic!("expected system subcommand")
+            }
         }
+    }
+
+    #[test]
+    fn user_file_worker_accepts_arguments() {
+        let cli = Cli::try_parse_from([
+            "guestd",
+            "write-user-file",
+            "--user",
+            "agent",
+            "--home",
+            "/data/home",
+            "--path",
+            ".codex/auth.json",
+            "--permissions",
+            "0600",
+        ])
+        .expect("parse user file worker command");
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::WriteUserFile(WriteUserFileArgs {
+                user,
+                home,
+                path,
+                permissions,
+            })) if permissions == "0600"
+                && user == "agent"
+                && home == std::path::Path::new("/data/home")
+                && path == ".codex/auth.json"
+        ));
+    }
+
+    #[test]
+    fn user_file_worker_accepts_option_like_paths_as_inline_values() {
+        let cli = Cli::try_parse_from([
+            "guestd",
+            "write-user-file",
+            "--user",
+            "agent",
+            "--home",
+            "/data/home",
+            "--path=-secret",
+            "--permissions",
+            "0600",
+        ])
+        .expect("parse option-like user file path");
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::WriteUserFile(WriteUserFileArgs { path, .. })) if path == "-secret"
+        ));
     }
 
     #[test]
@@ -122,7 +203,7 @@ mod tests {
                 );
                 assert_eq!(config.ca, std::path::PathBuf::from("/var/lib/agentdp/ca/ca-bundle.pem"));
             }
-            Command::User | Command::System(_) => {
+            Command::User | Command::System(_) | Command::WriteUserFile(_) => {
                 panic!("expected docker proxy subcommand")
             }
         }

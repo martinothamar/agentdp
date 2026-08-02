@@ -9,6 +9,7 @@ use agentdp_core::agent::{
 };
 use agentdp_core::manifest::{AgentManifest, NetworkMode};
 use agentdp_core::mediated_network::MediatedNetworkProfile;
+use agentdp_core::provisioning::SeedFile;
 use agentdp_core::provisioning::guest_os::GuestOsAdapter;
 use agentdp_core::provisioning::image::{ImageCatalog, ImageRequest};
 use agentdp_core::provisioning::secrets::SecretBindings;
@@ -21,7 +22,7 @@ use agentdp_qemu::{command, disk, image, qmp, system};
 use crate::agent::{AGENT_BASE_INSTANCE, AgentBaseFiles, AgentBaseKey, AgentInstanceFiles, AgentManifestContext};
 use crate::agent::{AgentName, InstanceName};
 use crate::backend::{self, BackendBaseImageIdentity, CreateBaseInput, CreateBaseOutput};
-use crate::host::collect_runtime_host_inputs;
+use crate::host::{collect_runtime_host_files, collect_runtime_secrets};
 use crate::services::InstanceNetwork;
 
 use super::control;
@@ -174,6 +175,7 @@ pub(super) async fn stop_base(
     agent: &AgentName,
     instance: &InstanceName,
     state: &mut State,
+    control: &mut Option<control::Session>,
 ) -> Result<backend::StopOutput, Error> {
     let output = if let Some(pid) = state.pid {
         let label = format!("agent base {agent}/{instance}");
@@ -185,6 +187,7 @@ pub(super) async fn stop_base(
         }
     };
     state.pid = None;
+    control.take();
     cleanup_qemu_runtime_files(state).await?;
     Ok(output)
 }
@@ -204,7 +207,7 @@ pub(super) async fn stop_base_runtime(
     context
         .logger()
         .verbose_with(|| format!("stopping agent base runtime {agent}/{key}"));
-    stop_base(context, agent, &instance, &mut state).await
+    stop_base(context, agent, &instance, &mut state, &mut None).await
 }
 
 fn qemu_image_for_manifest(
@@ -238,14 +241,14 @@ pub(super) async fn start_instance(
     let instance_name = InstanceName::new(instance);
     let spec = spec_from_state(manifest.value(), agent, instance, network, qemu_state)?;
     clear_stored_runtime_secrets_if_unconfigured(manifest.value(), qemu_state);
-    let host_inputs = collect_runtime_host_inputs(
+    let secrets = collect_runtime_secrets(
         context,
         manifest.source_path(),
         manifest.value(),
         &qemu_state.mediated_secrets,
     )
     .await?;
-    qemu_state.mediated_secrets = host_inputs.stored_secrets.clone();
+    qemu_state.mediated_secrets = secrets.stored_secrets.clone();
     let network_task = start_instance_network(
         context,
         instance_network,
@@ -253,7 +256,7 @@ pub(super) async fn start_instance(
         instance,
         network,
         qemu_state,
-        host_inputs.runtime_secrets,
+        secrets.live,
     )
     .await?;
     let pid = match qemu_system.start(context, &spec).await {
@@ -323,6 +326,7 @@ pub(super) async fn stop_instance(
     instance_network: &InstanceNetwork,
     input: backend::StopInstanceInput<'_>,
     state: &mut State,
+    control: &mut Option<control::Session>,
 ) -> Result<backend::StopOutput, Error> {
     let pid = match state.pid {
         Some(pid) => Some(pid),
@@ -330,10 +334,12 @@ pub(super) async fn stop_instance(
     };
     if let Some(pid) = pid {
         let output = stop_recorded_qemu_process(context, input.name, state, pid).await?;
+        control.take();
         cleanup_runtime_files(instance_network, input.agent, input.instance, state).await?;
         state.pid = None;
         return Ok(output);
     }
+    control.take();
     cleanup_runtime_files(instance_network, input.agent, input.instance, state).await?;
     let process_status = match input.status {
         AgentInstancePhase::Materialized => "not-started",
@@ -488,7 +494,7 @@ pub(super) async fn ensure_attached(input: RuntimeInput<'_>, state: &State) -> R
     let agent = AgentName::new(input.agent);
     let instance = InstanceName::new(input.instance);
     if !instance_network_is_attached(input.instance_network, &agent, &instance, state).await {
-        let host_inputs = collect_runtime_host_inputs(
+        let secrets = collect_runtime_secrets(
             input.context,
             input.manifest.source_path(),
             input.manifest.value(),
@@ -502,7 +508,7 @@ pub(super) async fn ensure_attached(input: RuntimeInput<'_>, state: &State) -> R
             input.instance,
             input.network,
             state,
-            host_inputs.runtime_secrets,
+            secrets.live,
         )
         .await?;
     }
@@ -522,14 +528,14 @@ pub(super) async fn reconcile(input: RuntimeInput<'_>, state: &mut State) -> Res
         && !instance_network_is_attached(input.instance_network, &agent, &instance, state).await
     {
         clear_live_runtime_secrets_if_unconfigured(&input, state)?;
-        let host_inputs = collect_runtime_host_inputs(
+        let secrets = collect_runtime_secrets(
             input.context,
             input.manifest.source_path(),
             input.manifest.value(),
             &state.mediated_secrets,
         )
         .await?;
-        state.mediated_secrets = host_inputs.stored_secrets.clone();
+        state.mediated_secrets = secrets.stored_secrets.clone();
         ensure_instance_network_attached(
             input.context,
             input.instance_network,
@@ -537,7 +543,7 @@ pub(super) async fn reconcile(input: RuntimeInput<'_>, state: &mut State) -> Res
             input.instance,
             input.network,
             state,
-            host_inputs.runtime_secrets,
+            secrets.live,
         )
         .await?;
     }
@@ -574,15 +580,17 @@ pub(super) async fn reconcile(input: RuntimeInput<'_>, state: &mut State) -> Res
     })
 }
 
-pub(super) async fn reconcile_host_inputs(
+pub(super) async fn reconcile_runtime_secrets(
     input: RuntimeInput<'_>,
     state: &mut State,
-) -> Result<backend::ReconcileHostInputsOutput, Error> {
-    if input.instance_status != AgentInstancePhase::Running {
-        return Ok(backend::ReconcileHostInputsOutput::default());
+) -> Result<backend::ReconcileRuntimeSecretsOutput, Error> {
+    if should_clear_runtime_secrets(input.manifest.value(), state) {
+        let secrets = SecretBindings::default();
+        update_running_instance_network_secrets(&input, state, &secrets)?;
+        state.mediated_secrets = secrets;
+        return Ok(backend::ReconcileRuntimeSecretsOutput::default());
     }
-    clear_live_runtime_secrets_if_unconfigured(&input, state)?;
-    let collected = collect_runtime_host_inputs(
+    let collected = collect_runtime_secrets(
         input.context,
         input.manifest.source_path(),
         input.manifest.value(),
@@ -590,23 +598,47 @@ pub(super) async fn reconcile_host_inputs(
     )
     .await?;
 
-    update_instance_network_secrets(
-        input.instance_network,
-        input.agent,
-        input.instance,
-        &collected.runtime_secrets,
-    )?;
+    update_running_instance_network_secrets(&input, state, &collected.live)?;
+    state.mediated_secrets = collected.stored_secrets;
+    Ok(backend::ReconcileRuntimeSecretsOutput {
+        secret_files: collected.files,
+    })
+}
+
+pub(super) async fn reconcile_host_inputs(
+    input: RuntimeInput<'_>,
+    state: &State,
+    secret_files: &[SeedFile],
+    control_session: &mut Option<control::Session>,
+) -> Result<backend::ReconcileHostInputsOutput, Error> {
+    let files = collect_runtime_host_files(
+        input.context,
+        input.manifest.source_path(),
+        input.manifest.value(),
+        &state.mediated_secrets,
+        secret_files,
+    )
+    .await?;
     let mut guest_files_updated = 0;
     let mut guest_file_failures = 0;
-    let control_socket = guest_control_socket_path(state);
-    for file in &collected.files {
+    let mut guest_file_errors = Vec::new();
+    let Some(session) = control_session.as_mut() else {
+        return Err(ErrorKind::GuestControlMessage {
+            code: "guest_control_missing".to_owned(),
+            message: "guest control session is not connected".to_owned(),
+        }
+        .into());
+    };
+    let mut session_broken = false;
+    for (index, file) in files.iter().enumerate() {
         let path = user_home_relative_seed_path(input.manifest.value(), &file.path)?;
         match control::write_user_file(
             input.context,
-            &control_socket,
+            session,
             &path,
             &file.contents,
             file.permissions.as_str(),
+            control::CONTROL_COMMAND_TIMEOUT,
         )
         .await
         {
@@ -616,18 +648,51 @@ pub(super) async fn reconcile_host_inputs(
             Ok(false) => {}
             Err(error) => {
                 guest_file_failures += 1;
+                guest_file_errors.push(backend::GuestFileReconcileError {
+                    path: file.path.clone(),
+                    error: error.to_string(),
+                });
                 input
                     .context
                     .logger()
                     .warn(format!("failed to write guest file {}: {error}", file.path));
+                if !session.is_usable() {
+                    for not_sent in &files[index + 1..] {
+                        guest_file_failures += 1;
+                        guest_file_errors.push(backend::GuestFileReconcileError {
+                            path: not_sent.path.clone(),
+                            error: "not sent because the guest control session failed".to_owned(),
+                        });
+                    }
+                    session_broken = true;
+                    break;
+                }
             }
         }
     }
-    state.mediated_secrets = collected.stored_secrets;
+    if session_broken {
+        control_session.take();
+    }
     Ok(backend::ReconcileHostInputsOutput {
-        guest_files_updated,
-        guest_file_failures,
+        files_updated: guest_files_updated,
+        file_failures: guest_file_failures,
+        file_errors: guest_file_errors,
     })
+}
+
+fn update_running_instance_network_secrets(
+    input: &RuntimeInput<'_>,
+    state: &State,
+    secrets: &SecretBindings,
+) -> Result<(), Error> {
+    let updated = update_instance_network_secrets(input.instance_network, input.agent, input.instance, secrets)?;
+    if state.instance_network.is_some() && !updated {
+        return Err(ErrorKind::InstanceNetworkNotRunning {
+            instance: format!("{}/{}", input.agent, input.instance),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn user_home_relative_seed_path(manifest: &AgentManifest, path: &str) -> Result<String, Error> {

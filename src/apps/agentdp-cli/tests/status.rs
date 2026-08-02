@@ -10,7 +10,7 @@ use agentdp_test_support::cli::{
 };
 
 #[test]
-fn status_starting_instance_after_observed() {
+fn status_bootstrapping_instance() {
     let fixture = AgentFixture::new("status-starting-instance-after-observed", valid_manifest())
         .with_qemu_system(QemuSystemMode::DelayBootstrapFinished);
     let apply = fixture.apply_agent();
@@ -19,11 +19,9 @@ fn status_starting_instance_after_observed() {
         snapshot::assert(file!(), "local_socket_permission_denied", &apply.render());
         return;
     }
-    let observed = fixture.wait_observed();
-    assert!(observed.stdout().contains("status: Satisfied"), "{}", observed.render());
-
-    let output = fixture.wait_status_contains("network_runtime:", Duration::from_secs(2));
+    let output = fixture.wait_status_contains("work: bootstrap", Duration::from_secs(2));
+    assert!(output.stdout().contains("work: bootstrap"), "{}", output.render());
     assert!(output.stdout().contains("network_runtime:"), "{}", output.render());
 
-    snapshot::assert(file!(), "starting_instance_after_observed", &output.render());
+    snapshot::assert(file!(), "bootstrapping_instance", &output.render());
 }

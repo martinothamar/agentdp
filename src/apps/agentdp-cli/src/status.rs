@@ -117,7 +117,9 @@ pub(crate) fn print_agent_document(document: &AgentDocument) {
     }
     println!("instances:");
     for (id, status) in &document.status.instances {
-        let ready = if status.readiness.as_ref().is_some_and(|readiness| readiness.ready) {
+        let ready = if status.readiness.as_ref().is_some_and(|readiness| readiness.ready)
+            && status.host_inputs.is_ready_for(document.generation())
+        {
             "ready"
         } else {
             "not-ready"
@@ -177,6 +179,14 @@ fn print_instance_document(document: &AgentInstanceDocument) {
         println!("pid: none");
     }
     println!("work: {}", work_summary(&document.status.work));
+    println!(
+        "host inputs: {} (observed generation {})",
+        document.status.host_inputs.phase.as_str(),
+        document.status.host_inputs.observed_generation
+    );
+    if let Some(error) = &document.status.host_inputs.last_error {
+        println!("host inputs error: {error}");
+    }
     print_readiness(document);
     print_backend(document);
     print_ports("ports", document.status.network.ports.iter());

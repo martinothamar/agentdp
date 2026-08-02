@@ -242,15 +242,17 @@ async fn user_owned_file_matches(
     file_mode: u32,
     owner: ResolvedFileOwner,
 ) -> std::io::Result<bool> {
-    let existing = match tokio::fs::read(path).await {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(source),
     };
-    if existing != contents {
+    if !metadata.file_type().is_file() || metadata.len() != contents.len() as u64 {
         return Ok(false);
     }
-    let metadata = tokio::fs::metadata(path).await?;
+    if tokio::fs::read(path).await? != contents {
+        return Ok(false);
+    }
     Ok(file_mode_matches(&metadata, file_mode) && file_owner_matches(&metadata, owner))
 }
 
@@ -531,6 +533,8 @@ pub async fn set_executable(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::write_atomic;
+    #[cfg(unix)]
+    use super::write_user_owned_file;
 
     #[tokio::test(flavor = "current_thread")]
     async fn write_atomic_replaces_existing_file() {
@@ -557,6 +561,30 @@ mod tests {
             tokio::fs::read_to_string(&path).await.expect("read created file"),
             "created"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_owned_write_replaces_fifo_without_reading_it() {
+        let temp = TestTemp::new("platform-write-user-file-fifo");
+        let path = temp.path.join("config");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        let user = std::env::var("USER").expect("current user name");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                write_user_owned_file(&path, b"config\n", 0o600, 0o700, &user)
+            )
+            .await
+            .expect("write must not block on fifo")
+            .expect("replace fifo")
+        );
+        assert_eq!(tokio::fs::read(&path).await.expect("read replacement"), b"config\n");
     }
 
     struct TestTemp {

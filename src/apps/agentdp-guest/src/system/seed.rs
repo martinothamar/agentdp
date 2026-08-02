@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use agentdp_protocol::server_guest::{
-    BootstrapPlan, GUEST_CONTROL_PROTOCOL_VERSION, GUEST_INSTANCE_SPEC_VERSION, GuestHello, GuestInstanceSpec,
-    GuestMessage, GuestMessageKind, GuestdRole,
+    BOOTSTRAP_PLAN_VERSION, BootstrapPlan, GUEST_CONTROL_PROTOCOL_VERSION, GUEST_INSTANCE_SPEC_VERSION, GuestHello,
+    GuestInstanceSpec, GuestMessage, GuestMessageKind, GuestdRole,
 };
 use tokio::fs;
 
@@ -27,6 +27,12 @@ impl SeedSpec {
         let instance = read_instance_spec(&config.instance_spec).await?;
         validate_instance_spec(&instance, &config.instance_spec)?;
         let plan = read_bootstrap_plan(Path::new(&instance.paths.bootstrap_plan)).await?;
+        if plan.plan_version != BOOTSTRAP_PLAN_VERSION {
+            return Err(Error::Message(format!(
+                "unsupported bootstrap plan version {}; expected {BOOTSTRAP_PLAN_VERSION}",
+                plan.plan_version
+            )));
+        }
         validate_bootstrap_plan(&plan, &instance.paths.bootstrap_root)?;
         let manifest = read_seed_file(Path::new(&instance.paths.manifest), "agent manifest").await?;
         validate_seed_inputs(&manifest)?;

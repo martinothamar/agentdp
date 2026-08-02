@@ -16,7 +16,7 @@ base: waiting for agent base bootstrap
 base: guest control channel connected
 base: guestd system connected for altinn-studio/agent-base
 base: bootstrap passed completed:0 pending:0
-base: bootstrap finished passed
+base: bootstrap finished
 base: stopping agent base bootstrap VM
 base: agent base ready
 0: instance materialized
@@ -26,8 +26,9 @@ base: agent base ready
 0: guest control channel connected
 0: guestd system connected for altinn-studio/replica-0
 0: bootstrap passed completed:0 pending:0
-0: bootstrap finished passed
+0: bootstrap finished
 0: checking guest access
+0: wrote host input file updates: 1
 0: ready code_server=$PORT ssh=$PORT
 wait altinn-studio
 generation: 1

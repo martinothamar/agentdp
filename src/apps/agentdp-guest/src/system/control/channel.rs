@@ -55,14 +55,6 @@ where
         Ok(())
     }
 
-    pub(in crate::system) async fn emit_error(
-        &mut self,
-        code: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Result<()> {
-        self.emit_error_with_id("guest_error", code, message).await
-    }
-
     pub(super) async fn emit_error_with_id(
         &mut self,
         id: impl Into<String>,

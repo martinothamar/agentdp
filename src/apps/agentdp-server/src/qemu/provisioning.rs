@@ -384,7 +384,7 @@ fn guest_bootstrap_plan(
 ) -> guest_protocol::BootstrapPlan {
     let layout = GuestOsAdapter::for_os(provisioning_plan.image.os).capabilities().layout;
     guest_protocol::BootstrapPlan {
-        plan_version: guest_protocol::GUEST_CONTROL_PROTOCOL_VERSION,
+        plan_version: guest_protocol::BOOTSTRAP_PLAN_VERSION,
         user: user.to_owned(),
         home: layout.agent_home.to_owned(),
         code_dir: layout.code_dir.to_owned(),

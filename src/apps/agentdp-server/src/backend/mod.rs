@@ -12,9 +12,9 @@ use agentdp_core::agent::{
 };
 use agentdp_core::doctor::DoctorReport;
 use agentdp_core::manifest::AgentManifest;
-use agentdp_core::provisioning::ProvisioningPlan;
 use agentdp_core::provisioning::bootstrap::RenderedBootstrapPlan;
 use agentdp_core::provisioning::image::{CatalogImage, ImageCatalog, ImageRequest};
+use agentdp_core::provisioning::{ProvisioningPlan, SeedFile};
 use agentdp_ds::local::spsc;
 use agentdp_platform::ssh::{CommandOutput, OutputSink};
 use agentdp_protocol::client_server::{BackendKind, HostCommandResult, LogFile};
@@ -39,11 +39,26 @@ pub(crate) enum Error {
 }
 
 pub(crate) type BackendRef = Rc<dyn Backend>;
+pub(crate) type InstanceControl = qemu::InstanceControl;
 pub(crate) type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + 'a>>;
 pub(crate) type BackendValueFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 pub(crate) trait BootstrapEventSink {
     fn emit(&mut self, event: BootstrapEvent);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootstrapOutcome {
+    Passed { attempt_epoch: u64 },
+    Failed { attempt_epoch: u64, error: String },
+}
+
+impl BootstrapOutcome {
+    pub(crate) const fn attempt_epoch(&self) -> u64 {
+        match self {
+            Self::Passed { attempt_epoch } | Self::Failed { attempt_epoch, .. } => *attempt_epoch,
+        }
+    }
 }
 
 impl BootstrapEventSink for spsc::Sender<BootstrapEvent> {
@@ -80,6 +95,7 @@ pub(crate) trait Backend: fmt::Debug {
         &'a self,
         context: &'a Context,
         state: &'a mut AgentInstanceDocument,
+        control: &'a mut Option<InstanceControl>,
     ) -> BackendFuture<'a, StopOutput>;
 
     fn stop_base_runtime<'a>(
@@ -117,8 +133,10 @@ pub(crate) trait Backend: fmt::Debug {
         &'a self,
         context: &'a Context,
         state: &'a AgentInstanceDocument,
+        control: &'a mut Option<InstanceControl>,
+        retry_epoch: Option<u64>,
         bootstrap_events: Option<&'a mut dyn BootstrapEventSink>,
-    ) -> BackendFuture<'a, ()>;
+    ) -> BackendFuture<'a, BootstrapOutcome>;
 
     fn stop_instance<'a>(
         &'a self,
@@ -126,6 +144,7 @@ pub(crate) trait Backend: fmt::Debug {
         network: &'a InstanceNetwork,
         input: StopInstanceInput<'a>,
         backend_state: &'a mut BackendState,
+        control: &'a mut Option<InstanceControl>,
     ) -> BackendFuture<'a, StopOutput>;
 
     fn reconcile_instance<'a>(
@@ -136,12 +155,22 @@ pub(crate) trait Backend: fmt::Debug {
         state: &'a mut AgentInstanceDocument,
     ) -> BackendFuture<'a, ReconcileOutput>;
 
-    fn reconcile_host_inputs<'a>(
+    fn reconcile_runtime_secrets<'a>(
         &'a self,
         context: &'a Context,
         network: &'a InstanceNetwork,
         manifest: &'a AgentManifestContext,
         state: &'a mut AgentInstanceDocument,
+    ) -> BackendFuture<'a, ReconcileRuntimeSecretsOutput>;
+
+    fn reconcile_host_inputs<'a>(
+        &'a self,
+        context: &'a Context,
+        network: &'a InstanceNetwork,
+        manifest: &'a AgentManifestContext,
+        state: &'a AgentInstanceDocument,
+        secret_files: &'a [SeedFile],
+        control: &'a mut Option<InstanceControl>,
     ) -> BackendFuture<'a, ReconcileHostInputsOutput>;
 
     fn ensure_attached<'a>(
@@ -249,10 +278,22 @@ pub(crate) struct ReconcileOutput {
     pub host_ports: std::collections::BTreeMap<String, PortMappingState>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReconcileRuntimeSecretsOutput {
+    pub secret_files: Vec<SeedFile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub(crate) struct ReconcileHostInputsOutput {
-    pub guest_files_updated: u16,
-    pub guest_file_failures: u16,
+    pub files_updated: u16,
+    pub file_failures: u16,
+    pub file_errors: Vec<GuestFileReconcileError>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct GuestFileReconcileError {
+    pub path: String,
+    pub error: String,
 }
 
 #[cfg(test)]

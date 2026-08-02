@@ -48,7 +48,7 @@ mod tests {
         decode_guest_message_line, decode_host_message_line, encode_guest_message_line, encode_host_message_line,
     };
     use crate::server_guest::{
-        GUEST_CONTROL_PROTOCOL_VERSION, GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostAccept,
+        GUEST_CONTROL_PROTOCOL_VERSION, GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostCommand,
         HostMessage, HostMessageKind,
     };
 
@@ -142,12 +142,12 @@ mod tests {
     }
 
     fn host_message() -> impl Strategy<Value = HostMessage> {
-        (bounded_text(), bounded_text()).prop_map(|(id, instance)| {
+        (bounded_text(), bounded_text()).prop_map(|(id, command)| {
             HostMessage::new(
                 id,
-                HostMessageKind::Accept(HostAccept {
-                    instance,
-                    protocol_version: GUEST_CONTROL_PROTOCOL_VERSION,
+                HostMessageKind::Command(HostCommand {
+                    command,
+                    payload: serde_json::Value::Null,
                 }),
             )
         })

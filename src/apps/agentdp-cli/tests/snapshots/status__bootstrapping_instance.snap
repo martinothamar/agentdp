@@ -4,11 +4,12 @@ status altinn-studio/0
 status: running
 instance: altinn-studio/replica-0
 desired generation: 1
-observed generation: 1
+observed generation: 0
 target: active
 process: running
 pid: $PID
 work: bootstrap
+host inputs: pending (observed generation 0)
 readiness: unknown
 disk: $TMP/home/.agentdp/agents/altinn-studio/instances/0/disk.qcow2
 seed: $TMP/home/.agentdp/agents/altinn-studio/instances/0/seed.img

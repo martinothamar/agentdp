@@ -25,10 +25,10 @@ pub(crate) struct Collected {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuntimeHostInputs {
-    pub files: Vec<SeedFile>,
-    pub runtime_secrets: SecretBindings,
+pub(crate) struct RuntimeSecrets {
+    pub live: SecretBindings,
     pub stored_secrets: SecretBindings,
+    pub files: Vec<SeedFile>,
 }
 
 #[derive(Debug, Error)]
@@ -171,12 +171,12 @@ async fn collect_ca_seed(
     Ok(())
 }
 
-pub(crate) async fn collect_runtime_host_inputs(
+pub(crate) async fn collect_runtime_secrets(
     context: &Context,
     manifest_path: &Path,
     manifest: &AgentManifest,
     existing_secrets: &SecretBindings,
-) -> Result<RuntimeHostInputs, Error> {
+) -> Result<RuntimeSecrets, Error> {
     let manifest_dir = manifest_path
         .parent()
         .ok_or_else(|| Error::MissingManifestParent(manifest_path.to_path_buf()))?;
@@ -184,17 +184,8 @@ pub(crate) async fn collect_runtime_host_inputs(
     let layout = GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout;
     let materialization = MaterializationContext::new(existing_secrets);
     let mut files = Vec::new();
-    let mut runtime_secrets = SecretBindings::default();
-    collect_home_seed(context, &manifest_dir.join("data/home"), layout.agent_home, &mut files).await?;
-    collect_host_input_files(
-        context,
-        &requirements,
-        layout,
-        materialization,
-        &mut files,
-        &mut runtime_secrets,
-    )
-    .await?;
+    let mut live = SecretBindings::default();
+    collect_secret_host_input_files(context, &requirements, layout, materialization, &mut files, &mut live).await?;
     if requirements.has_mediated_env_secret_inputs() {
         let materialized = materialize_required_custom_env(
             context,
@@ -204,14 +195,70 @@ pub(crate) async fn collect_runtime_host_inputs(
             "runtime custom env",
         )
         .await?;
-        runtime_secrets.extend(materialized.secrets);
+        live.extend(materialized.secrets);
     }
-    let stored_secrets = runtime_secrets.redacted();
-    Ok(RuntimeHostInputs {
-        files: dedupe_by_path(files),
-        runtime_secrets,
+    let stored_secrets = live.redacted();
+    Ok(RuntimeSecrets {
+        live,
         stored_secrets,
+        files: dedupe_by_path(files),
     })
+}
+
+pub(crate) async fn collect_runtime_host_files(
+    context: &Context,
+    manifest_path: &Path,
+    manifest: &AgentManifest,
+    existing_secrets: &SecretBindings,
+    secret_files: &[SeedFile],
+) -> Result<Vec<SeedFile>, Error> {
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or_else(|| Error::MissingManifestParent(manifest_path.to_path_buf()))?;
+    let requirements = manifest.host_input_requirements();
+    let layout = GuestOsAdapter::for_os(manifest.spec.image.os).capabilities().layout;
+    let mut files = Vec::new();
+    let mut ignored_secrets = SecretBindings::default();
+    collect_home_seed(context, &manifest_dir.join("data/home"), layout.agent_home, &mut files).await?;
+    collect_non_secret_host_input_files(
+        context,
+        &requirements,
+        layout,
+        MaterializationContext::new(existing_secrets),
+        &mut files,
+        &mut ignored_secrets,
+    )
+    .await?;
+    files.extend_from_slice(secret_files);
+    Ok(dedupe_by_path(files))
+}
+
+async fn collect_secret_host_input_files(
+    context: &Context,
+    requirements: &HostInputRequirements,
+    layout: GuestLayout,
+    materialization: MaterializationContext<'_>,
+    files: &mut Vec<SeedFile>,
+    secrets: &mut SecretBindings,
+) -> Result<(), Error> {
+    for requirement in requirements.files().iter().filter(|file| file.produces_secrets()) {
+        collect_host_input_file(context, requirement, layout, materialization, files, secrets).await?;
+    }
+    Ok(())
+}
+
+async fn collect_non_secret_host_input_files(
+    context: &Context,
+    requirements: &HostInputRequirements,
+    layout: GuestLayout,
+    materialization: MaterializationContext<'_>,
+    files: &mut Vec<SeedFile>,
+    secrets: &mut SecretBindings,
+) -> Result<(), Error> {
+    for requirement in requirements.files().iter().filter(|file| !file.produces_secrets()) {
+        collect_host_input_file(context, requirement, layout, materialization, files, secrets).await?;
+    }
+    Ok(())
 }
 
 async fn collect_host_input_files(
@@ -601,8 +648,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        MaterializationContext, SecretBindings, collect, collect_host_input_file_from_path,
-        collect_runtime_host_inputs, guest_tool_path, materialize_custom_env,
+        MaterializationContext, SecretBindings, collect, collect_host_input_file_from_path, collect_runtime_host_files,
+        collect_runtime_secrets, guest_tool_path, materialize_custom_env,
     };
     use agentdp_core::Context;
     use agentdp_core::manifest::AgentManifest;
@@ -633,26 +680,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_host_inputs_include_manifest_local_home_seed_files() {
+    async fn runtime_host_files_include_manifest_local_home_seed_files() {
         let temp = TestTempDir::create("qemu-host-seed-runtime-home");
         let manifest_path = temp.write("agent.yaml", agentdp_test_support::manifest::minimal());
         temp.write("data/home/.codex/AGENTS.md", "agent instructions\n");
         temp.write("data/home/.env", "secret=do-not-copy-as-home\n");
         let manifest = manifest(&manifest_path);
 
+        let files = collect_runtime_host_files(
+            &Context::quiet(),
+            &manifest_path,
+            &manifest,
+            &SecretBindings::default(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let paths = files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/data/home/.codex/AGENTS.md"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_secrets_do_not_depend_on_home_seed() {
+        let temp = TestTempDir::create("qemu-host-seed-runtime-secrets");
+        let manifest_path = temp.write("agent.yaml", agentdp_test_support::manifest::minimal());
+        temp.write("data/home", "not a directory\n");
+        let manifest = manifest(&manifest_path);
+
         let collected =
-            collect_runtime_host_inputs(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
+            collect_runtime_secrets(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
                 .await
                 .unwrap();
 
-        let paths = collected
-            .files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["/data/home/.codex/AGENTS.md"]);
-        assert!(collected.runtime_secrets.is_empty());
+        assert!(collected.live.is_empty());
         assert!(collected.stored_secrets.is_empty());
+        assert!(collected.files.is_empty());
     }
 
     #[tokio::test]
@@ -834,10 +897,9 @@ spec:
         temp.write(".env", "OTHER=value\n");
         let manifest = manifest(&manifest_path);
 
-        let error =
-            collect_runtime_host_inputs(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
-                .await
-                .unwrap_err();
+        let error = collect_runtime_secrets(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("GITHUB_TOKEN"));
     }
@@ -848,10 +910,9 @@ spec:
         let manifest_path = write_mediated_manifest(&temp, "mediated-auth", GITHUB_MEDIATED_PLUGIN);
         let manifest = manifest(&manifest_path);
 
-        let error =
-            collect_runtime_host_inputs(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
-                .await
-                .unwrap_err();
+        let error = collect_runtime_secrets(&Context::quiet(), &manifest_path, &manifest, &SecretBindings::default())
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("runtime custom env"));
     }

@@ -28,15 +28,7 @@ pub(crate) enum Error {
     },
     #[error("failed to serialize event log record: {0}")]
     Serialize(#[source] serde_json::Error),
-    #[error("failed to parse final event sequence in {path}: {source}")]
-    ParseSequence {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error(
-        "failed to find final event sequence in {path}; final record is larger than {max_bytes} bytes or malformed"
-    )]
+    #[error("failed to find a valid event sequence in the final {max_bytes} bytes of {path}")]
     MissingSequence { path: PathBuf, max_bytes: u64 },
     #[error("failed to append event log {path}: {source}")]
     Append {
@@ -165,10 +157,72 @@ async fn open_writer(path: &Path) -> Result<BufWriter<tokio::fs::File>, Error> {
     Ok(BufWriter::new(file))
 }
 
-pub(crate) async fn next_sequence(path: &Path) -> Result<u64, Error> {
+pub(crate) struct SequencePlan {
+    path: PathBuf,
+    next_sequence: u64,
+    repair: SequenceRepair,
+}
+
+enum SequenceRepair {
+    None,
+    Truncate { len: u64, terminate: bool },
+}
+
+impl SequencePlan {
+    fn unchanged(path: &Path, next_sequence: u64) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            next_sequence,
+            repair: SequenceRepair::None,
+        }
+    }
+
+    fn repair(path: &Path, next_sequence: u64, len: u64, terminate: bool) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            next_sequence,
+            repair: SequenceRepair::Truncate { len, terminate },
+        }
+    }
+
+    pub(crate) async fn apply(self) -> Result<u64, Error> {
+        let SequenceRepair::Truncate { len, terminate } = self.repair else {
+            return Ok(self.next_sequence);
+        };
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .await
+            .map_err(|source| Error::Append {
+                path: self.path.clone(),
+                source,
+            })?;
+        file.set_len(len).await.map_err(|source| Error::Append {
+            path: self.path.clone(),
+            source,
+        })?;
+        if terminate {
+            file.seek(SeekFrom::Start(len)).await.map_err(|source| Error::Append {
+                path: self.path.clone(),
+                source,
+            })?;
+            file.write_all(b"\n").await.map_err(|source| Error::Append {
+                path: self.path.clone(),
+                source,
+            })?;
+            file.flush().await.map_err(|source| Error::Append {
+                path: self.path,
+                source,
+            })?;
+        }
+        Ok(self.next_sequence)
+    }
+}
+
+pub(crate) async fn inspect_sequence(path: &Path) -> Result<SequencePlan, Error> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(SequencePlan::unchanged(path, 1)),
         Err(source) => {
             return Err(Error::Read {
                 path: path.to_path_buf(),
@@ -185,7 +239,7 @@ pub(crate) async fn next_sequence(path: &Path) -> Result<u64, Error> {
         })?
         .len();
     if file_len == 0 {
-        return Ok(1);
+        return Ok(SequencePlan::unchanged(path, 1));
     }
 
     let max_window = file_len.min(EVENT_LOG_SEQUENCE_MAX_TAIL_BYTES);
@@ -208,15 +262,30 @@ pub(crate) async fn next_sequence(path: &Path) -> Result<u64, Error> {
             source,
         })?;
 
-        if start == 0 && buffer.iter().all(u8::is_ascii_whitespace) {
-            return Ok(1);
-        }
-        if let Some(line) = final_complete_line(&buffer, start == 0) {
-            let record = serde_json::from_slice::<SequenceRecord>(line).map_err(|source| Error::ParseSequence {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            return Ok(record.sequence.saturating_add(1));
+        match inspect_sequence_tail(&buffer, start == 0) {
+            SequenceTail::Valid { sequence, end, repair } => {
+                let Ok(record_end) = u64::try_from(end) else {
+                    return Err(Error::MissingSequence {
+                        path: path.to_path_buf(),
+                        max_bytes: EVENT_LOG_SEQUENCE_MAX_TAIL_BYTES,
+                    });
+                };
+                let next_sequence = sequence.saturating_add(1);
+                return Ok(if repair {
+                    SequencePlan::repair(path, next_sequence, start.saturating_add(record_end), true)
+                } else {
+                    SequencePlan::unchanged(path, next_sequence)
+                });
+            }
+            SequenceTail::Empty { repair: false } => return Ok(SequencePlan::unchanged(path, 1)),
+            SequenceTail::Empty { repair: true } => return Ok(SequencePlan::repair(path, 1, 0, false)),
+            SequenceTail::Corrupt => {
+                return Err(Error::MissingSequence {
+                    path: path.to_path_buf(),
+                    max_bytes: EVENT_LOG_SEQUENCE_MAX_TAIL_BYTES,
+                });
+            }
+            SequenceTail::NeedMore => {}
         }
 
         if window == max_window {
@@ -234,32 +303,68 @@ struct SequenceRecord {
     sequence: u64,
 }
 
-fn final_complete_line(buffer: &[u8], includes_file_start: bool) -> Option<&[u8]> {
-    let mut end = buffer.len();
-    while end > 0 && buffer[end - 1].is_ascii_whitespace() {
-        end -= 1;
+enum SequenceTail {
+    Valid { sequence: u64, end: usize, repair: bool },
+    Empty { repair: bool },
+    NeedMore,
+    Corrupt,
+}
+
+fn inspect_sequence_tail(buffer: &[u8], includes_file_start: bool) -> SequenceTail {
+    let mut limit = buffer.len();
+    let mut torn_tail = false;
+    loop {
+        let mut end = limit;
+        while end > 0 && buffer[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return if includes_file_start {
+                SequenceTail::Empty { repair: torn_tail }
+            } else {
+                SequenceTail::NeedMore
+            };
+        }
+
+        let terminated = buffer[end..limit].contains(&b'\n');
+        let delimiter = buffer[..end].iter().rposition(|byte| *byte == b'\n');
+        let line_start = delimiter.map_or(0, |position| position + 1);
+        if line_start == 0 && !includes_file_start {
+            return SequenceTail::NeedMore;
+        }
+
+        match serde_json::from_slice::<SequenceRecord>(&buffer[line_start..end]) {
+            Ok(record) => {
+                return SequenceTail::Valid {
+                    sequence: record.sequence,
+                    end,
+                    repair: torn_tail || !terminated,
+                };
+            }
+            Err(_) if terminated => return SequenceTail::Corrupt,
+            Err(_) => {
+                torn_tail = true;
+                let Some(delimiter) = delimiter else {
+                    return SequenceTail::Empty { repair: true };
+                };
+                limit = delimiter + 1;
+            }
+        }
     }
-    if end == 0 {
-        return None;
-    }
-    let line_start = buffer[..end]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position + 1);
-    if line_start == 0 && !includes_file_start {
-        return None;
-    }
-    let line = &buffer[line_start..end];
-    (!line.iter().all(u8::is_ascii_whitespace)).then_some(line)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::next_sequence;
+    use super::{EVENT_LOG_SEQUENCE_MAX_TAIL_BYTES, Error, inspect_sequence};
 
     static NEXT_TEST_LOG: AtomicU64 = AtomicU64::new(1);
+
+    async fn next_sequence(path: &Path) -> Result<u64, Error> {
+        inspect_sequence(path).await?.apply().await
+    }
 
     #[tokio::test(flavor = "local")]
     async fn next_sequence_returns_one_for_missing_log() {
@@ -289,6 +394,126 @@ mod tests {
         write_log(&path, contents).await.expect("write test log");
 
         assert_eq!(next_sequence(&path).await.expect("next sequence"), 8);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_terminates_an_unterminated_valid_record() {
+        let path = test_path("unterminated-valid-record");
+        write_log(&path, b"{\"sequence\":41,\"kind\":\"last\"}")
+            .await
+            .expect("write test log");
+
+        assert_eq!(next_sequence(&path).await.expect("next sequence"), 42);
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read repaired log"),
+            b"{\"sequence\":41,\"kind\":\"last\"}\n"
+        );
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_recovers_from_trailing_nul_bytes() {
+        let path = test_path("trailing-nuls");
+        let mut contents = b"{\"sequence\":41,\"kind\":\"last\"}\n".to_vec();
+        contents.extend(std::iter::repeat_n(0, 937));
+        write_log(&path, contents).await.expect("write test log");
+
+        assert_eq!(next_sequence(&path).await.expect("next sequence"), 42);
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read repaired log"),
+            b"{\"sequence\":41,\"kind\":\"last\"}\n"
+        );
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_recovers_from_truncated_final_record() {
+        let path = test_path("truncated-final-record");
+        write_log(
+            &path,
+            b"{\"sequence\":41,\"kind\":\"last\"}\n{\"sequence\":42,\"kind\":\"truncated",
+        )
+        .await
+        .expect("write test log");
+
+        assert_eq!(next_sequence(&path).await.expect("next sequence"), 42);
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read repaired log"),
+            b"{\"sequence\":41,\"kind\":\"last\"}\n"
+        );
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn sequence_inspection_defers_torn_tail_repair_until_applied() {
+        let path = test_path("deferred-truncated-final-record");
+        let contents = b"{\"sequence\":41,\"kind\":\"last\"}\n{\"sequence\":42,\"kind\":\"truncated";
+        write_log(&path, contents).await.expect("write test log");
+
+        let plan = inspect_sequence(&path).await.expect("inspect sequence");
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read unmodified log"),
+            contents,
+            "inspection must be read-only"
+        );
+
+        assert_eq!(plan.apply().await.expect("apply sequence repair"), 42);
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read repaired log"),
+            b"{\"sequence\":41,\"kind\":\"last\"}\n"
+        );
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_recovers_from_truncated_only_record() {
+        let path = test_path("truncated-only-record");
+        write_log(&path, b"{\"sequence\":1,\"kind\":\"truncated")
+            .await
+            .expect("write test log");
+
+        assert_eq!(next_sequence(&path).await.expect("next sequence"), 1);
+        assert_eq!(tokio::fs::read(&path).await.expect("read repaired log"), b"");
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_rejects_terminated_corruption_after_valid_record() {
+        let path = test_path("terminated-corruption-after-valid");
+        let contents = b"{\"sequence\":41,\"kind\":\"last\"}\n{malformed}\n";
+        write_log(&path, contents).await.expect("write test log");
+
+        assert!(matches!(next_sequence(&path).await, Err(Error::MissingSequence { .. })));
+        assert_eq!(tokio::fs::read(&path).await.expect("read unchanged log"), contents);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_rejects_terminated_corruption_as_only_record() {
+        let path = test_path("terminated-corruption-only");
+        let contents = b"{malformed}\n";
+        write_log(&path, contents).await.expect("write test log");
+
+        assert!(matches!(next_sequence(&path).await, Err(Error::MissingSequence { .. })));
+        assert_eq!(tokio::fs::read(&path).await.expect("read unchanged log"), contents);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_does_not_hide_terminated_corruption_before_torn_tail() {
+        let path = test_path("terminated-corruption-before-torn-tail");
+        let contents = b"{\"sequence\":41,\"kind\":\"last\"}\n{malformed}\n{\"sequence\":42";
+        write_log(&path, contents).await.expect("write test log");
+
+        assert!(matches!(next_sequence(&path).await, Err(Error::MissingSequence { .. })));
+        assert_eq!(tokio::fs::read(&path).await.expect("read unchanged log"), contents);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn next_sequence_preserves_oversized_unterminated_only_record() {
+        let path = test_path("oversized-unterminated-only");
+        let contents =
+            vec![b'x'; usize::try_from(EVENT_LOG_SEQUENCE_MAX_TAIL_BYTES).expect("tail bound fits usize") + 1];
+        write_log(&path, &contents).await.expect("write test log");
+
+        assert!(matches!(next_sequence(&path).await, Err(Error::MissingSequence { .. })));
+        assert_eq!(
+            tokio::fs::metadata(&path).await.expect("inspect unchanged log").len(),
+            u64::try_from(contents.len()).expect("test contents length fits u64")
+        );
     }
 
     fn test_path(name: &str) -> std::path::PathBuf {

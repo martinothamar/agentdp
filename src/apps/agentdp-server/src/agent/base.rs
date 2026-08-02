@@ -127,6 +127,7 @@ pub(super) async fn ensure_agent_base_ready(
         )
         .await?;
     let mut runtime = base_bootstrap_runtime_document(agent, instance, key, &preparation.manifest, output.state);
+    let mut control = None;
     runtime.status.phase = AgentInstancePhase::Starting;
     events.emit(BootstrapEvent::Diagnostic {
         level: EventLevel::Info,
@@ -139,15 +140,22 @@ pub(super) async fn ensure_agent_base_ready(
         level: EventLevel::Info,
         message: "waiting for agent base bootstrap".to_owned(),
     });
-    let bootstrap = backend.wait_bootstrap(context, &runtime, Some(events)).await;
+    let bootstrap = backend
+        .wait_bootstrap(context, &runtime, &mut control, None, Some(events))
+        .await;
     runtime.status.phase = AgentInstancePhase::Stopping;
     events.emit(BootstrapEvent::Diagnostic {
         level: EventLevel::Info,
         message: "stopping agent base bootstrap VM".to_owned(),
     });
-    let shutdown = backend.stop_base(context, &mut runtime).await;
+    let shutdown = backend.stop_base(context, &mut runtime, &mut control).await;
     runtime.status.phase = AgentInstancePhase::Stopped;
-    bootstrap?;
+    match bootstrap? {
+        backend::BootstrapOutcome::Passed { .. } => {}
+        backend::BootstrapOutcome::Failed { error, .. } => {
+            return Err(Error::AgentBaseBootstrapFailed { error });
+        }
+    }
     shutdown?;
 
     let now = agentdp_platform::time::rfc3339_utc_now();

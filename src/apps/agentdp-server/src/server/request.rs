@@ -460,9 +460,8 @@ async fn instance_ps(
     let mut instances = Vec::new();
     for agent in agents {
         let (respond, receive) = oneshot::channel();
-        if agent.send(AgentCommand::ListItems { respond }).is_ok() {
-            instances.extend(receive.await.unwrap_or_default());
-        }
+        agent.send(AgentCommand::ListItems { respond })?;
+        instances.extend(receive_agent_response(agent.agent(), receive).await?);
     }
     instances.sort_by(|left, right| {
         left.agent

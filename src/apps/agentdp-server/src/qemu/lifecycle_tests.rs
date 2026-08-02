@@ -164,6 +164,7 @@ async fn stop_instance_uses_pid_file_when_in_memory_pid_is_missing() {
     tokio::fs::write(&state.pid_file, u32::MAX.to_string()).await.unwrap();
     let (agent, instance) = test_instance_names();
 
+    let mut control = None;
     let output = super::stop_instance(
         &Context::quiet(),
         &network_runtime,
@@ -174,6 +175,7 @@ async fn stop_instance_uses_pid_file_when_in_memory_pid_is_missing() {
             status: AgentInstancePhase::Failed,
         },
         &mut state,
+        &mut control,
     )
     .await
     .unwrap();
@@ -246,6 +248,48 @@ async fn unconfigured_runtime_secrets_are_cleared_before_runtime_host_input_coll
     ));
 
     assert!(state.mediated_secrets.is_empty());
+}
+
+#[tokio::test(flavor = "local")]
+async fn runtime_secret_refresh_fails_when_mediated_network_is_not_running() {
+    let network_runtime = test_instance_network();
+    let qemu_dir = test_runtime_dir();
+    let mut state = test_state(&qemu_dir, test_network_in_dir(&qemu_dir));
+    state.mediated_secrets.insert(
+        SecretBinding::new_with_placeholder(
+            "CODEX_AUTH_TOKEN",
+            Some("AGENTDP_SECRET_CODEX_AUTH_TOKEN_TEST".to_owned()),
+            "stored-token",
+            &["chatgpt.com".to_owned()],
+        )
+        .expect("test secret binding"),
+    );
+    let instance_network = NetworkState {
+        mode: NetworkModeState::Mediated,
+        allow: NetworkAllowState::All,
+        ipv6: NetworkIpv6State::default(),
+        ports: BTreeMap::new(),
+        runtime: None,
+    };
+    let context = Context::quiet();
+    let manifest = test_loaded_manifest().await;
+
+    let error = super::reconcile_runtime_secrets(
+        super::RuntimeInput {
+            context: &context,
+            instance_network: &network_runtime,
+            instance_status: AgentInstancePhase::Running,
+            agent: "test-manifest",
+            instance: "test-instance",
+            network: &instance_network,
+            manifest: &manifest,
+        },
+        &mut state,
+    )
+    .await
+    .expect_err("missing mediated network must be retried");
+
+    assert!(error.to_string().contains("network is not running"));
 }
 
 #[tokio::test(flavor = "local")]

@@ -8,16 +8,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agentdp_core::Context;
 use agentdp_core::agent::{
     AgentBaseKey, AgentDocument, AgentEvent, AgentInstanceBootstrapState, AgentInstanceBootstrapStepStatus,
-    AgentInstanceDocument, AgentInstanceEvent, AgentInstanceEventEnvelope, AgentInstanceEventSource, AgentInstanceId,
-    AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind, AgentInstancePhase, AgentInstanceTarget,
-    AgentStatusPhase, BackendState, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State,
-    NetworkModeState, NetworkState, PortProtocolState, ProcessStatus, QemuImageState, QemuInstanceNetworkState,
-    QemuMediatedCaState, QemuState, ReconciliationState, assign_port_mappings,
+    AgentInstanceDocument, AgentInstanceEvent, AgentInstanceEventEnvelope, AgentInstanceEventSource,
+    AgentInstanceHostInputsPhase, AgentInstanceId, AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind,
+    AgentInstancePhase, AgentInstanceTarget, AgentStatusPhase, BackendState, BootstrapEvent, EventLevel, InstanceName,
+    NetworkAllowState, NetworkIpv6State, NetworkModeState, NetworkState, OperationResult, PortProtocolState,
+    ProcessStatus, QemuImageState, QemuInstanceNetworkState, QemuMediatedCaState, QemuState, ReconciliationState,
+    assign_port_mappings,
 };
 use agentdp_core::doctor::DoctorReport;
 use agentdp_core::manifest::plugins::codex::Codex;
 use agentdp_core::manifest::plugins::{AuthMode, codex};
 use agentdp_core::manifest::{AgentManifest, AgentPhase, GuestPort, NetworkMode, NetworkProtocol, Secret};
+use agentdp_core::provisioning::SeedFile;
 use agentdp_core::provisioning::image::CatalogImage;
 use agentdp_core::provisioning::secrets::SecretBindings;
 use agentdp_ds::local::{oneshot, spsc};
@@ -58,6 +60,658 @@ async fn cold_apply_reaches_ready_without_child_actors() {
 }
 
 #[tokio::test(flavor = "local")]
+async fn malformed_persisted_agent_state_quarantines_agent() {
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    let path = layout.agent_document(&agent_name);
+    let malformed = b"metadata: [invalid\n";
+    tokio::fs::create_dir_all(path.parent().expect("agent document parent"))
+        .await
+        .expect("create agent directory");
+    tokio::fs::write(&path, malformed)
+        .await
+        .expect("write malformed agent state");
+
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        Rc::new(FakeBackend::default()),
+        tailscale_service(),
+    );
+    let error = apply_result(&agent, manifest_context(manifest))
+        .await
+        .expect_err("apply must be rejected after persisted state fails to load");
+    assert!(matches!(
+        error,
+        Error::PersistedStateUnavailable { message, .. } if message.contains("failed to parse agent document")
+    ));
+    assert!(
+        !agent.is_finished(),
+        "load failure must remain quarantined in the registry"
+    );
+    let (respond, receive) = oneshot::channel();
+    agent
+        .send(AgentCommand::ListItems { respond })
+        .expect("quarantined agent accepts list command");
+    assert!(matches!(
+        receive.await.expect("list response"),
+        Err(Error::PersistedStateUnavailable { .. })
+    ));
+    assert_eq!(tokio::fs::read(path).await.expect("read agent state"), malformed);
+}
+
+#[tokio::test(flavor = "local")]
+async fn malformed_persisted_instance_state_quarantines_agent() {
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    let _document = persisted_running_instance(&layout, &agent_name, &manifest).await;
+    let path = layout.instance(&agent_name, AgentInstanceId::new(0)).instance_state();
+    let agent_events = layout.agent_events(&agent_name);
+    let instance_events = layout.instance(&agent_name, AgentInstanceId::new(0)).instance_events();
+    let malformed = b"metadata: [invalid\n";
+    tokio::fs::create_dir_all(path.parent().expect("instance document parent"))
+        .await
+        .expect("create instance directory");
+    tokio::fs::write(&path, malformed)
+        .await
+        .expect("write malformed instance state");
+
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        Rc::new(FakeBackend::default()),
+        tailscale_service(),
+    );
+    let error = apply_result(&agent, manifest_context(manifest))
+        .await
+        .expect_err("apply must be rejected after persisted instance state fails to load");
+    assert!(matches!(
+        error,
+        Error::PersistedStateUnavailable { message, .. } if message.contains("failed to parse instance document")
+    ));
+    assert!(
+        !agent.is_finished(),
+        "load failure must remain quarantined in the registry"
+    );
+    assert_eq!(tokio::fs::read(path).await.expect("read instance state"), malformed);
+    assert!(
+        !tokio::fs::try_exists(agent_events)
+            .await
+            .expect("inspect agent event log"),
+        "document validation must finish before the agent event writer starts"
+    );
+    assert!(
+        !tokio::fs::try_exists(instance_events)
+            .await
+            .expect("inspect instance event log"),
+        "document validation must finish before instance event writers start"
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn persisted_event_logs_are_all_validated_before_any_repair() {
+    let manifest = manifest_with(2);
+    let (layout, agent_name) = unique_layout(&manifest);
+    let first = persisted_running_instance(&layout, &agent_name, &manifest).await;
+    write_persisted_instance(&layout, &agent_name, AgentInstanceId::new(0), &first).await;
+    let mut second = first.clone();
+    second.metadata.id = AgentInstanceId::new(1);
+    second.metadata.name = InstanceName::new("replica-1");
+    write_persisted_instance(&layout, &agent_name, AgentInstanceId::new(1), &second).await;
+    let first_events = layout.instance(&agent_name, AgentInstanceId::new(0)).instance_events();
+    let second_events = layout.instance(&agent_name, AgentInstanceId::new(1)).instance_events();
+    let torn = b"{\"sequence\":1}\n{\"sequence\":2";
+    tokio::fs::write(&first_events, torn)
+        .await
+        .expect("write repairable event log");
+    tokio::fs::write(&second_events, b"not-json\n")
+        .await
+        .expect("write corrupt event log");
+
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        Rc::new(FakeBackend::default()),
+        tailscale_service(),
+    );
+    let error = apply_result(&agent, manifest_context(manifest))
+        .await
+        .expect_err("apply must be rejected when an event log is corrupt");
+
+    assert!(matches!(
+        error,
+        Error::PersistedStateUnavailable { message, .. }
+            if message.contains("failed to find a valid event sequence")
+    ));
+    assert_eq!(
+        tokio::fs::read(first_events).await.expect("read repairable event log"),
+        torn,
+        "a later validation failure must prevent earlier repair plans from being applied"
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn manifest_change_during_bootstrap_does_not_wedge_instance_work() {
+    let initial = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    let release_bootstrap = backend.pause_next_instance_bootstrap();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_instance_event(&mut stream, |event| {
+        matches!(event, AgentInstanceEvent::BootstrapStarted)
+    })
+    .await;
+    let changed = apply(&agent, manifest_context(manifest_with_code_server_host(1, 4090))).await;
+    release_bootstrap.try_send(());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation() && document.status.replicas.ready == 1
+    })
+    .await;
+    assert_eq!(ready.status.observed_generation, changed.generation());
+}
+
+#[tokio::test(flavor = "local")]
+async fn mediated_runtime_secrets_refresh_while_bootstrap_is_running() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let backend = Rc::new(FakeBackend::default());
+    let release_bootstrap = backend.pause_next_instance_bootstrap();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_instance_event(&mut stream, |event| {
+        matches!(event, AgentInstanceEvent::BootstrapStarted)
+    })
+    .await;
+
+    wait_for_count(
+        &backend.runtime_secret_reconciles,
+        1,
+        "runtime secret refresh during bootstrap",
+    )
+    .await;
+    assert_eq!(
+        *backend.host_input_reconciles.borrow(),
+        0,
+        "guest files must wait until bootstrap releases the control session"
+    );
+
+    release_bootstrap.try_send(());
+    wait_for_ready(&mut stream, 1).await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn backend_state_reconcile_waits_for_runtime_secrets() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    persist_ready_running_instance(&layout, &agent_name, &manifest).await;
+    let backend = Rc::new(FakeBackend::default());
+    let release_secrets = backend.pause_next_runtime_secret_reconcile();
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    let AgentStreamItem::Document(_) = recv_stream_item(&mut stream).await else {
+        panic!("first stream item should be loaded document");
+    };
+    wait_for_count(&backend.runtime_secret_reconciles, 1, "runtime secret refresh").await;
+    assert_eq!(
+        *backend.instance_reconciles.borrow(),
+        0,
+        "backend state reconciliation must not race runtime secret refresh"
+    );
+
+    release_secrets.try_send(());
+    wait_for_count(&backend.instance_reconciles, 1, "backend state reconciliation").await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn runtime_secret_failure_is_reported_and_triggers_backend_reconciliation() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_runtime_secret_reconciles(1);
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let _stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_count(&backend.runtime_secret_reconciles, 1, "failed runtime secret refresh").await;
+    wait_for_count(
+        &backend.instance_reconciles,
+        1,
+        "backend reconciliation after runtime secret failure",
+    )
+    .await;
+    let degraded = document(&agent).await;
+    let degraded_status = degraded.status.instances.get(&AgentInstanceId::new(0)).unwrap();
+    assert_eq!(degraded.status.replicas.ready, 0);
+    assert!(degraded.status.reconciling);
+    assert_eq!(degraded_status.host_inputs.phase, AgentInstanceHostInputsPhase::Failed);
+    assert_eq!(degraded_status.host_inputs.observed_generation, degraded.generation());
+    assert!(
+        degraded_status
+            .host_inputs
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("runtime secret refresh failed"))
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn failed_runtime_secret_repair_preserves_running_vm_during_backoff() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_runtime_secret_reconciles(1);
+    backend.fail_instance_reconciles(1);
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let _stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_count(&backend.instance_reconciles, 1, "failed backend repair").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(
+        *backend.instance_starts.borrow(),
+        1,
+        "failed ancillary repair must not restart a still-running VM"
+    );
+    assert_eq!(
+        *backend.runtime_secret_reconciles.borrow(),
+        1,
+        "runtime-secret backoff must govern the next repair attempt"
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn persisted_running_instance_preserves_runtime_repair_backoff() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    persist_ready_running_instance(&layout, &agent_name, &manifest).await;
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_runtime_secret_reconciles(1);
+    backend.fail_instance_reconciles(2);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    let AgentStreamItem::Document(_) = recv_stream_item(&mut stream).await else {
+        panic!("first stream item should be loaded document");
+    };
+    wait_for_count(&backend.runtime_secret_reconciles, 1, "failed runtime secret refresh").await;
+    wait_for_count(&backend.instance_reconciles, 1, "failed runtime repair").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(
+        *backend.instance_reconciles.borrow(),
+        1,
+        "ordinary lifecycle reconciliation must remain suppressed during repair backoff"
+    );
+    assert_eq!(
+        *backend.instance_starts.borrow(),
+        0,
+        "failed repair must not start another VM for a restored running instance"
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn guest_file_reconcile_uses_runtime_secret_snapshot() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let backend = Rc::new(FakeBackend::default());
+    let secret_file = SeedFile {
+        path: "/data/home/.codex/auth.json".to_owned(),
+        contents: br#"{"tokens":{"future_token":"snapshot-placeholder"}}"#.to_vec(),
+        permissions: "0600".to_owned(),
+        owner: None,
+    };
+    backend.set_runtime_secret_files(vec![secret_file.clone()]);
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_ready(&mut stream, 1).await;
+    wait_for_host_input_reconcile_count(&backend, 1).await;
+
+    assert_eq!(backend.reconciled_secret_files.borrow().as_slice(), &[secret_file]);
+}
+
+#[tokio::test(flavor = "local")]
+async fn guest_files_reconcile_after_terminal_bootstrap_failure() {
+    let manifest = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_instance_bootstraps(1);
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_instance_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentInstanceEvent::BootstrapFinished {
+                result: OperationResult::Failed { .. }
+            }
+        )
+    })
+    .await;
+    wait_for_host_input_reconcile_count(&backend, 1).await;
+
+    assert_eq!(*backend.host_input_reconciles.borrow(), 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn template_change_during_instance_create_discards_obsolete_instance() {
+    let initial = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    let release_create = backend.pause_next_instance_create();
+    let release_cleanup = backend.pause_next_instance_stop();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name.clone(),
+        layout.clone(),
+        agent_backend,
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_created_instances(&backend, 1).await;
+    let mut changed = manifest_with(1);
+    changed.spec.template.resources.memory = "3G".to_owned();
+    let changed = apply(&agent, manifest_context(changed)).await;
+    assert!(release_create.send(()).is_ok());
+    wait_for_count(&backend.instance_stops, 1, "obsolete instance cleanup").await;
+    let deleting = status(&agent, AgentInstanceId::new(0))
+        .await
+        .expect("obsolete instance remains addressable during cleanup");
+    assert_eq!(deleting.spec.target, AgentInstanceTarget::Active);
+    assert_eq!(deleting.status.phase, AgentInstancePhase::Deleting);
+    let persisted = tokio::fs::read_to_string(layout.instance(&agent_name, AgentInstanceId::new(0)).instance_state())
+        .await
+        .expect("read persisted cleanup marker");
+    let persisted: AgentInstanceDocument = serde_yaml::from_str(&persisted).expect("parse persisted cleanup marker");
+    assert_eq!(persisted.status.phase, AgentInstancePhase::Deleting);
+    assert!(release_cleanup.send(()).is_ok());
+
+    wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+    assert_eq!(*backend.instance_stops.borrow(), 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn scale_up_during_instance_create_keeps_compatible_materialization() {
+    let initial = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    let release_create = backend.pause_next_instance_create();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_created_instances(&backend, 1).await;
+    let scaled = scale(&agent, 2).await;
+    assert!(release_create.send(()).is_ok());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == scaled.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 2
+    })
+    .await;
+    assert_eq!(ready.status.replicas.active, 2);
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+    assert_eq!(*backend.instance_stops.borrow(), 0);
+}
+
+#[tokio::test(flavor = "local")]
+async fn stale_instance_create_failure_is_not_published_for_latest_generation() {
+    let initial = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_instance_creates(1);
+    let release_create = backend.pause_next_instance_create();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_created_instances(&backend, 1).await;
+    let mut changed = manifest_with(1);
+    changed.spec.template.resources.memory = "3G".to_owned();
+    let changed = apply(&agent, manifest_context(changed)).await;
+    assert!(release_create.send(()).is_ok());
+
+    let mut stale_failure_published = false;
+    loop {
+        match recv_stream_item(&mut stream).await {
+            AgentStreamItem::Event(event) => {
+                stale_failure_published |= matches!(
+                    event.event,
+                    AgentEvent::Diagnostic { ref message, .. } if message.contains("failed to create instance")
+                );
+            }
+            AgentStreamItem::Document(document)
+                if document.generation() == changed.generation()
+                    && document.status.observed_generation == document.generation()
+                    && document.status.replicas.ready == 1 =>
+            {
+                break;
+            }
+            AgentStreamItem::Document(_) => {}
+        }
+    }
+    assert!(!stale_failure_published);
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+}
+
+#[tokio::test(flavor = "local")]
+async fn persisted_deleting_instance_is_cleaned_before_latest_recreation() {
+    let initial = manifest_with(1);
+    let mut changed = manifest_with(1);
+    changed.spec.template.resources.memory = "3G".to_owned();
+    let (layout, agent_name) = unique_layout(&initial);
+    let initial_document =
+        AgentDocument::from_manifest("/tmp/initial.yaml", agent_name.clone(), &initial).expect("initial document");
+    let mut current_document = AgentDocument::from_manifest_after_existing(
+        "/tmp/changed.yaml",
+        agent_name.clone(),
+        &changed,
+        &initial_document,
+    )
+    .expect("changed document");
+    let current_base = AgentBaseKey::new("sha256-current");
+    current_document.mark_agent_base_ready(current_base);
+    let agent_path = layout.agent_document(&agent_name);
+    tokio::fs::create_dir_all(agent_path.parent().expect("agent document parent"))
+        .await
+        .expect("create agent directory");
+    tokio::fs::write(
+        &agent_path,
+        serde_yaml::to_string(&current_document).expect("serialize agent document"),
+    )
+    .await
+    .expect("persist agent document");
+
+    let id = AgentInstanceId::new(0);
+    let backend_state = fake_mediated_backend_state();
+    let network = NetworkState::new(
+        &backend_state,
+        NetworkAllowState::from(&initial.spec.network.allow),
+        NetworkIpv6State::default(),
+        assign_port_mappings(&initial, id).expect("old port mappings"),
+    );
+    let obsolete = AgentInstanceDocument::new(
+        agent_name.clone(),
+        id,
+        InstanceName::new("replica-0"),
+        initial_document.generation(),
+        AgentBaseKey::new("sha256-obsolete"),
+        initial.spec.template,
+        AgentInstanceTarget::Active,
+        AgentInstancePhase::Deleting,
+        network,
+        Vec::new(),
+        None,
+        backend_state,
+    );
+    write_persisted_instance(&layout, &agent_name, id, &obsolete).await;
+
+    let backend = Rc::new(FakeBackend::default());
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == current_document.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+
+    assert_eq!(ready.generation(), 2);
+    assert_eq!(*backend.instance_stops.borrow(), 1);
+    assert_eq!(backend.created_instances.borrow().len(), 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn persisted_deleted_instance_finishes_file_removal_without_repeating_stop() {
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    let mut deleted = persisted_running_instance(&layout, &agent_name, &manifest).await;
+    deleted.status.phase = AgentInstancePhase::Deleted;
+    deleted.status.clear_readiness();
+    write_persisted_instance(&layout, &agent_name, AgentInstanceId::new(0), &deleted).await;
+
+    let backend = Rc::new(FakeBackend::default());
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_ready(&mut stream, 1).await;
+
+    assert_eq!(*backend.instance_stops.borrow(), 0);
+    assert_eq!(backend.created_instances.borrow().len(), 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn persisted_deleted_inactive_instance_does_not_recreate_its_document() {
+    let manifest = manifest_with(0);
+    let (layout, agent_name) = unique_layout(&manifest);
+    let mut deleted = persisted_running_instance(&layout, &agent_name, &manifest).await;
+    deleted.status.phase = AgentInstancePhase::Deleted;
+    deleted.status.clear_readiness();
+    let id = AgentInstanceId::new(0);
+    write_persisted_instance(&layout, &agent_name, id, &deleted).await;
+
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name.clone(),
+        layout.clone(),
+        Rc::new(FakeBackend::default()),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentEvent::InstanceDeleted { instance_id } if *instance_id == id
+        )
+    })
+    .await;
+    wait_for_document(&mut stream, |document| {
+        document.status.instances.is_empty() && !document.status.reconciling
+    })
+    .await;
+
+    assert!(
+        !tokio::fs::try_exists(layout.instance(&agent_name, id).instance_state())
+            .await
+            .expect("inspect removed instance document")
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn stale_base_failure_is_not_published_for_latest_generation() {
+    let initial = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    backend.fail_base_creates(1);
+    let release_base = backend.pause_next_base_create();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_count(&backend.created_bases, 1, "obsolete agent base create").await;
+    let mut changed = manifest_with(1);
+    changed.spec.bootstrap.packages.push("htop".to_owned());
+    let changed = apply(&agent, manifest_context(changed)).await;
+    assert!(release_base.send(()).is_ok());
+
+    let mut stale_failure_published = false;
+    loop {
+        match recv_stream_item(&mut stream).await {
+            AgentStreamItem::Event(event) => {
+                stale_failure_published |= matches!(event.event, AgentEvent::AgentBaseFailed { .. });
+            }
+            AgentStreamItem::Document(document)
+                if document.generation() == changed.generation()
+                    && document.status.observed_generation == document.generation()
+                    && document.status.replicas.ready == 1 =>
+            {
+                assert!(document.status.agent_base.last_error.is_none());
+                break;
+            }
+            AgentStreamItem::Document(_) => {}
+        }
+    }
+    assert!(!stale_failure_published);
+}
+
+#[tokio::test(flavor = "local")]
 async fn scale_up_down_and_back_up_keeps_control_flow_local_to_agent() {
     let (agent, mut stream) = start_agent(&manifest_with(1)).await;
     let first = wait_for_ready(&mut stream, 1).await;
@@ -83,6 +737,213 @@ async fn scale_up_down_and_back_up_keeps_control_flow_local_to_agent() {
     assert_eq!(restarted.replicas(), 1);
     let restarted = wait_for_ready(&mut stream, 1).await;
     assert_eq!(restarted.status.replicas.ready, 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn scale_back_up_while_stop_is_running_converges_to_latest_generation() {
+    let (agent, mut stream, backend) = start_agent_with_backend(&manifest_with(1)).await;
+    wait_for_ready(&mut stream, 1).await;
+    let release_stop = backend.pause_next_instance_stop();
+
+    scale(&agent, 0).await;
+    wait_for_count(&backend.instance_stops, 1, "instance stop").await;
+    let restarted = scale(&agent, 1).await;
+    release_stop.try_send(());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == restarted.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert_eq!(ready.status.replicas.active, 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn stale_stop_completion_preserves_latest_desired_port_mapping() {
+    let initial = manifest_with_code_server_host(1, 4090);
+    let (agent, mut stream, backend) = start_agent_with_backend(&initial).await;
+    wait_for_ready(&mut stream, 1).await;
+    let release_stop = backend.pause_next_instance_stop();
+
+    scale(&agent, 0).await;
+    wait_for_count(&backend.instance_stops, 1, "instance stop").await;
+    let changed = apply(&agent, manifest_context(manifest_with_code_server_host(1, 4091))).await;
+    release_stop.try_send(());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert_eq!(
+        ready.status.instances[&AgentInstanceId::new(0)].network.ports["code_server"].host,
+        Some(4091)
+    );
+}
+
+#[tokio::test(flavor = "local")]
+async fn stale_start_completion_preserves_latest_desired_port_mapping() {
+    let initial = manifest_with_code_server_host(1, 4090);
+    let backend = Rc::new(FakeBackend::default());
+    let release_start = backend.pause_next_instance_start();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_count(&backend.instance_starts, 1, "instance start").await;
+    let changed = apply(&agent, manifest_context(manifest_with_code_server_host(1, 4091))).await;
+    assert!(release_start.send(()).is_ok());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert_eq!(
+        ready.status.instances[&AgentInstanceId::new(0)].network.ports["code_server"].host,
+        Some(4091)
+    );
+    assert_eq!(*backend.instance_starts.borrow(), 2);
+    assert_eq!(*backend.instance_stops.borrow(), 1);
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+}
+
+#[tokio::test(flavor = "local")]
+async fn scale_up_during_instance_start_keeps_compatible_materialization() {
+    let initial = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    let release_start = backend.pause_next_instance_start();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_count(&backend.instance_starts, 1, "instance start").await;
+    let scaled = scale(&agent, 2).await;
+    assert!(release_start.send(()).is_ok());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == scaled.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 2
+    })
+    .await;
+    assert_eq!(ready.status.replicas.active, 2);
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+    assert_eq!(*backend.instance_starts.borrow(), 2);
+    assert_eq!(*backend.instance_stops.borrow(), 0);
+}
+
+#[tokio::test(flavor = "local")]
+async fn stale_start_cleanup_does_not_wait_for_replacement_base() {
+    let initial = manifest_with(1);
+    let backend = Rc::new(FakeBackend::default());
+    let release_start = backend.pause_next_instance_start();
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&initial);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(initial)).await;
+    wait_for_count(&backend.instance_starts, 1, "obsolete instance start").await;
+    let release_base = backend.pause_next_base_create();
+    let mut changed_manifest = manifest_with(1);
+    changed_manifest.spec.bootstrap.packages.push("htop".to_owned());
+    let changed = apply(&agent, manifest_context(changed_manifest)).await;
+    wait_for_count(&backend.created_bases, 2, "replacement agent base build").await;
+
+    assert!(release_start.send(()).is_ok());
+    wait_for_count(
+        &backend.instance_stops,
+        1,
+        "obsolete instance cleanup before replacement base",
+    )
+    .await;
+    assert!(release_base.send(()).is_ok());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert_eq!(ready.ready_agent_base_key(), ready.desired_agent_base_key());
+}
+
+#[tokio::test(flavor = "local")]
+async fn changed_inactive_instance_deletes_stale_materialization() {
+    let initial = manifest_with_code_server_host(1, 4090);
+    let (agent, mut stream) = start_agent(&initial).await;
+    wait_for_ready(&mut stream, 1).await;
+    let scaled = scale(&agent, 0).await;
+    wait_for_document(&mut stream, |document| {
+        document.generation() == scaled.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.active == 0
+    })
+    .await;
+
+    let mut changed_manifest = manifest_with_code_server_host(0, 4091);
+    changed_manifest.spec.template.resources.memory = "3G".to_owned();
+    let changed = apply(&agent, manifest_context(changed_manifest.clone())).await;
+
+    let observed = wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.instances.is_empty()
+            && !document.status.reconciling
+    })
+    .await;
+    assert_eq!(observed.status.replicas.desired, 0);
+    assert!(status(&agent, AgentInstanceId::new(0)).await.is_err());
+}
+
+#[tokio::test(flavor = "local")]
+async fn reapply_while_instance_delete_is_running_recreates_latest_generation() {
+    let manifest = manifest_with(1);
+    let (agent, mut stream, backend) = start_agent_with_backend(&manifest).await;
+    wait_for_ready(&mut stream, 1).await;
+    let release_stop = backend.pause_next_instance_stop();
+
+    delete(&agent).await;
+    wait_for_count(&backend.instance_stops, 1, "instance delete").await;
+    let reapplied = apply(&agent, manifest_context(manifest)).await;
+    release_stop.try_send(());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == reapplied.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert!(!ready.deletion_requested());
+}
+
+#[tokio::test(flavor = "local")]
+async fn reapply_while_base_stop_is_running_rebuilds_latest_generation() {
+    let manifest = manifest_with(1);
+    let (agent, mut stream, backend) = start_agent_with_backend(&manifest).await;
+    wait_for_ready(&mut stream, 1).await;
+    let release_base_stop = backend.pause_next_base_stop();
+
+    delete(&agent).await;
+    wait_for_count(&backend.base_stops, 1, "agent base stop").await;
+    let reapplied = apply(&agent, manifest_context(manifest)).await;
+    release_base_stop.try_send(());
+
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == reapplied.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert!(!ready.deletion_requested());
 }
 
 #[tokio::test(flavor = "local")]
@@ -129,8 +990,8 @@ async fn delete_while_base_is_building_converges_to_deleted() {
 }
 
 #[tokio::test(flavor = "local")]
-async fn apply_changed_manifest_rebuilds_base_and_reconciles_instances() {
-    let (agent, mut stream) = start_agent(&manifest_with(1)).await;
+async fn apply_changed_manifest_rebuilds_base_and_replaces_instances() {
+    let (agent, mut stream, backend) = start_agent_with_backend(&manifest_with(1)).await;
     let initial = wait_for_ready(&mut stream, 1).await;
     let mut changed = manifest_with(1);
     changed.spec.bootstrap.packages.push("htop".to_owned());
@@ -142,6 +1003,8 @@ async fn apply_changed_manifest_rebuilds_base_and_reconciles_instances() {
     assert_eq!(reconciled.generation(), initial.generation() + 1);
     assert_ne!(reconciled.ready_agent_base_key(), initial.ready_agent_base_key());
     assert_eq!(reconciled.ready_agent_base_key(), reconciled.desired_agent_base_key());
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+    assert_eq!(*backend.instance_stops.borrow(), 1);
 }
 
 #[tokio::test(flavor = "local")]
@@ -375,8 +1238,8 @@ async fn failed_host_input_reconcile_does_not_retry_in_a_busy_loop() {
     persist_ready_running_instance(&layout, &agent_name, &manifest_with(1)).await;
     let agent = Agent::spawn(
         Context::quiet(),
-        agent_name,
-        layout,
+        agent_name.clone(),
+        layout.clone(),
         backend.clone(),
         tailscale_service(),
     );
@@ -389,6 +1252,27 @@ async fn failed_host_input_reconcile_does_not_retry_in_a_busy_loop() {
         )
     })
     .await;
+    let degraded = document(&agent).await;
+    assert_eq!(degraded.status.replicas.ready, 0);
+    assert!(degraded.status.reconciling);
+    let degraded_status = degraded.status.instances.get(&AgentInstanceId::new(0)).unwrap();
+    assert_eq!(degraded_status.host_inputs.phase, AgentInstanceHostInputsPhase::Failed);
+    assert_eq!(degraded_status.host_inputs.observed_generation, degraded.generation());
+    assert!(
+        degraded_status
+            .host_inputs
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("host input reconciliation failed"))
+    );
+    let persisted_path = layout.instance(&agent_name, AgentInstanceId::new(0)).instance_state();
+    let persisted: AgentInstanceDocument = serde_yaml::from_str(
+        &tokio::fs::read_to_string(&persisted_path)
+            .await
+            .expect("read persisted degraded instance"),
+    )
+    .expect("parse persisted degraded instance");
+    assert_eq!(persisted.status.host_inputs, degraded_status.host_inputs);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -396,6 +1280,241 @@ async fn failed_host_input_reconcile_does_not_retry_in_a_busy_loop() {
         1,
         "host input failure must wait for retry delay before re-reading host files"
     );
+
+    drop(agent);
+    drop(stream);
+    let recovered_backend = Rc::new(FakeBackend::default());
+    let release_recovery = recovered_backend.pause_next_runtime_secret_reconcile();
+    let recovered = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        recovered_backend.clone(),
+        tailscale_service(),
+    );
+    let mut recovered_stream = watch(&recovered).await;
+    wait_for_count(
+        &recovered_backend.runtime_secret_reconciles,
+        1,
+        "runtime secret recovery after restart",
+    )
+    .await;
+    let restored = status(&recovered, AgentInstanceId::new(0))
+        .await
+        .expect("restored instance status");
+    assert_eq!(restored.status.host_inputs, persisted.status.host_inputs);
+
+    assert!(release_recovery.send(()).is_ok());
+    let recovered_document = wait_for_ready(&mut recovered_stream, 1).await;
+    let recovered_status = recovered_document
+        .status
+        .instances
+        .get(&AgentInstanceId::new(0))
+        .unwrap();
+    assert_eq!(recovered_status.host_inputs.phase, AgentInstanceHostInputsPhase::Ready);
+    assert_eq!(
+        recovered_status.host_inputs.observed_generation,
+        recovered_document.generation()
+    );
+    assert!(recovered_status.host_inputs.last_error.is_none());
+}
+
+#[tokio::test(flavor = "local")]
+async fn scale_to_zero_waits_for_in_flight_host_input_reconcile() {
+    let backend = Rc::new(FakeBackend::default());
+    let release_host_inputs = backend.pause_next_host_input_reconcile();
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    persist_ready_running_instance(&layout, &agent_name, &manifest).await;
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_host_input_reconcile_count(&backend, 1).await;
+    scale(&agent, 0).await;
+    assert!(release_host_inputs.send(()).is_ok());
+    let stopped = wait_for_document(&mut stream, |document| document.status.replicas.stopped == 1).await;
+
+    assert_eq!(stopped.status.replicas.stopped, 1);
+    assert_eq!(*backend.host_input_side_effects.borrow(), 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn delete_waits_for_in_flight_host_input_reconcile() {
+    let backend = Rc::new(FakeBackend::default());
+    let release_host_inputs = backend.pause_next_host_input_reconcile();
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    persist_ready_running_instance(&layout, &agent_name, &manifest).await;
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_host_input_reconcile_count(&backend, 1).await;
+    delete(&agent).await;
+    assert!(release_host_inputs.send(()).is_ok());
+    let deleted = wait_for_document(&mut stream, |document| document.status.deleted).await;
+
+    assert!(deleted.status.instances.is_empty());
+    assert_eq!(*backend.host_input_side_effects.borrow(), 1);
+}
+
+#[tokio::test(flavor = "local")]
+async fn superseded_host_input_completion_does_not_replace_newer_attempt() {
+    let backend = Rc::new(FakeBackend::default());
+    let release_old_host_inputs = backend.pause_next_host_input_reconcile();
+    let release_new_host_inputs = backend.pause_next_host_input_reconcile();
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    persist_ready_running_instance(&layout, &agent_name, &manifest).await;
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_host_input_reconcile_count(&backend, 1).await;
+    scale(&agent, 0).await;
+    wait_for_ready(&mut stream, 0).await;
+    scale(&agent, 1).await;
+    assert!(release_old_host_inputs.send(()).is_ok());
+    wait_for_ready(&mut stream, 1).await;
+    wait_for_host_input_reconcile_count(&backend, 2).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        *backend.host_input_reconciles.borrow(),
+        2,
+        "the superseded completion must not admit a concurrent third reconcile"
+    );
+    assert!(release_new_host_inputs.send(()).is_ok());
+}
+
+#[tokio::test(flavor = "local")]
+async fn manifest_change_during_host_input_reconcile_starts_new_generation() {
+    let backend = Rc::new(FakeBackend::default());
+    let release_host_inputs = backend.pause_next_host_input_reconcile();
+    let initial = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&initial);
+    persist_ready_running_instance(&layout, &agent_name, &initial).await;
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_host_input_reconcile_count(&backend, 1).await;
+    let changed = apply(&agent, manifest_context(manifest_with_code_server_host(1, 4090))).await;
+    let projected = status(&agent, AgentInstanceId::new(0))
+        .await
+        .expect("instance remains addressable while stale work finishes");
+    assert_eq!(projected.spec.desired_generation, changed.generation());
+    assert_eq!(projected.status.phase, AgentInstancePhase::Deleting);
+    assert!(
+        release_host_inputs.send(()).is_ok(),
+        "superseded host-input work must finish instead of being cancelled"
+    );
+
+    wait_for_host_input_reconcile_count(&backend, 2).await;
+    assert_eq!(
+        *backend.host_input_side_effects.borrow(),
+        2,
+        "the completed old effect must be followed by reconciliation of the current generation"
+    );
+    let ready = wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.replicas.ready == 1
+            && document.status.observed_generation == document.generation()
+    })
+    .await;
+    assert_eq!(ready.generation(), changed.generation());
+}
+
+#[tokio::test(flavor = "local")]
+async fn manifest_change_finishes_host_inputs_after_partial_side_effect() {
+    let backend = Rc::new(FakeBackend::default());
+    let release_old_host_inputs = backend.pause_next_host_input_after_side_effect();
+    let initial = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&initial);
+    persist_ready_running_instance(&layout, &agent_name, &initial).await;
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_count(&backend.host_input_side_effects, 1, "partial host-input side effect").await;
+    let changed = apply(&agent, manifest_context(manifest_with_code_server_host(1, 4090))).await;
+    assert!(release_old_host_inputs.send(()).is_ok());
+
+    wait_for_host_input_reconcile_count(&backend, 2).await;
+    wait_for_count(
+        &backend.host_input_completed_side_effects,
+        2,
+        "superseded and current host-input completion",
+    )
+    .await;
+    wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
+    assert_eq!(*backend.host_input_side_effects.borrow(), 2);
+    assert_eq!(*backend.host_input_completed_side_effects.borrow(), 2);
+}
+
+#[tokio::test(flavor = "local")]
+async fn deleted_agent_reapply_does_not_reuse_host_input_attempt_owner() {
+    let backend = Rc::new(FakeBackend::default());
+    let release_old_host_inputs = backend.pause_next_host_input_reconcile();
+    let release_new_host_inputs = backend.pause_next_host_input_reconcile();
+    let manifest = manifest_with(1);
+    let (layout, agent_name) = unique_layout(&manifest);
+    persist_ready_running_instance(&layout, &agent_name, &manifest).await;
+    let agent = Agent::spawn(
+        Context::quiet(),
+        agent_name,
+        layout,
+        backend.clone(),
+        tailscale_service(),
+    );
+    let mut stream = watch(&agent).await;
+
+    wait_for_host_input_reconcile_count(&backend, 1).await;
+    delete(&agent).await;
+    assert!(release_old_host_inputs.send(()).is_ok());
+    wait_for_document(&mut stream, |document| document.status.deleted).await;
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_host_input_reconcile_count(&backend, 2).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        *backend.host_input_reconciles.borrow(),
+        2,
+        "the deleted instance completion must not replace the recreated instance attempt"
+    );
+    assert!(release_new_host_inputs.send(()).is_ok());
+    wait_for_ready(&mut stream, 1).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -542,6 +1661,38 @@ async fn foreground_exec_status_and_logs_share_the_agent_runtime_queue() {
         logs.iter().any(|line| line.contains("session_finished")),
         "event log should include session completion: {logs:?}"
     );
+}
+
+#[tokio::test(flavor = "local")]
+async fn manifest_change_while_exec_is_running_completes_session_and_latest_generation() {
+    let (agent, mut stream, backend) = start_agent_with_backend(&manifest_with(1)).await;
+    wait_for_ready(&mut stream, 1).await;
+    let release_exec = backend.pause_next_exec();
+    let id = AgentInstanceId::new(0);
+    let exec_task = tokio::task::spawn_local({
+        let agent = agent.clone();
+        async move { exec(&agent, id, "sleep until released").await }
+    });
+    wait_for_event(&mut stream, |event| {
+        matches!(
+            event,
+            AgentEvent::InstanceEvent { event }
+                if matches!(event.event, AgentInstanceEvent::SessionStarted { .. })
+        )
+    })
+    .await;
+
+    let changed = apply(&agent, manifest_context(manifest_with_code_server_host(1, 4090))).await;
+    release_exec.try_send(());
+
+    let result = exec_task.await.expect("exec task joined").expect("exec completed");
+    assert_eq!(result.stdout, "executed: 'sleep until released'");
+    wait_for_document(&mut stream, |document| {
+        document.generation() == changed.generation()
+            && document.status.observed_generation == document.generation()
+            && document.status.replicas.ready == 1
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -695,7 +1846,7 @@ async fn delete_waits_for_foreground_session_before_cleanup() {
 
 #[tokio::test(flavor = "local")]
 async fn changed_manifest_restarts_children_without_synthetic_network_state() {
-    let (agent, mut stream) = start_agent(&manifest_with(1)).await;
+    let (agent, mut stream, backend) = start_agent_with_backend(&manifest_with(1)).await;
     wait_for_ready(&mut stream, 1).await;
     let mut changed = manifest_with(1);
     changed.spec.template.resources.memory = "3G".to_owned();
@@ -711,6 +1862,11 @@ async fn changed_manifest_restarts_children_without_synthetic_network_state() {
     assert_eq!(instance.network.mode, NetworkModeState::Mediated);
     assert_eq!(instance.network.ports["ssh"].guest, 22);
     assert_eq!(instance.network.ports["ssh"].host, None);
+    assert_eq!(backend.created_instances.borrow().len(), 2);
+    assert_eq!(*backend.instance_stops.borrow(), 1);
+    let instance = status(&agent, AgentInstanceId::new(0)).await.expect("instance status");
+    assert_eq!(instance.spec.template.resources.memory, "3G");
+    assert_eq!(instance.status.materialized_template, instance.spec.template);
 }
 
 #[tokio::test(flavor = "local")]
@@ -791,7 +1947,7 @@ async fn delete_continues_after_bounded_base_stop_timeout() {
 }
 
 #[tokio::test(flavor = "local")]
-async fn delete_continues_after_bounded_instance_delete_timeout() {
+async fn delete_retries_after_bounded_instance_delete_timeout() {
     let (agent, mut stream, backend) = start_agent_with_backend(&manifest_with(1)).await;
     wait_for_ready(&mut stream, 1).await;
     backend.fail_next_instance_delete();
@@ -805,6 +1961,7 @@ async fn delete_continues_after_bounded_instance_delete_timeout() {
         )
     })
     .await;
+    wait_for_count(&backend.instance_stops, 2, "retried instance delete").await;
     let deleted = wait_for_document(&mut stream, |document| document.status.deleted).await;
     assert!(deleted.status.instances.is_empty());
 }
@@ -875,17 +2032,19 @@ async fn persisted_bootstrap_retry_wakes_without_external_input() {
     let manifest = manifest_with(1);
     let (layout, agent_name) = unique_layout(&manifest);
     persist_retrying_running_instance(&layout, &agent_name, &manifest).await;
+    let backend = Rc::new(FakeBackend::default());
     let agent = Agent::spawn(
         Context::quiet(),
         agent_name,
         layout,
-        Rc::new(FakeBackend::default()),
+        backend.clone(),
         tailscale_service(),
     );
     let mut stream = watch(&agent).await;
 
     let ready = wait_for_ready(&mut stream, 1).await;
     assert_eq!(ready.status.replicas.ready, 1);
+    assert_eq!(backend.bootstrap_retry_epochs.borrow().as_slice(), &[Some(1)]);
 }
 
 #[tokio::test(flavor = "local")]
@@ -1105,6 +2264,14 @@ async fn status(agent: &Agent, id: AgentInstanceId) -> Result<AgentInstanceDocum
     receive.await.expect("status response")
 }
 
+async fn document(agent: &Agent) -> AgentDocument {
+    let (respond, receive) = oneshot::channel();
+    agent
+        .send(AgentCommand::Document { respond })
+        .expect("agent accepts document command");
+    receive.await.expect("document response").expect("document succeeds")
+}
+
 async fn wait_for_host_input_reconcile_count(backend: &FakeBackend, expected: u32) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -1113,6 +2280,34 @@ async fn wait_for_host_input_reconcile_count(backend: &FakeBackend, expected: u3
             "timed out waiting for host input reconciliation"
         );
         if *backend.host_input_reconciles.borrow() >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_count(count: &RefCell<u32>, expected: u32, operation: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {operation}"
+        );
+        if *count.borrow() >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_created_instances(backend: &FakeBackend, expected: usize) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for instance creation"
+        );
+        if backend.created_instances.borrow().len() >= expected {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1320,6 +2515,7 @@ async fn persist_retrying_running_instance(layout: &AgentdpLayout, agent: &Agent
     let mut instance = persisted_running_instance(layout, agent, manifest).await;
     let now = agentdp_platform::time::unix_seconds();
     instance.status.record_bootstrap_failure(AgentInstanceBootstrapState {
+        attempt_epoch: Some(0),
         failure_count: 1,
         last_failure_unix_seconds: now,
         next_retry_unix_seconds: now.saturating_add(1),
@@ -1330,6 +2526,7 @@ async fn persist_retrying_running_instance(layout: &AgentdpLayout, agent: &Agent
 
 async fn persist_ready_running_instance(layout: &AgentdpLayout, agent: &AgentName, manifest: &AgentManifest) {
     let mut instance = persisted_running_instance(layout, agent, manifest).await;
+    instance.status.host_inputs.mark_ready(instance.spec.desired_generation);
     instance.status.mark_ready(agentdp_core::agent::ReadinessState {
         ready: true,
         last_success_unix_seconds: agentdp_platform::time::unix_seconds(),
@@ -1426,13 +2623,32 @@ struct FakeBackend {
     fail_next_instance_delete: RefCell<bool>,
     fail_instance_creates: RefCell<u32>,
     pause_next_instance_create: RefCell<Option<oneshot::Receiver<()>>>,
+    pause_next_base_create: RefCell<Option<oneshot::Receiver<()>>>,
+    pause_next_instance_bootstrap: RefCell<Option<oneshot::Receiver<()>>>,
+    fail_instance_bootstraps: RefCell<u32>,
+    bootstrap_retry_epochs: RefCell<Vec<Option<u64>>>,
+    pause_next_instance_start: RefCell<Option<oneshot::Receiver<()>>>,
+    pause_next_instance_stop: RefCell<Option<oneshot::Receiver<()>>>,
+    pause_next_runtime_secret_reconcile: RefCell<Option<oneshot::Receiver<()>>>,
+    pause_next_base_stop: RefCell<Option<oneshot::Receiver<()>>>,
+    pause_next_exec: RefCell<Option<oneshot::Receiver<()>>>,
+    paused_host_input_reconciles: RefCell<std::collections::VecDeque<oneshot::Receiver<()>>>,
+    pause_next_host_input_after_side_effect: RefCell<Option<oneshot::Receiver<()>>>,
     created_bases: RefCell<u32>,
     created_instances: RefCell<Vec<String>>,
     instance_starts: RefCell<u32>,
     instance_reconciles: RefCell<u32>,
+    fail_instance_reconciles: RefCell<u32>,
+    runtime_secret_reconciles: RefCell<u32>,
+    fail_runtime_secret_reconciles: RefCell<u32>,
+    runtime_secret_files: RefCell<Vec<SeedFile>>,
     host_input_reconciles: RefCell<u32>,
+    reconciled_secret_files: RefCell<Vec<SeedFile>>,
+    host_input_side_effects: RefCell<u32>,
+    host_input_completed_side_effects: RefCell<u32>,
     fail_host_input_reconciles: RefCell<u32>,
     instance_stops: RefCell<u32>,
+    base_stops: RefCell<u32>,
 }
 
 impl FakeBackend {
@@ -1452,13 +2668,83 @@ impl FakeBackend {
         *self.fail_instance_creates.borrow_mut() = count;
     }
 
+    fn fail_instance_bootstraps(&self, count: u32) {
+        *self.fail_instance_bootstraps.borrow_mut() = count;
+    }
+
+    fn fail_instance_reconciles(&self, count: u32) {
+        *self.fail_instance_reconciles.borrow_mut() = count;
+    }
+
     fn fail_host_input_reconciles(&self, count: u32) {
         *self.fail_host_input_reconciles.borrow_mut() = count;
+    }
+
+    fn fail_runtime_secret_reconciles(&self, count: u32) {
+        *self.fail_runtime_secret_reconciles.borrow_mut() = count;
+    }
+
+    fn set_runtime_secret_files(&self, files: Vec<SeedFile>) {
+        *self.runtime_secret_files.borrow_mut() = files;
     }
 
     fn pause_next_instance_create(&self) -> oneshot::Sender<()> {
         let (release, wait) = oneshot::channel();
         *self.pause_next_instance_create.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_base_create(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_base_create.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_instance_bootstrap(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_instance_bootstrap.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_instance_start(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_instance_start.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_instance_stop(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_instance_stop.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_runtime_secret_reconcile(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_runtime_secret_reconcile.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_base_stop(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_base_stop.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_exec(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_exec.borrow_mut() = Some(wait);
+        release
+    }
+
+    fn pause_next_host_input_reconcile(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        self.paused_host_input_reconciles.borrow_mut().push_back(wait);
+        release
+    }
+
+    fn pause_next_host_input_after_side_effect(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.pause_next_host_input_after_side_effect.borrow_mut() = Some(wait);
         release
     }
 
@@ -1488,6 +2774,24 @@ impl FakeBackend {
         true
     }
 
+    fn take_instance_bootstrap_failure(&self) -> bool {
+        let mut failures = self.fail_instance_bootstraps.borrow_mut();
+        if *failures == 0 {
+            return false;
+        }
+        *failures -= 1;
+        true
+    }
+
+    fn take_instance_reconcile_failure(&self) -> bool {
+        let mut failures = self.fail_instance_reconciles.borrow_mut();
+        if *failures == 0 {
+            return false;
+        }
+        *failures -= 1;
+        true
+    }
+
     fn take_host_input_reconcile_failure(&self) -> bool {
         let mut failures = self.fail_host_input_reconciles.borrow_mut();
         if *failures == 0 {
@@ -1497,8 +2801,53 @@ impl FakeBackend {
         true
     }
 
+    fn take_runtime_secret_reconcile_failure(&self) -> bool {
+        let mut failures = self.fail_runtime_secret_reconciles.borrow_mut();
+        if *failures == 0 {
+            return false;
+        }
+        *failures -= 1;
+        true
+    }
+
     fn take_instance_create_pause(&self) -> Option<oneshot::Receiver<()>> {
         self.pause_next_instance_create.borrow_mut().take()
+    }
+
+    fn take_base_create_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_base_create.borrow_mut().take()
+    }
+
+    fn take_instance_bootstrap_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_instance_bootstrap.borrow_mut().take()
+    }
+
+    fn take_instance_start_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_instance_start.borrow_mut().take()
+    }
+
+    fn take_instance_stop_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_instance_stop.borrow_mut().take()
+    }
+
+    fn take_runtime_secret_reconcile_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_runtime_secret_reconcile.borrow_mut().take()
+    }
+
+    fn take_base_stop_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_base_stop.borrow_mut().take()
+    }
+
+    fn take_exec_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_exec.borrow_mut().take()
+    }
+
+    fn take_host_input_reconcile_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.paused_host_input_reconciles.borrow_mut().pop_front()
+    }
+
+    fn take_host_input_after_side_effect_pause(&self) -> Option<oneshot::Receiver<()>> {
+        self.pause_next_host_input_after_side_effect.borrow_mut().take()
     }
 }
 
@@ -1544,8 +2893,12 @@ impl backend::Backend for FakeBackend {
         _input: backend::CreateBaseInput<'a>,
     ) -> backend::BackendFuture<'a, backend::CreateBaseOutput> {
         *self.created_bases.borrow_mut() += 1;
+        let pause = self.take_base_create_pause();
         let fail = self.take_base_create_failure();
         Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
             if fail {
                 return Err(fake_backend_error());
             }
@@ -1569,6 +2922,7 @@ impl backend::Backend for FakeBackend {
         &'a self,
         _context: &'a Context,
         _state: &'a mut AgentInstanceDocument,
+        _control: &'a mut Option<backend::InstanceControl>,
     ) -> backend::BackendFuture<'a, backend::StopOutput> {
         Box::pin(async { Ok(stop_output()) })
     }
@@ -1580,8 +2934,13 @@ impl backend::Backend for FakeBackend {
         _key: &'a crate::agent::AgentBaseKey,
         _files: &'a AgentBaseFiles,
     ) -> backend::BackendFuture<'a, backend::StopOutput> {
+        *self.base_stops.borrow_mut() += 1;
+        let pause = self.take_base_stop_pause();
         let fail = self.take_base_stop_failure();
         Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
             if fail {
                 Err(fake_backend_error())
             } else {
@@ -1620,10 +2979,15 @@ impl backend::Backend for FakeBackend {
         state: &'a mut AgentInstanceDocument,
     ) -> backend::BackendFuture<'a, backend::StartOutput> {
         *self.instance_starts.borrow_mut() += 1;
-        Box::pin(async {
+        let pause = self.take_instance_start_pause();
+        let host_ports = state.status.network.ports.clone();
+        Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
             Ok(backend::StartOutput {
                 process: process_status("running"),
-                host_ports: state.status.network.ports.clone(),
+                host_ports,
             })
         })
     }
@@ -1636,7 +3000,11 @@ impl backend::Backend for FakeBackend {
         _timeout: std::time::Duration,
         output: &'a mut dyn OutputSink,
     ) -> backend::BackendFuture<'a, CommandOutput> {
+        let pause = self.take_exec_pause();
         Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
             let stdout = format!("executed: {command}");
             output.output(agentdp_platform::ssh::OutputStream::Stdout, stdout.as_bytes());
             Ok(CommandOutput {
@@ -1650,10 +3018,23 @@ impl backend::Backend for FakeBackend {
     fn wait_bootstrap<'a>(
         &'a self,
         _context: &'a Context,
-        _state: &'a AgentInstanceDocument,
+        state: &'a AgentInstanceDocument,
+        _control: &'a mut Option<backend::InstanceControl>,
+        retry_epoch: Option<u64>,
         bootstrap_events: Option<&'a mut dyn backend::BootstrapEventSink>,
-    ) -> backend::BackendFuture<'a, ()> {
+    ) -> backend::BackendFuture<'a, backend::BootstrapOutcome> {
+        let pause = (state.metadata.name.as_str() != crate::agent::AGENT_BASE_INSTANCE)
+            .then(|| self.take_instance_bootstrap_pause())
+            .flatten();
+        let instance_bootstrap = state.metadata.name.as_str() != crate::agent::AGENT_BASE_INSTANCE;
+        if instance_bootstrap {
+            self.bootstrap_retry_epochs.borrow_mut().push(retry_epoch);
+        }
+        let fail = instance_bootstrap && self.take_instance_bootstrap_failure();
         Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
             if let Some(events) = bootstrap_events {
                 for step in ["system.packages", "system.guest_tooling"] {
                     events.emit(BootstrapEvent::StepStarted {
@@ -1667,7 +3048,15 @@ impl backend::Backend for FakeBackend {
                     });
                 }
             }
-            Ok(())
+            if fail {
+                return Ok(backend::BootstrapOutcome::Failed {
+                    attempt_epoch: retry_epoch.unwrap_or(0),
+                    error: "fake bootstrap failure".to_owned(),
+                });
+            }
+            Ok(backend::BootstrapOutcome::Passed {
+                attempt_epoch: retry_epoch.unwrap_or(0),
+            })
         })
     }
 
@@ -1677,10 +3066,15 @@ impl backend::Backend for FakeBackend {
         _network: &'a InstanceNetwork,
         _input: backend::StopInstanceInput<'a>,
         _backend_state: &'a mut BackendState,
+        _control: &'a mut Option<backend::InstanceControl>,
     ) -> backend::BackendFuture<'a, backend::StopOutput> {
         *self.instance_stops.borrow_mut() += 1;
+        let pause = self.take_instance_stop_pause();
         let fail = self.take_instance_delete_failure();
         Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
             if fail {
                 Err(fake_backend_error())
             } else {
@@ -1697,7 +3091,11 @@ impl backend::Backend for FakeBackend {
         state: &'a mut AgentInstanceDocument,
     ) -> backend::BackendFuture<'a, backend::ReconcileOutput> {
         *self.instance_reconciles.borrow_mut() += 1;
+        let fail = self.take_instance_reconcile_failure();
         Box::pin(async move {
+            if fail {
+                return Err(fake_backend_error());
+            }
             Ok(backend::ReconcileOutput {
                 stale: false,
                 mark_stopped: false,
@@ -1708,26 +3106,58 @@ impl backend::Backend for FakeBackend {
         })
     }
 
+    fn reconcile_runtime_secrets<'a>(
+        &'a self,
+        _context: &'a Context,
+        _network: &'a InstanceNetwork,
+        _manifest: &'a AgentManifestContext,
+        _state: &'a mut AgentInstanceDocument,
+    ) -> backend::BackendFuture<'a, backend::ReconcileRuntimeSecretsOutput> {
+        *self.runtime_secret_reconciles.borrow_mut() += 1;
+        let secret_files = self.runtime_secret_files.borrow().clone();
+        let pause = self.take_runtime_secret_reconcile_pause();
+        let fail = self.take_runtime_secret_reconcile_failure();
+        Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
+            if fail {
+                return Err(fake_backend_error());
+            }
+            Ok(backend::ReconcileRuntimeSecretsOutput { secret_files })
+        })
+    }
+
     fn reconcile_host_inputs<'a>(
         &'a self,
         _context: &'a Context,
         _network: &'a InstanceNetwork,
-        manifest: &'a AgentManifestContext,
-        state: &'a mut AgentInstanceDocument,
+        _manifest: &'a AgentManifestContext,
+        _state: &'a AgentInstanceDocument,
+        secret_files: &'a [SeedFile],
+        _control: &'a mut Option<backend::InstanceControl>,
     ) -> backend::BackendFuture<'a, backend::ReconcileHostInputsOutput> {
         *self.host_input_reconciles.borrow_mut() += 1;
+        *self.reconciled_secret_files.borrow_mut() = secret_files.to_vec();
+        let pause = self.take_host_input_reconcile_pause();
+        let pause_after_side_effect = self.take_host_input_after_side_effect_pause();
         let fail = self.take_host_input_reconcile_failure();
-        if !manifest.value().host_input_requirements().has_mediated_secret_inputs() {
-            let BackendState::Qemu(state) = &mut state.status.backend;
-            state.mediated_secrets = SecretBindings::default();
-        }
         Box::pin(async move {
+            if let Some(release) = pause {
+                let _result = release.await;
+            }
+            *self.host_input_side_effects.borrow_mut() += 1;
+            if let Some(release) = pause_after_side_effect {
+                let _result = release.await;
+            }
+            *self.host_input_completed_side_effects.borrow_mut() += 1;
             if fail {
                 return Err(fake_backend_error());
             }
             Ok(backend::ReconcileHostInputsOutput {
-                guest_files_updated: 0,
-                guest_file_failures: 0,
+                files_updated: 0,
+                file_failures: 0,
+                file_errors: Vec::new(),
             })
         })
     }

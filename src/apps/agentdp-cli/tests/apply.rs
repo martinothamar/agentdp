@@ -25,6 +25,10 @@ fn apply_dry_agent() {
 
     let observed = fixture.wait_observed();
     assert!(observed.stdout().contains("status: Satisfied"), "{}", observed.render());
+    assert!(
+        fixture.wait_guest_control_command("user_file.write", Duration::from_secs(2)),
+        "fake guest did not receive a host-file command over the retained control session"
+    );
 
     assert!(
         fixture.instance_file("instance.yaml").is_file(),

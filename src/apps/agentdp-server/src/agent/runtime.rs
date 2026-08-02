@@ -18,11 +18,11 @@ use agentdp_core::agent::{
     AgentInstanceTarget, AgentInstanceTransitionKind, AgentInstanceTransitionWorkStatus, AgentInstanceWorkStatus,
     AgentName, BackendState, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State,
     NetworkState, OperationResult, PortMappingState, PortRequestError, ReadinessResult, ReadinessState, ServiceStatus,
-    SessionKind, SessionResultSummary, assign_port_mappings,
+    SessionKind, SessionResultSummary, TailscaleServeState, assign_port_mappings,
 };
 use agentdp_core::manifest::{AgentPhase, ValidationErrors};
 use agentdp_core::provisioning::bootstrap::BootstrapGraphError;
-use agentdp_core::provisioning::{ProvisioningOptions, ProvisioningPlan};
+use agentdp_core::provisioning::{ProvisioningOptions, ProvisioningPlan, SeedFile};
 use agentdp_ds::local::{inbox, oneshot, spsc};
 use agentdp_platform::ssh::{CommandOutput, OutputSink, OutputStream, shell_join};
 use agentdp_platform::text::Utf8Stream;
@@ -45,7 +45,9 @@ use crate::services::InstanceNetwork;
 
 use super::base::{AgentBaseDiskPhase, AgentBasePreparation, ensure_agent_base_ready};
 use super::documents::{AgentDocuments, AgentInstanceDocuments};
-use super::event_log::{Error as EventLogError, EventLogWriter, next_sequence as event_log_next_sequence};
+use super::event_log::{
+    Error as EventLogError, EventLogWriter, SequencePlan, inspect_sequence as inspect_event_sequence,
+};
 
 const INPUT_CAPACITY: usize = 256;
 const RECENT_EVENT_CAPACITY: usize = 128;
@@ -55,7 +57,9 @@ const HOST_INPUT_RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(15);
 const HOST_INPUT_RECONCILE_RETRY_MAX_DELAY: Duration = Duration::from_mins(5);
 const INSTANCE_CREATE_RETRY_DELAY: Duration = Duration::from_secs(15);
 const INSTANCE_CREATE_RETRY_MAX_DELAY: Duration = Duration::from_mins(5);
+const INSTANCE_DELETE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INSTANCE_BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(15);
+const INSTANCE_BOOTSTRAP_RETRY_MAX_DELAY: Duration = Duration::from_mins(5);
 const INSTANCE_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_TAIL_CHUNK_BYTES: u64 = 64 * 1024;
 
@@ -102,6 +106,14 @@ pub(crate) enum Error {
         path: std::path::PathBuf,
         errors: ValidationErrors,
     },
+    #[error("persisted state {path} identifies {actual}; expected {expected}")]
+    PersistedStateIdentityMismatch {
+        path: std::path::PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("persisted state for agent {name} could not be loaded: {message}")]
+    PersistedStateUnavailable { name: String, message: String },
     #[error("failed to read instance document {path}: {source}")]
     ReadInstanceDocument {
         path: std::path::PathBuf,
@@ -157,6 +169,8 @@ pub(crate) enum Error {
     PersistState { message: String },
     #[error("readiness probe failed for {name}: exit status {status}")]
     ReadinessProbeFailed { name: String, status: i32 },
+    #[error("agent base guest bootstrap failed: {error}")]
+    AgentBaseBootstrapFailed { error: String },
     #[error("failed to read instance log {path}: {source}")]
     ReadLog {
         path: std::path::PathBuf,
@@ -307,7 +321,7 @@ pub(crate) enum AgentCommand {
         respond: oneshot::Sender<Result<AgentInstanceShellResult, Error>>,
     },
     ListItems {
-        respond: oneshot::Sender<Vec<AgentInstanceListItem>>,
+        respond: oneshot::Sender<Result<Vec<AgentInstanceListItem>, Error>>,
     },
     Document {
         respond: oneshot::Sender<Result<AgentDocument, Error>>,
@@ -316,82 +330,142 @@ pub(crate) enum AgentCommand {
 
 enum WorkCompletion {
     BasePrepared {
+        work_id: u64,
         generation: u64,
-        preparation: AgentBasePreparation,
+        preparation: Box<AgentBasePreparation>,
     },
     BaseBuilt {
+        work_id: u64,
         generation: u64,
         key: AgentBaseKey,
     },
     BaseFailed {
+        work_id: u64,
         generation: u64,
         error: String,
     },
     BaseStopped {
-        generation: u64,
+        work_id: u64,
     },
     BaseStopTimedOut {
-        generation: u64,
+        work_id: u64,
     },
     InstanceCreated {
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
-        document: Result<AgentInstanceDocument, String>,
+        document: Box<Result<AgentInstanceDocument, String>>,
     },
     InstanceStarted {
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
-        document: Result<AgentInstanceDocument, String>,
+        outcome: InstanceBackendOutcome<backend::StartOutput>,
     },
     InstanceReconciled {
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
-        document: Result<AgentInstanceDocument, String>,
+        outcome: InstanceBackendOutcome<backend::ReconcileOutput>,
     },
     BootstrapStarted {
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
     },
     BootstrapEvent {
         source: BootstrapSource,
+        work_id: u64,
         generation: u64,
         event: BootstrapEvent,
     },
     BootstrapFinished {
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
-        document: Result<AgentInstanceDocument, String>,
+        control: Option<backend::InstanceControl>,
+        result: Result<Option<TailscaleServeState>, BootstrapTaskFailure>,
     },
     TailscaleServeReconciled {
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
-        document: Result<AgentInstanceDocument, String>,
+        result: Result<Option<TailscaleServeState>, String>,
+    },
+    RuntimeSecretsReconciled {
+        id: AgentInstanceId,
+        generation: u64,
+        work_id: u64,
+        outcome: InstanceBackendOutcome<backend::ReconcileRuntimeSecretsOutput>,
     },
     HostInputsReconciled {
         id: AgentInstanceId,
         generation: u64,
-        result: Result<(BackendState, backend::ReconcileHostInputsOutput), (BackendState, String)>,
+        work_id: u64,
+        control: Option<backend::InstanceControl>,
+        result: Result<backend::ReconcileHostInputsOutput, String>,
     },
     InstanceStopped {
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
-        document: Result<AgentInstanceDocument, String>,
+        control: Option<backend::InstanceControl>,
+        outcome: InstanceStopOutcome,
+    },
+    InstanceDeleteRuntimeStopped {
+        id: AgentInstanceId,
+        work_id: u64,
+        generation: u64,
+        control: Option<backend::InstanceControl>,
+        outcome: InstanceStopOutcome,
     },
     InstanceDeleted {
         id: AgentInstanceId,
-        generation: u64,
+        work_id: u64,
     },
     InstanceDeleteTimedOut {
         id: AgentInstanceId,
-        generation: u64,
+        work_id: u64,
         error: String,
     },
     ExecFinished {
         id: AgentInstanceId,
-        generation: u64,
+        work_id: u64,
         command: Vec<String>,
         output: CommandOutput,
     },
+}
+
+struct BootstrapTaskFailure {
+    attempt_epoch: Option<u64>,
+    error: String,
+}
+
+impl BootstrapTaskFailure {
+    fn unobserved(error: impl std::fmt::Display) -> Self {
+        Self {
+            attempt_epoch: None,
+            error: error.to_string(),
+        }
+    }
+
+    const fn observed(attempt_epoch: u64, error: String) -> Self {
+        Self {
+            attempt_epoch: Some(attempt_epoch),
+            error,
+        }
+    }
+}
+
+struct InstanceBackendOutcome<T> {
+    backend: BackendState,
+    result: Result<T, String>,
+}
+
+struct InstanceStopOutcome {
+    backend: BackendState,
+    tailscale_serve: Option<TailscaleServeState>,
+    result: Result<backend::StopOutput, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -402,6 +476,7 @@ enum BootstrapSource {
 
 enum AgentState {
     Starting(StartingAgentState),
+    LoadFailed(LoadFailedAgentState),
     Running(Box<RunningAgentState>),
 }
 
@@ -422,6 +497,11 @@ struct StartingAgentState {
     input: inbox::Sender<AgentInput>,
 }
 
+struct LoadFailedAgentState {
+    agent: AgentName,
+    message: String,
+}
+
 struct RunningAgentState {
     agent: AgentName,
     context: Context,
@@ -438,6 +518,7 @@ struct RunningAgentState {
     streams: Vec<spsc::Sender<AgentStreamItem>>,
     input: inbox::Sender<AgentInput>,
     next_reconcile: Instant,
+    next_work_id: u64,
 }
 
 enum PendingResponse {
@@ -446,7 +527,7 @@ enum PendingResponse {
         id: AgentInstanceId,
         respond: oneshot::Sender<Result<AgentInstanceDocument, Error>>,
     },
-    ListItems(oneshot::Sender<Vec<AgentInstanceListItem>>),
+    ListItems(oneshot::Sender<Result<Vec<AgentInstanceListItem>, Error>>),
     OpenStream {
         replay_from_generation: Option<u64>,
         items: spsc::Sender<AgentStreamItem>,
@@ -461,11 +542,24 @@ struct PendingOpenStream {
 
 pub(super) enum AgentBaseState {
     Missing,
-    Preparing { generation: u64 },
-    Building { generation: u64, key: AgentBaseKey },
-    Ready { key: AgentBaseKey },
-    Failed { generation: u64, key: Option<AgentBaseKey> },
-    Stopping,
+    Preparing {
+        work_id: u64,
+    },
+    Building {
+        work_id: u64,
+        generation: u64,
+        key: AgentBaseKey,
+    },
+    Ready {
+        key: AgentBaseKey,
+    },
+    Failed {
+        generation: u64,
+        key: Option<AgentBaseKey>,
+    },
+    Stopping {
+        work_id: u64,
+    },
     Stopped,
 }
 
@@ -475,7 +569,7 @@ impl AgentBaseState {
             self,
             Self::Building { .. }
                 | Self::Ready { .. }
-                | Self::Stopping
+                | Self::Stopping { .. }
                 | Self::Stopped
                 | Self::Failed { key: Some(_), .. }
         )
@@ -483,6 +577,7 @@ impl AgentBaseState {
 }
 
 pub(super) struct StartingAgentInstanceState {
+    work_id: u64,
     generation: u64,
     retry_at: Option<Instant>,
     failure_count: u16,
@@ -493,11 +588,19 @@ pub(super) struct StartingAgentInstanceState {
 }
 
 impl StartingAgentInstanceState {
-    fn new(context: &Context, layout: &AgentdpLayout, agent: &AgentName, id: AgentInstanceId, generation: u64) -> Self {
+    fn new(
+        context: &Context,
+        layout: &AgentdpLayout,
+        agent: &AgentName,
+        id: AgentInstanceId,
+        work_id: u64,
+        generation: u64,
+    ) -> Self {
         let instance_layout = layout.instance(agent, id);
         let events = EventLogWriter::spawn(context, instance_layout.instance_events());
         let (network_events, network_event_receiver) = spsc::bounded(1024);
         Self {
+            work_id,
             generation,
             retry_at: None,
             failure_count: 0,
@@ -557,10 +660,15 @@ pub(super) struct RunningAgentInstanceState {
     event_sequence: u64,
     events: EventLogWriter<AgentInstanceEventEnvelope>,
     bootstrap_retry: Option<Instant>,
+    cleanup_retry: Option<Instant>,
     work: Option<AgentInstanceWork>,
     network_runtime: Rc<InstanceNetwork>,
     network_events: spsc::Receiver<AgentInstanceNetworkEvent>,
-    host_inputs: HostInputReconcileState,
+    control: Option<backend::InstanceControl>,
+    runtime_secrets: ReconcileSchedule,
+    runtime_repair: RuntimeRepairState,
+    secret_host_files: Option<Vec<SeedFile>>,
+    host_inputs: ReconcileSchedule,
     session: Option<ForegroundSession>,
 }
 
@@ -579,34 +687,90 @@ impl RunningAgentInstanceState {
             event_sequence,
             events,
             bootstrap_retry,
+            cleanup_retry: None,
             work: None,
             network_runtime,
             network_events,
-            host_inputs: HostInputReconcileState::new(),
+            control: None,
+            runtime_secrets: ReconcileSchedule::new(),
+            runtime_repair: RuntimeRepairState::Idle,
+            secret_host_files: None,
+            host_inputs: ReconcileSchedule::new(),
             session: None,
         }
     }
+
+    const fn blocks_instance_transition(&self) -> bool {
+        self.work.is_some()
+            || self.runtime_secrets.active_work_id.is_some()
+            || self.host_inputs.active_work_id.is_some()
+            || self.session.is_some()
+    }
+
+    fn bootstrap_retry_wake(&self) -> Option<Instant> {
+        if self.blocks_instance_transition()
+            || !self.runtime_repair.allows_auxiliary_work()
+            || self.documents.private.spec.target != AgentInstanceTarget::Active
+            || self
+                .documents
+                .private
+                .status
+                .readiness
+                .as_ref()
+                .is_some_and(|state| state.ready)
+        {
+            return None;
+        }
+        self.bootstrap_retry
+    }
 }
 
-struct HostInputReconcileState {
+struct ReconcileSchedule {
     next_at: Instant,
-    in_flight: bool,
+    active_work_id: Option<u64>,
     failure_count: u16,
 }
 
-impl HostInputReconcileState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRepairState {
+    Idle,
+    Due,
+    Backoff,
+}
+
+impl RuntimeRepairState {
+    const fn allows_auxiliary_work(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+}
+
+impl ReconcileSchedule {
     fn new() -> Self {
         Self {
             next_at: Instant::now(),
-            in_flight: false,
+            active_work_id: None,
             failure_count: 0,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentInstanceWork {
+struct AgentInstanceWork {
+    id: u64,
+    kind: AgentInstanceWorkKind,
+    input_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TaskAttempt {
+    work_id: u64,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentInstanceWorkKind {
     Reconciling,
+    Repairing,
     Starting,
     Bootstrapping,
     Stopping,
@@ -614,6 +778,7 @@ enum AgentInstanceWork {
 }
 
 struct ForegroundSession {
+    work_id: u64,
     respond: oneshot::Sender<Result<AgentInstanceExecResult, Error>>,
 }
 
@@ -645,7 +810,7 @@ fn spawn_agent_loop(mut state: AgentState, mut inputs: inbox::Receiver<AgentInpu
         // - Responses to commands (like list, wait/stream, status) are enqueued in memory and dispatched at the end of the loop (commit stage)
         loop {
             let input = match &state {
-                AgentState::Starting(_) => match inputs.recv().await {
+                AgentState::Starting(_) | AgentState::LoadFailed(_) => match inputs.recv().await {
                     Ok(input) => Some(input),
                     Err(inbox::TryRecvError::Empty) => continue,
                     Err(inbox::TryRecvError::Disconnected) => break,
@@ -669,11 +834,21 @@ fn spawn_agent_loop(mut state: AgentState, mut inputs: inbox::Receiver<AgentInpu
             };
             if let Some(input) = input {
                 match &mut state {
-                    AgentState::Starting(starting) => {
-                        if let Some(running) = starting.handle_input(input).await {
-                            state = AgentState::Running(Box::new(running));
+                    AgentState::Starting(starting) => match starting.handle_input(input).await {
+                        Ok(Some(running)) => state = AgentState::Running(Box::new(running)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            starting
+                                .context
+                                .logger()
+                                .error(format!("failed to load persisted agent {}: {error}", starting.agent));
+                            state = AgentState::LoadFailed(LoadFailedAgentState {
+                                agent: starting.agent.clone(),
+                                message: error.to_string(),
+                            });
                         }
-                    }
+                    },
+                    AgentState::LoadFailed(failed) => failed.handle_input(input),
                     AgentState::Running(running) => match input {
                         AgentInput::Load => {}
                         AgentInput::Command(command) => running.handle_command(command),
@@ -694,7 +869,7 @@ fn spawn_agent_loop(mut state: AgentState, mut inputs: inbox::Receiver<AgentInpu
 }
 
 impl StartingAgentState {
-    async fn handle_input(&mut self, input: AgentInput) -> Option<RunningAgentState> {
+    async fn handle_input(&mut self, input: AgentInput) -> Result<Option<RunningAgentState>, Error> {
         match input {
             AgentInput::Load => self.load().await,
             AgentInput::Command(AgentCommand::Apply { manifest, respond }) => {
@@ -706,7 +881,7 @@ impl StartingAgentState {
                     Ok(document) => document,
                     Err(error) => {
                         respond.try_send(Err(error.into()));
-                        return None;
+                        return Ok(None);
                     }
                 };
                 match self.start(document, false).await {
@@ -718,11 +893,11 @@ impl StartingAgentState {
                             },
                         );
                         running.pending_responses.push(PendingResponse::AgentDocument(respond));
-                        Some(running)
+                        Ok(Some(running))
                     }
                     Err(error) => {
                         respond.try_send(Err(error));
-                        None
+                        Ok(None)
                     }
                 }
             }
@@ -736,7 +911,7 @@ impl StartingAgentState {
                     items,
                 });
                 respond.try_send(Ok(()));
-                None
+                Ok(None)
             }
             AgentInput::Command(command) => {
                 match command {
@@ -753,7 +928,7 @@ impl StartingAgentState {
                     AgentCommand::InstanceShell { instance, respond, .. } => {
                         respond.try_send(Err(instance_not_found(&self.agent, instance)));
                     }
-                    AgentCommand::ListItems { respond } => respond.try_send(Vec::new()),
+                    AgentCommand::ListItems { respond } => respond.try_send(Ok(Vec::new())),
                     AgentCommand::Document { respond } => {
                         respond.try_send(Err(Error::InstanceNotFound {
                             name: self.agent.to_string(),
@@ -763,41 +938,44 @@ impl StartingAgentState {
                         unreachable!("handled by starting state")
                     }
                 }
-                None
+                Ok(None)
             }
-            AgentInput::Work(_) => None,
+            AgentInput::Work(_) => Ok(None),
         }
     }
 
-    async fn load(&mut self) -> Option<RunningAgentState> {
+    async fn load(&mut self) -> Result<Option<RunningAgentState>, Error> {
         let path = self.layout.agent_document(&self.agent);
-        match try_read_agent_document(&path).await {
-            Ok(Some(document)) if document.agent() == &self.agent => match self.start(document, true).await {
-                Ok(running) => Some(running),
-                Err(error) => {
-                    self.context
-                        .logger()
-                        .warn(format!("failed to load agent {}: {error}", self.agent));
-                    None
-                }
-            },
-            Ok(Some(_) | None) | Err(_) => None,
+        let Some(document) = try_read_agent_document(&path).await? else {
+            return Ok(None);
+        };
+        if document.agent() != &self.agent {
+            return Err(Error::PersistedStateIdentityMismatch {
+                path,
+                expected: self.agent.to_string(),
+                actual: document.agent().to_string(),
+            });
         }
+        self.start(document, true).await.map(Some)
     }
 
     async fn start(&mut self, document: AgentDocument, persisted: bool) -> Result<RunningAgentState, Error> {
         let events_path = self.layout.agent_events(document.agent());
-        let event_sequence = if persisted {
-            event_log_next_sequence(&events_path).await?
+        let (event_plan, inspected_instances) = if persisted {
+            let instance_documents = load_instance_documents(&self.layout, document.agent()).await?;
+            let inspected_instances =
+                inspect_instance_states(&self.layout, document.agent(), instance_documents).await?;
+            (Some(inspect_event_sequence(&events_path).await?), inspected_instances)
         } else {
-            1
+            (None, BTreeMap::new())
         };
+        let event_sequence = match event_plan {
+            Some(plan) => plan.apply().await?,
+            None => 1,
+        };
+        let prepared_instances = apply_instance_event_repairs(inspected_instances).await?;
         let events = EventLogWriter::spawn(&self.context, events_path);
-        let instances = if persisted {
-            load_instance_states(&self.context, &self.layout, document.agent()).await?
-        } else {
-            BTreeMap::new()
-        };
+        let instances = start_instance_states(&self.context, &self.layout, document.agent(), prepared_instances);
         let documents = AgentDocuments::new(document.clone(), persisted.then(|| document.clone()));
         let base = if persisted {
             document
@@ -830,11 +1008,45 @@ impl StartingAgentState {
             streams: Vec::new(),
             input: self.input.clone(),
             next_reconcile: Instant::now(),
+            next_work_id: 0,
         })
     }
 }
 
+impl LoadFailedAgentState {
+    fn handle_input(&self, input: AgentInput) {
+        let error = || Error::PersistedStateUnavailable {
+            name: self.agent.to_string(),
+            message: self.message.clone(),
+        };
+        match input {
+            AgentInput::Load | AgentInput::Work(_) => {}
+            AgentInput::Command(command) => match command {
+                AgentCommand::Apply { respond, .. }
+                | AgentCommand::Scale { respond, .. }
+                | AgentCommand::Delete { respond }
+                | AgentCommand::Document { respond } => respond.try_send(Err(error())),
+                AgentCommand::OpenStream { respond, .. } => respond.try_send(Err(error())),
+                AgentCommand::InstanceStatus { respond, .. } => respond.try_send(Err(error())),
+                AgentCommand::InstanceLogs { respond, .. } => respond.try_send(Err(error())),
+                AgentCommand::InstanceExec { respond, .. } => respond.try_send(Err(error())),
+                AgentCommand::InstanceShell { respond, .. } => respond.try_send(Err(error())),
+                AgentCommand::ListItems { respond } => respond.try_send(Err(error())),
+            },
+        }
+    }
+}
+
 impl RunningAgentState {
+    fn allocate_work_id(&mut self) -> u64 {
+        let work_id = self.next_work_id;
+        let Some(next_work_id) = self.next_work_id.checked_add(1) else {
+            std::process::abort();
+        };
+        self.next_work_id = next_work_id;
+        work_id
+    }
+
     fn work_services(&self) -> AgentWorkServices {
         AgentWorkServices {
             input: self.input.clone(),
@@ -854,24 +1066,28 @@ impl RunningAgentState {
                 }
                 continue;
             };
-            if instance.work.is_none()
-                && instance.session.is_none()
-                && instance.documents.private.spec.target == AgentInstanceTarget::Active
-                && instance
-                    .documents
-                    .private
-                    .status
-                    .readiness
-                    .as_ref()
-                    .is_none_or(|state| !state.ready)
-                && let Some(retry) = instance.bootstrap_retry
-            {
+            if let Some(retry) = instance.bootstrap_retry_wake() {
                 deadline = Some(deadline.map_or(retry, |current| current.min(retry)));
+            }
+            if should_reconcile_runtime_secrets(instance) {
+                deadline = Some(deadline.map_or(instance.runtime_secrets.next_at, |current| {
+                    current.min(instance.runtime_secrets.next_at)
+                }));
             }
             if should_reconcile_host_inputs(instance) {
                 deadline = Some(deadline.map_or(instance.host_inputs.next_at, |current| {
                     current.min(instance.host_inputs.next_at)
                 }));
+            }
+            if !instance.blocks_instance_transition()
+                && matches!(
+                    instance.documents.private.status.phase,
+                    AgentInstancePhase::Deleting | AgentInstancePhase::Deleted
+                )
+                && cleanup_phase_persisted(instance, instance.documents.private.status.phase)
+            {
+                let retry = instance.cleanup_retry.unwrap_or_else(Instant::now);
+                deadline = Some(deadline.map_or(retry, |current| current.min(retry)));
             }
         }
         deadline
@@ -1067,7 +1283,13 @@ impl RunningAgentState {
                     process_status: reconciliation.map(|state| state.observed_status.clone()),
                     process_message: reconciliation.and_then(|state| state.reason.clone()),
                     pid: reconciliation.and_then(|state| state.observed_pid),
-                    ready: document.status.readiness.as_ref().map(|readiness| readiness.ready),
+                    ready: document.status.readiness.as_ref().map(|readiness| {
+                        readiness.ready
+                            && document
+                                .status
+                                .host_inputs
+                                .is_ready_for(document.spec.desired_generation)
+                    }),
                 }
             })
             .collect()
@@ -1120,7 +1342,8 @@ impl RunningAgentState {
             }
         };
         let shell_command = shell_join(&command);
-        let (generation, instance_document, network) = {
+        let work_id = self.allocate_work_id();
+        let (instance_document, network) = {
             let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
                 respond.try_send(Err(instance_not_found(&self.agent, id)));
                 return;
@@ -1139,12 +1362,11 @@ impl RunningAgentState {
                 }));
                 return;
             }
-            let generation = instance.documents.private.spec.desired_generation;
             let instance_document = instance.documents.private.clone();
             let network = Rc::clone(&instance.network_runtime);
-            instance.session = Some(ForegroundSession { respond });
+            instance.session = Some(ForegroundSession { work_id, respond });
             instance.documents.private.status.work.sessions.active = 1;
-            (generation, instance_document, network)
+            (instance_document, network)
         };
         self.emit_instance_event(
             id,
@@ -1163,7 +1385,7 @@ impl RunningAgentState {
             network,
             document: instance_document,
             id,
-            generation,
+            work_id,
             command,
             shell_command,
             output,
@@ -1189,8 +1411,22 @@ impl RunningAgentState {
             return Ok(());
         }
         self.documents.write(updated.clone(), &self.base, &mut self.instances);
-        if updated.generation() != previous_generation
-            || (updated.desired_agent_base_key().is_none() && updated.ready_agent_base_key().is_none())
+        let generation_changed = updated.generation() != previous_generation;
+        if generation_changed {
+            for instance in self.instances.values_mut().filter_map(AgentInstanceState::running_mut) {
+                instance.runtime_secrets.next_at = Instant::now();
+                instance.runtime_secrets.failure_count = 0;
+                instance.secret_host_files = None;
+                instance.host_inputs.next_at = Instant::now();
+                instance.host_inputs.failure_count = 0;
+            }
+        }
+        if (generation_changed
+            || (updated.desired_agent_base_key().is_none() && updated.ready_agent_base_key().is_none()))
+            && !matches!(
+                self.base,
+                AgentBaseState::Preparing { .. } | AgentBaseState::Building { .. } | AgentBaseState::Stopping { .. }
+            )
         {
             self.base = AgentBaseState::Missing;
         }
@@ -1230,13 +1466,15 @@ impl RunningAgentState {
             | WorkCompletion::InstanceReconciled { .. }
             | WorkCompletion::InstanceStarted { .. }
             | WorkCompletion::InstanceStopped { .. }
+            | WorkCompletion::InstanceDeleteRuntimeStopped { .. }
             | WorkCompletion::InstanceDeleted { .. }
             | WorkCompletion::InstanceDeleteTimedOut { .. } => self.handle_instance_completion(completion),
             WorkCompletion::BootstrapStarted { .. }
             | WorkCompletion::BootstrapEvent { .. }
-            | WorkCompletion::BootstrapFinished { .. } => self.handle_bootstrap_completion(&completion),
+            | WorkCompletion::BootstrapFinished { .. } => self.handle_bootstrap_completion(completion),
             WorkCompletion::TailscaleServeReconciled { .. } => self.handle_tailscale_completion(&completion),
-            WorkCompletion::HostInputsReconciled { .. } => self.handle_host_inputs_completion(&completion),
+            WorkCompletion::RuntimeSecretsReconciled { .. } => self.handle_runtime_secrets_completion(completion),
+            WorkCompletion::HostInputsReconciled { .. } => self.handle_host_inputs_completion(completion),
             WorkCompletion::ExecFinished { .. } => self.handle_exec_completion(&completion),
         }
     }
@@ -1248,10 +1486,11 @@ impl RunningAgentState {
     fn handle_base_completion(&mut self, completion: WorkCompletion) {
         match completion {
             WorkCompletion::BasePrepared {
+                work_id,
                 generation,
                 preparation,
             } => {
-                if !matches!(self.base, AgentBaseState::Preparing { generation: active } if active == generation) {
+                if !matches!(self.base, AgentBaseState::Preparing { work_id: active, .. } if active == work_id) {
                     return;
                 }
                 if generation != self.documents.private.generation() {
@@ -1262,6 +1501,7 @@ impl RunningAgentState {
                 self.documents.private.mark_agent_base_desired(key.clone());
                 let document = self.documents.private.clone();
                 self.base = AgentBaseState::Building {
+                    work_id,
                     generation,
                     key: key.clone(),
                 };
@@ -1271,18 +1511,23 @@ impl RunningAgentState {
                     self.backend.clone(),
                     self.layout.clone(),
                     document,
-                    generation,
-                    preparation,
+                    TaskAttempt { work_id, generation },
+                    *preparation,
                 );
                 self.emit(AgentEventSource::AgentBase, AgentEvent::AgentBaseStarted { key });
             }
-            WorkCompletion::BaseBuilt { generation, key } => {
+            WorkCompletion::BaseBuilt {
+                work_id,
+                generation,
+                key,
+            } => {
                 if !matches!(
                     &self.base,
                     AgentBaseState::Building {
+                        work_id: active_work,
                         generation: active,
                         key: active_key,
-                    } if *active == generation && active_key == &key
+                    } if *active_work == work_id && *active == generation && active_key == &key
                 ) {
                     return;
                 }
@@ -1299,39 +1544,44 @@ impl RunningAgentState {
                 self.base = AgentBaseState::Ready { key: key.clone() };
                 self.emit(AgentEventSource::AgentBase, AgentEvent::AgentBaseReady { key });
             }
-            WorkCompletion::BaseFailed { generation, error } => {
+            WorkCompletion::BaseFailed {
+                work_id,
+                generation,
+                error,
+            } => {
                 let failed_key = match &self.base {
-                    AgentBaseState::Preparing { generation: active } if *active == generation => {
+                    AgentBaseState::Preparing { work_id: active, .. } if *active == work_id => {
                         self.documents.private.desired_agent_base_key().cloned()
                     }
                     AgentBaseState::Building {
-                        generation: active,
-                        key,
-                    } if *active == generation => Some(key.clone()),
+                        work_id: active, key, ..
+                    } if *active == work_id => Some(key.clone()),
                     _ => return,
                 };
-                {
-                    self.base = AgentBaseState::Failed {
-                        generation,
-                        key: failed_key.clone(),
-                    };
-                    self.documents.private.mark_agent_base_failed(error.clone());
-                    self.emit(
-                        AgentEventSource::AgentBase,
-                        AgentEvent::AgentBaseFailed {
-                            key: failed_key.unwrap_or_else(|| AgentBaseKey::new("unknown")),
-                            error,
-                        },
-                    );
+                if generation != self.documents.private.generation() {
+                    self.base = AgentBaseState::Missing;
+                    return;
                 }
+                self.base = AgentBaseState::Failed {
+                    generation,
+                    key: failed_key.clone(),
+                };
+                self.documents.private.mark_agent_base_failed(error.clone());
+                self.emit(
+                    AgentEventSource::AgentBase,
+                    AgentEvent::AgentBaseFailed {
+                        key: failed_key.unwrap_or_else(|| AgentBaseKey::new("unknown")),
+                        error,
+                    },
+                );
             }
-            WorkCompletion::BaseStopped { generation } => {
-                if generation == self.documents.private.generation() {
+            WorkCompletion::BaseStopped { work_id } => {
+                if matches!(self.base, AgentBaseState::Stopping { work_id: active } if active == work_id) {
                     self.base = AgentBaseState::Stopped;
                 }
             }
-            WorkCompletion::BaseStopTimedOut { generation } => {
-                if generation == self.documents.private.generation() {
+            WorkCompletion::BaseStopTimedOut { work_id } => {
+                if matches!(self.base, AgentBaseState::Stopping { work_id: active } if active == work_id) {
                     self.base = AgentBaseState::Stopped;
                     self.emit(
                         AgentEventSource::AgentBase,
@@ -1349,8 +1599,10 @@ impl RunningAgentState {
             | WorkCompletion::BootstrapEvent { .. }
             | WorkCompletion::BootstrapFinished { .. }
             | WorkCompletion::TailscaleServeReconciled { .. }
+            | WorkCompletion::RuntimeSecretsReconciled { .. }
             | WorkCompletion::HostInputsReconciled { .. }
             | WorkCompletion::InstanceStopped { .. }
+            | WorkCompletion::InstanceDeleteRuntimeStopped { .. }
             | WorkCompletion::InstanceDeleted { .. }
             | WorkCompletion::InstanceDeleteTimedOut { .. }
             | WorkCompletion::ExecFinished { .. } => {}
@@ -1361,68 +1613,39 @@ impl RunningAgentState {
         match completion {
             WorkCompletion::InstanceCreated {
                 id,
+                work_id,
                 generation,
                 document,
-            } => self.complete_instance_create(id, generation, document),
+            } => self.complete_instance_create(id, work_id, generation, *document),
             WorkCompletion::InstanceStarted {
                 id,
+                work_id,
                 generation,
-                document,
-            } => {
-                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Starting, document, true);
-            }
+                outcome,
+            } => self.complete_instance_start(id, work_id, generation, outcome),
             WorkCompletion::InstanceReconciled {
                 id,
+                work_id,
                 generation,
-                document,
-            } => {
-                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Reconciling, document, true);
-            }
+                outcome,
+            } => self.complete_instance_reconcile(id, work_id, generation, outcome),
             WorkCompletion::InstanceStopped {
                 id,
+                work_id,
                 generation,
-                document,
-            } => {
-                self.apply_instance_document_completion(id, generation, AgentInstanceWork::Stopping, document, true);
-            }
-            WorkCompletion::InstanceDeleted { id, generation } => {
-                let Some(instance) = self.instances.get(&id).and_then(AgentInstanceState::running_ref) else {
-                    return;
-                };
-                if generation == instance.documents.private.spec.desired_generation
-                    && instance.work == Some(AgentInstanceWork::Deleting)
-                {
-                    self.instances.remove(&id);
-                    self.emit(
-                        AgentEventSource::Controller,
-                        AgentEvent::InstanceDeleted { instance_id: id },
-                    );
-                }
-            }
-            WorkCompletion::InstanceDeleteTimedOut {
+                control,
+                outcome,
+            } => self.complete_instance_stop(id, work_id, generation, control, outcome),
+            WorkCompletion::InstanceDeleteRuntimeStopped {
                 id,
+                work_id,
                 generation,
-                ref error,
-            } => {
-                let Some(instance) = self.instances.get(&id).and_then(AgentInstanceState::running_ref) else {
-                    return;
-                };
-                if generation == instance.documents.private.spec.desired_generation
-                    && instance.work == Some(AgentInstanceWork::Deleting)
-                {
-                    self.instances.remove(&id);
-                    self.emit(
-                        AgentEventSource::Instance { id },
-                        AgentEvent::Diagnostic {
-                            level: EventLevel::Warn,
-                            message: format!("{id}: instance delete timed out; cleanup continued: {error}"),
-                        },
-                    );
-                    self.emit(
-                        AgentEventSource::Controller,
-                        AgentEvent::InstanceDeleted { instance_id: id },
-                    );
-                }
+                control,
+                outcome,
+            } => self.complete_instance_delete_runtime(id, work_id, generation, control, outcome),
+            WorkCompletion::InstanceDeleted { id, work_id } => self.complete_instance_delete(id, work_id, None),
+            WorkCompletion::InstanceDeleteTimedOut { id, work_id, error } => {
+                self.complete_instance_delete(id, work_id, Some(error));
             }
             WorkCompletion::BasePrepared { .. }
             | WorkCompletion::BaseBuilt { .. }
@@ -1433,20 +1656,90 @@ impl RunningAgentState {
             | WorkCompletion::BootstrapEvent { .. }
             | WorkCompletion::BootstrapFinished { .. }
             | WorkCompletion::TailscaleServeReconciled { .. }
+            | WorkCompletion::RuntimeSecretsReconciled { .. }
             | WorkCompletion::HostInputsReconciled { .. }
             | WorkCompletion::ExecFinished { .. } => {}
         }
     }
 
+    fn complete_instance_delete_runtime(
+        &mut self,
+        id: AgentInstanceId,
+        work_id: u64,
+        generation: u64,
+        control: Option<backend::InstanceControl>,
+        outcome: InstanceStopOutcome,
+    ) {
+        let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+            return;
+        };
+        if !instance.work.is_some_and(|work| {
+            work.id == work_id && work.kind == AgentInstanceWorkKind::Deleting && work.input_generation == generation
+        }) {
+            return;
+        }
+        instance.control = control;
+        instance.documents.private.status.backend = outcome.backend;
+        instance.documents.private.status.tailscale_serve = outcome.tailscale_serve;
+        match outcome.result {
+            Ok(_) => {
+                clear_instance_work(instance);
+                instance.cleanup_retry = None;
+                instance.documents.private.status.phase = AgentInstancePhase::Deleted;
+            }
+            Err(error) => {
+                clear_instance_work(instance);
+                instance.cleanup_retry = Some(Instant::now() + INSTANCE_DELETE_RETRY_DELAY);
+                self.emit(
+                    AgentEventSource::Instance { id },
+                    AgentEvent::Diagnostic {
+                        level: EventLevel::Warn,
+                        message: format!("{id}: instance delete timed out; cleanup will retry: {error}"),
+                    },
+                );
+            }
+        }
+    }
+
+    fn complete_instance_delete(&mut self, id: AgentInstanceId, work_id: u64, error: Option<String>) {
+        let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+            return;
+        };
+        if !instance
+            .work
+            .is_some_and(|work| work.id == work_id && work.kind == AgentInstanceWorkKind::Deleting)
+        {
+            return;
+        }
+        if let Some(error) = error {
+            clear_instance_work(instance);
+            instance.cleanup_retry = Some(Instant::now() + INSTANCE_DELETE_RETRY_DELAY);
+            self.emit(
+                AgentEventSource::Instance { id },
+                AgentEvent::Diagnostic {
+                    level: EventLevel::Warn,
+                    message: format!("{id}: instance delete timed out; cleanup will retry: {error}"),
+                },
+            );
+            return;
+        }
+        self.instances.remove(&id);
+        self.emit(
+            AgentEventSource::Controller,
+            AgentEvent::InstanceDeleted { instance_id: id },
+        );
+    }
+
     fn complete_instance_create(
         &mut self,
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
         document: Result<AgentInstanceDocument, String>,
     ) {
         if !matches!(
             self.instances.get(&id),
-            Some(AgentInstanceState::Starting(pending)) if pending.generation == generation
+            Some(AgentInstanceState::Starting(pending)) if pending.work_id == work_id
         ) {
             return;
         }
@@ -1455,22 +1748,16 @@ impl RunningAgentState {
         };
         match document {
             Ok(document) => {
-                self.instances.insert(
-                    id,
-                    AgentInstanceState::running(
-                        document,
-                        None,
-                        pending.event_sequence,
-                        pending.events,
-                        pending.network_runtime,
-                        pending.network_events,
-                    ),
-                );
-                self.emit(
-                    AgentEventSource::Controller,
-                    AgentEvent::InstanceCreated { instance_id: id },
-                );
+                self.instances
+                    .insert(id, running_instance_from_created_document(document, pending));
+                if generation == self.documents.private.generation() {
+                    self.emit(
+                        AgentEventSource::Controller,
+                        AgentEvent::InstanceCreated { instance_id: id },
+                    );
+                }
             }
+            Err(_) if generation != self.documents.private.generation() => {}
             Err(error) => {
                 let mut pending = pending;
                 pending.failure_count = pending.failure_count.saturating_add(1);
@@ -1487,40 +1774,165 @@ impl RunningAgentState {
         }
     }
 
-    fn apply_instance_document_completion(
+    fn complete_instance_start(
         &mut self,
         id: AgentInstanceId,
+        work_id: u64,
         generation: u64,
-        expected_work: AgentInstanceWork,
-        document: Result<AgentInstanceDocument, String>,
-        mark_observed: bool,
-    ) -> bool {
+        outcome: InstanceBackendOutcome<backend::StartOutput>,
+    ) {
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
-            return false;
+            return;
         };
-        if generation != instance.documents.private.spec.desired_generation || instance.work != Some(expected_work) {
-            return false;
+        if !instance.work.is_some_and(|work| {
+            work.id == work_id && work.kind == AgentInstanceWorkKind::Starting && work.input_generation == generation
+        }) {
+            return;
         }
-        apply_transition_document(instance, document);
-        instance.bootstrap_retry = bootstrap_retry_deadline(&instance.documents.private);
-        if mark_observed {
-            instance.documents.private.status.mark_observed_generation(generation);
+        let relevant = generation == instance.documents.private.spec.desired_generation;
+        let cleaning_up = instance.documents.private.spec.target == AgentInstanceTarget::Deleting
+            || matches!(
+                instance.documents.private.status.phase,
+                AgentInstancePhase::Deleting | AgentInstancePhase::Deleted
+            );
+        instance.documents.private.status.backend = outcome.backend;
+        match outcome.result {
+            Ok(started) if !cleaning_up => {
+                if relevant {
+                    apply_bound_host_ports(&mut instance.documents.private.status.network, &started.host_ports);
+                }
+                instance.documents.private.status.phase = AgentInstancePhase::Running;
+                instance.documents.private.status.clear_readiness();
+                instance.documents.private.status.reconciliation =
+                    relevant.then_some(agentdp_core::agent::ReconciliationState {
+                        stale: false,
+                        observed_status: started.process.status,
+                        observed_pid: started.process.pid,
+                        reason: started.process.message,
+                    });
+            }
+            Ok(_) => {
+                instance.documents.private.status.clear_readiness();
+                instance.documents.private.status.reconciliation = None;
+                instance.cleanup_retry = None;
+            }
+            Err(error) if relevant && !cleaning_up => mark_instance_transition_failed(instance, error),
+            Err(_) => {}
         }
         clear_instance_work(instance);
-        true
+    }
+
+    fn complete_instance_reconcile(
+        &mut self,
+        id: AgentInstanceId,
+        work_id: u64,
+        generation: u64,
+        outcome: InstanceBackendOutcome<backend::ReconcileOutput>,
+    ) {
+        let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+            return;
+        };
+        let Some(work) = instance.work.filter(|work| {
+            work.id == work_id
+                && matches!(
+                    work.kind,
+                    AgentInstanceWorkKind::Reconciling | AgentInstanceWorkKind::Repairing
+                )
+                && work.input_generation == generation
+        }) else {
+            return;
+        };
+        let repairing = work.kind == AgentInstanceWorkKind::Repairing;
+        let relevant = generation == instance.documents.private.spec.desired_generation;
+        instance.documents.private.status.backend = outcome.backend;
+        if repairing && outcome.result.is_ok() {
+            instance.runtime_repair = RuntimeRepairState::Idle;
+        }
+        match outcome.result {
+            Ok(reconciled) if relevant => {
+                apply_bound_host_ports(&mut instance.documents.private.status.network, &reconciled.host_ports);
+                instance.documents.private.status.reconciliation = Some(agentdp_core::agent::ReconciliationState {
+                    stale: reconciled.stale,
+                    observed_status: reconciled.process.status,
+                    observed_pid: reconciled.process.pid,
+                    reason: reconciled.process.message,
+                });
+                if reconciled.mark_stopped {
+                    instance.documents.private.status.phase = AgentInstancePhase::Stopped;
+                    instance.documents.private.status.clear_readiness();
+                }
+            }
+            Ok(reconciled) => {
+                if reconciled.mark_stopped {
+                    instance.documents.private.status.phase = AgentInstancePhase::Stopped;
+                    instance.documents.private.status.clear_readiness();
+                }
+                instance.documents.private.status.reconciliation = None;
+            }
+            Err(error) if relevant && !repairing => mark_instance_transition_failed(instance, error),
+            Err(_) => {}
+        }
+        clear_instance_work(instance);
+    }
+
+    fn complete_instance_stop(
+        &mut self,
+        id: AgentInstanceId,
+        work_id: u64,
+        generation: u64,
+        control: Option<backend::InstanceControl>,
+        outcome: InstanceStopOutcome,
+    ) {
+        let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+            return;
+        };
+        if !instance.work.is_some_and(|work| {
+            work.id == work_id && work.kind == AgentInstanceWorkKind::Stopping && work.input_generation == generation
+        }) {
+            return;
+        }
+        let relevant = generation == instance.documents.private.spec.desired_generation;
+        instance.control = control;
+        instance.documents.private.status.backend = outcome.backend;
+        instance.documents.private.status.tailscale_serve = outcome.tailscale_serve;
+        match outcome.result {
+            Ok(stopped) => {
+                instance.documents.private.status.phase = AgentInstancePhase::Stopped;
+                instance.documents.private.status.clear_readiness();
+                instance.documents.private.status.reconciliation = Some(agentdp_core::agent::ReconciliationState {
+                    stale: false,
+                    observed_status: stopped.process_status.to_owned(),
+                    observed_pid: None,
+                    reason: None,
+                });
+            }
+            Err(error) if relevant => mark_instance_transition_failed(instance, error),
+            Err(_) => {}
+        }
+        clear_instance_work(instance);
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "bootstrap state transitions are kept together so success, failure, and event emission remain visible in one place"
     )]
-    fn handle_bootstrap_completion(&mut self, completion: &WorkCompletion) {
+    fn handle_bootstrap_completion(&mut self, completion: WorkCompletion) {
         match completion {
-            WorkCompletion::BootstrapStarted { id, generation } => {
-                let Some(instance) = self.instances.get_mut(id).and_then(AgentInstanceState::running_mut) else {
+            WorkCompletion::BootstrapStarted {
+                id,
+                work_id,
+                generation,
+            } => {
+                let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
                     return;
                 };
-                if *generation == instance.documents.private.spec.desired_generation {
+                if generation == instance.documents.private.spec.desired_generation
+                    && instance.work.is_some_and(|work| {
+                        work.id == work_id
+                            && work.kind == AgentInstanceWorkKind::Bootstrapping
+                            && work.input_generation == generation
+                    })
+                {
                     instance.documents.private.status.work.bootstrap = Some(AgentInstanceBootstrapWorkStatus {
                         phase: AgentInstanceBootstrapWorkPhase::Running,
                         current_step: None,
@@ -1529,7 +1941,7 @@ impl RunningAgentState {
                         next_retry_unix_seconds: None,
                     });
                     self.emit_instance_event(
-                        *id,
+                        id,
                         AgentInstanceEventSource::Bootstrap,
                         AgentInstanceEvent::BootstrapStarted,
                     );
@@ -1537,27 +1949,41 @@ impl RunningAgentState {
             }
             WorkCompletion::BootstrapEvent {
                 source,
+                work_id,
                 generation,
                 event,
-            } => self.apply_bootstrap_event(*source, *generation, event.clone()),
+            } => self.apply_bootstrap_event(source, work_id, generation, event),
             WorkCompletion::BootstrapFinished {
                 id,
+                work_id,
                 generation,
-                document,
+                control,
+                result,
             } => {
-                let Some(instance) = self.instances.get_mut(id).and_then(AgentInstanceState::running_mut) else {
+                let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
                     return;
                 };
-                if *generation != instance.documents.private.spec.desired_generation
-                    || instance.work != Some(AgentInstanceWork::Bootstrapping)
-                {
+                if !instance.work.is_some_and(|work| {
+                    work.id == work_id
+                        && work.kind == AgentInstanceWorkKind::Bootstrapping
+                        && work.input_generation == generation
+                }) {
                     return;
                 }
-                let document = match document {
-                    Ok(document) => document.clone(),
-                    Err(error) => {
+                instance.control = control;
+                if generation != instance.documents.private.spec.desired_generation {
+                    if let Ok(tailscale_serve) = result {
+                        instance.documents.private.status.tailscale_serve = tailscale_serve;
+                    }
+                    clear_instance_work(instance);
+                    instance.bootstrap_retry = None;
+                    return;
+                }
+                let tailscale_serve = match result {
+                    Ok(tailscale_serve) => tailscale_serve,
+                    Err(failure) => {
+                        let BootstrapTaskFailure { attempt_epoch, error } = failure;
                         let now = time::unix_seconds();
-                        let next_retry_unix_seconds = now.saturating_add(INSTANCE_BOOTSTRAP_RETRY_DELAY.as_secs());
                         let failure_count = instance
                             .documents
                             .private
@@ -1565,17 +1991,29 @@ impl RunningAgentState {
                             .bootstrap
                             .as_ref()
                             .map_or(1, |state| state.failure_count.saturating_add(1));
+                        let observed_attempt_epoch = attempt_epoch.or_else(|| {
+                            instance
+                                .documents
+                                .private
+                                .status
+                                .bootstrap
+                                .as_ref()
+                                .and_then(|state| state.attempt_epoch)
+                        });
+                        let retry_delay = bootstrap_retry_delay(failure_count);
+                        let next_retry_unix_seconds = now.saturating_add(retry_delay.as_secs());
                         instance
                             .documents
                             .private
                             .status
                             .record_bootstrap_failure(AgentInstanceBootstrapState {
+                                attempt_epoch: observed_attempt_epoch,
                                 failure_count,
                                 last_failure_unix_seconds: now,
                                 next_retry_unix_seconds,
                                 last_error: error.clone(),
                             });
-                        instance.bootstrap_retry = Some(Instant::now() + INSTANCE_BOOTSTRAP_RETRY_DELAY);
+                        instance.bootstrap_retry = Some(Instant::now() + retry_delay);
                         instance.documents.private.status.work.bootstrap = Some(AgentInstanceBootstrapWorkStatus {
                             phase: AgentInstanceBootstrapWorkPhase::BackingOff,
                             current_step: None,
@@ -1585,16 +2023,16 @@ impl RunningAgentState {
                         });
                         instance.work = None;
                         self.emit_instance_event(
-                            *id,
+                            id,
                             AgentInstanceEventSource::Bootstrap,
                             AgentInstanceEvent::BootstrapFinished {
-                                result: OperationResult::Failed { error: error.clone() },
+                                result: OperationResult::Failed { error },
                             },
                         );
                         return;
                     }
                 };
-                instance.documents.private = document;
+                instance.documents.private.status.tailscale_serve = tailscale_serve;
                 let readiness_result = ready_result(&instance.documents.private);
                 instance.documents.private.status.mark_ready(ReadinessState {
                     ready: true,
@@ -1604,7 +2042,7 @@ impl RunningAgentState {
                 instance.bootstrap_retry = None;
                 clear_instance_work(instance);
                 self.emit_instance_event(
-                    *id,
+                    id,
                     AgentInstanceEventSource::Bootstrap,
                     AgentInstanceEvent::BootstrapFinished {
                         result: OperationResult::Succeeded,
@@ -1620,9 +2058,11 @@ impl RunningAgentState {
             | WorkCompletion::InstanceReconciled { .. }
             | WorkCompletion::InstanceStarted { .. }
             | WorkCompletion::InstanceStopped { .. }
+            | WorkCompletion::InstanceDeleteRuntimeStopped { .. }
             | WorkCompletion::InstanceDeleted { .. }
             | WorkCompletion::InstanceDeleteTimedOut { .. }
             | WorkCompletion::TailscaleServeReconciled { .. }
+            | WorkCompletion::RuntimeSecretsReconciled { .. }
             | WorkCompletion::HostInputsReconciled { .. }
             | WorkCompletion::ExecFinished { .. } => {}
         }
@@ -1631,8 +2071,9 @@ impl RunningAgentState {
     fn handle_tailscale_completion(&mut self, completion: &WorkCompletion) {
         let WorkCompletion::TailscaleServeReconciled {
             id,
+            work_id,
             generation,
-            document,
+            result,
         } = completion
         else {
             return;
@@ -1642,19 +2083,26 @@ impl RunningAgentState {
             let Some(instance) = self.instances.get_mut(id).and_then(AgentInstanceState::running_mut) else {
                 return;
             };
-            if *generation != instance.documents.private.spec.desired_generation
-                || instance.work != Some(AgentInstanceWork::Reconciling)
-            {
+            if !instance.work.is_some_and(|work| {
+                work.id == *work_id
+                    && work.kind == AgentInstanceWorkKind::Reconciling
+                    && work.input_generation == *generation
+            }) {
                 return;
             }
-            match document {
-                Ok(document) => {
-                    instance.documents.private = document.clone();
-                    instance.documents.private.status.mark_observed_generation(*generation);
+            match result {
+                Ok(tailscale_serve) => {
+                    instance
+                        .documents
+                        .private
+                        .status
+                        .tailscale_serve
+                        .clone_from(tailscale_serve);
                 }
-                Err(error) => {
+                Err(error) if *generation == instance.documents.private.spec.desired_generation => {
                     warning = Some(format!("{id}: failed to reconcile Tailscale serve: {error}"));
                 }
+                Err(_) => {}
             }
             clear_instance_work(instance);
         }
@@ -1669,53 +2117,143 @@ impl RunningAgentState {
         }
     }
 
-    fn handle_host_inputs_completion(&mut self, completion: &WorkCompletion) {
-        let WorkCompletion::HostInputsReconciled { id, generation, result } = completion else {
+    fn handle_runtime_secrets_completion(&mut self, completion: WorkCompletion) {
+        let WorkCompletion::RuntimeSecretsReconciled {
+            id,
+            generation,
+            work_id,
+            outcome,
+        } = completion
+        else {
             return;
         };
         let mut diagnostic = None;
         {
-            let Some(instance) = self.instances.get_mut(id).and_then(AgentInstanceState::running_mut) else {
+            let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
                 return;
             };
-            if !instance.host_inputs.in_flight {
+            if instance.runtime_secrets.active_work_id != Some(work_id) {
                 return;
             }
-            instance.host_inputs.in_flight = false;
-            if *generation != instance.documents.private.spec.desired_generation {
-                instance.host_inputs.next_at = Instant::now();
+            instance.runtime_secrets.active_work_id.take();
+            if generation != instance.documents.private.spec.desired_generation {
+                instance.runtime_secrets.next_at = Instant::now();
                 return;
             }
+            match outcome.result {
+                Ok(output) => {
+                    instance.documents.private.status.backend = outcome.backend;
+                    instance.runtime_repair = RuntimeRepairState::Idle;
+                    instance.secret_host_files = Some(output.secret_files);
+                    instance.runtime_secrets.failure_count = 0;
+                    instance.runtime_secrets.next_at = Instant::now() + HOST_INPUT_RECONCILE_INTERVAL;
+                    instance.host_inputs.next_at = Instant::now();
+                }
+                Err(error) => {
+                    instance.runtime_repair = RuntimeRepairState::Due;
+                    instance.runtime_secrets.failure_count = instance.runtime_secrets.failure_count.saturating_add(1);
+                    instance.runtime_secrets.next_at =
+                        Instant::now() + host_input_reconcile_retry_delay(instance.runtime_secrets.failure_count);
+                    instance
+                        .documents
+                        .private
+                        .status
+                        .host_inputs
+                        .record_failure(generation, format!("runtime secret refresh failed: {error}"));
+                    diagnostic = Some(format!(
+                        "{id}: failed to refresh runtime secrets (attempt {}): {error}",
+                        instance.runtime_secrets.failure_count
+                    ));
+                }
+            }
+        }
+        if let Some(message) = diagnostic {
+            self.emit(
+                AgentEventSource::Instance { id },
+                AgentEvent::Diagnostic {
+                    level: EventLevel::Warn,
+                    message,
+                },
+            );
+        }
+    }
+
+    fn handle_host_inputs_completion(&mut self, completion: WorkCompletion) {
+        let WorkCompletion::HostInputsReconciled {
+            id,
+            generation,
+            work_id,
+            control,
+            result,
+        } = completion
+        else {
+            return;
+        };
+        let mut diagnostic = None;
+        {
+            let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+                return;
+            };
+            if instance.host_inputs.active_work_id != Some(work_id) {
+                return;
+            }
+            instance.host_inputs.active_work_id.take();
+            instance.control = control;
             match result {
-                Ok((backend_state, output)) => {
-                    instance.documents.private.status.backend = backend_state.clone();
-                    if output.guest_file_failures > 0 {
+                Ok(output) => {
+                    if generation != instance.documents.private.spec.desired_generation {
+                        instance.host_inputs.next_at = Instant::now();
+                        return;
+                    }
+                    if output.file_failures > 0 {
                         instance.host_inputs.failure_count = instance.host_inputs.failure_count.saturating_add(1);
                         instance.host_inputs.next_at =
                             Instant::now() + host_input_reconcile_retry_delay(instance.host_inputs.failure_count);
+                        let error = output
+                            .file_errors
+                            .iter()
+                            .map(|failure| format!("{}: {}", failure.path, failure.error))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        instance
+                            .documents
+                            .private
+                            .status
+                            .host_inputs
+                            .record_failure(generation, format!("guest file writes failed: {error}"));
                         diagnostic = Some((
                             EventLevel::Warn,
                             format!(
-                                "{id}: host input guest file writes failed: {}; live network secrets refreshed",
-                                output.guest_file_failures
+                                "{id}: host input guest file writes failed: {}: {}",
+                                output.file_failures, error
                             ),
                         ));
                     } else {
                         instance.host_inputs.failure_count = 0;
                         instance.host_inputs.next_at = Instant::now() + HOST_INPUT_RECONCILE_INTERVAL;
-                        if output.guest_files_updated > 0 {
+                        instance.documents.private.status.host_inputs.mark_ready(generation);
+                        if output.files_updated > 0 {
                             diagnostic = Some((
                                 EventLevel::Info,
-                                format!("{id}: wrote host input file updates: {}", output.guest_files_updated),
+                                format!("{id}: wrote host input file updates: {}", output.files_updated),
                             ));
                         }
                     }
                 }
-                Err((backend_state, error)) => {
-                    instance.documents.private.status.backend = backend_state.clone();
+                Err(error) => {
+                    if generation != instance.documents.private.spec.desired_generation {
+                        instance.host_inputs.next_at = Instant::now();
+                        return;
+                    }
                     instance.host_inputs.failure_count = instance.host_inputs.failure_count.saturating_add(1);
                     instance.host_inputs.next_at =
                         Instant::now() + host_input_reconcile_retry_delay(instance.host_inputs.failure_count);
+                    instance
+                        .documents
+                        .private
+                        .status
+                        .host_inputs
+                        .record_failure(generation, format!("host input reconciliation failed: {error}"));
                     diagnostic = Some((
                         EventLevel::Warn,
                         format!(
@@ -1728,16 +2266,22 @@ impl RunningAgentState {
         }
         if let Some((level, message)) = diagnostic {
             self.emit(
-                AgentEventSource::Instance { id: *id },
+                AgentEventSource::Instance { id },
                 AgentEvent::Diagnostic { level, message },
             );
         }
     }
 
-    fn apply_bootstrap_event(&mut self, source: BootstrapSource, generation: u64, event: BootstrapEvent) {
+    fn apply_bootstrap_event(&mut self, source: BootstrapSource, work_id: u64, generation: u64, event: BootstrapEvent) {
         match source {
             BootstrapSource::AgentBase => {
-                if generation == self.documents.private.generation() {
+                let owns_event = matches!(
+                    self.base,
+                    AgentBaseState::Preparing { work_id: active, .. }
+                        | AgentBaseState::Building { work_id: active, .. }
+                        if active == work_id
+                );
+                if owns_event && generation == self.documents.private.generation() {
                     self.emit(AgentEventSource::AgentBase, AgentEvent::BootstrapEvent { event });
                 }
             }
@@ -1745,7 +2289,13 @@ impl RunningAgentState {
                 let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
                     return;
                 };
-                if generation != instance.documents.private.spec.desired_generation {
+                if generation != instance.documents.private.spec.desired_generation
+                    || !instance.work.is_some_and(|work| {
+                        work.id == work_id
+                            && work.kind == AgentInstanceWorkKind::Bootstrapping
+                            && work.input_generation == generation
+                    })
+                {
                     return;
                 }
                 match &event {
@@ -1789,7 +2339,7 @@ impl RunningAgentState {
     fn handle_exec_completion(&mut self, completion: &WorkCompletion) {
         let WorkCompletion::ExecFinished {
             id,
-            generation,
+            work_id,
             ref command,
             ref output,
         } = *completion
@@ -1799,10 +2349,7 @@ impl RunningAgentState {
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
-        if generation != instance.documents.private.spec.desired_generation {
-            return;
-        }
-        let Some(session) = instance.session.take() else {
+        let Some(session) = instance.session.take_if(|session| session.work_id == work_id) else {
             return;
         };
         instance.documents.private.status.work.sessions.active = 0;
@@ -1840,18 +2387,20 @@ impl RunningAgentState {
         if now >= self.next_reconcile {
             self.next_reconcile = now + AGENT_RECONCILE_INTERVAL;
         }
+        self.project_instance_desired_states();
+        self.reconcile_runtime_secrets();
         if self.documents.private.deletion_requested() {
             self.reconcile_deletion();
-            return;
-        }
-        if self.documents.private.phase() == AgentPhase::Paused || self.documents.private.replicas() == 0 {
+        } else if self.documents.private.phase() == AgentPhase::Paused || self.documents.private.replicas() == 0 {
             self.reconcile_inactive_instances();
-            return;
+        } else {
+            self.reconcile_cleanup_instances();
+            self.reconcile_base();
+            if self.agent_base_ready_for_document() {
+                self.reconcile_active_instances();
+            }
         }
-        self.reconcile_base();
-        if self.agent_base_ready_for_document() {
-            self.reconcile_active_instances();
-        }
+        self.reconcile_host_inputs();
     }
 
     fn agent_base_ready_for_document(&self) -> bool {
@@ -1872,37 +2421,67 @@ impl RunningAgentState {
         )
     }
 
+    fn project_instance_desired_states(&mut self) {
+        let document = self.documents.private.clone();
+        let manifest = document.manifest();
+        let inactive = document.phase() == AgentPhase::Paused || document.replicas() == 0;
+        let deleting = document.deletion_requested();
+        let ids = self.instances.keys().copied().collect::<Vec<_>>();
+        let mut warnings = Vec::new();
+        for id in ids {
+            let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+                continue;
+            };
+            let target = if deleting {
+                AgentInstanceTarget::Deleting
+            } else if inactive || id.as_u32() >= u32::from(document.replicas()) {
+                AgentInstanceTarget::Inactive
+            } else {
+                AgentInstanceTarget::Active
+            };
+            if let Some(warning) = project_instance_desired_state(instance, &document, &manifest, id, target) {
+                warnings.push((id, warning));
+            }
+            refresh_instance_observed_generation(instance);
+        }
+        for (id, message) in warnings {
+            self.emit(
+                AgentEventSource::Instance { id },
+                AgentEvent::Diagnostic {
+                    level: EventLevel::Warn,
+                    message,
+                },
+            );
+        }
+    }
+
     fn reconcile_deletion(&mut self) {
         self.drop_retrying_starting_instances(|_| true);
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
-            let services = self.work_services();
             if let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut)
-                && instance.work.is_none()
-                && instance.session.is_none()
+                && !matches!(
+                    instance.documents.private.status.phase,
+                    AgentInstancePhase::Deleting | AgentInstancePhase::Deleted
+                )
             {
-                instance.documents.private.spec.target = AgentInstanceTarget::Deleting;
-                admit_instance_work(instance, AgentInstanceWork::Deleting);
-                spawn_delete_instance(
-                    services,
-                    Rc::clone(&instance.network_runtime),
-                    self.layout.clone(),
-                    instance.documents.private.clone(),
-                    id,
-                    instance.documents.private.spec.desired_generation,
-                );
+                instance.documents.private.status.phase = AgentInstancePhase::Deleting;
+                instance.documents.private.status.clear_readiness();
+                instance.documents.private.status.reconciliation = None;
             }
+            self.reconcile_instance(id);
         }
         if self.instances.is_empty() {
+            let work_id = self.allocate_work_id();
             match &self.base {
                 AgentBaseState::Ready { .. } => {
-                    self.base = AgentBaseState::Stopping;
+                    self.base = AgentBaseState::Stopping { work_id };
                     spawn_stop_base(
                         self.input.clone(),
                         self.backend.clone(),
                         self.documents.private.clone(),
                         self.layout.clone(),
-                        self.documents.private.generation(),
+                        work_id,
                     );
                 }
                 AgentBaseState::Missing | AgentBaseState::Stopped => {
@@ -1912,62 +2491,60 @@ impl RunningAgentState {
                 AgentBaseState::Preparing { .. }
                 | AgentBaseState::Building { .. }
                 | AgentBaseState::Failed { .. }
-                | AgentBaseState::Stopping => {}
+                | AgentBaseState::Stopping { .. } => {}
             }
         }
     }
 
     fn reconcile_inactive_instances(&mut self) {
         self.drop_retrying_starting_instances(|_| true);
-        let agent = self.documents.private.agent().clone();
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
-            let services = self.work_services();
-            let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
-                continue;
-            };
-            if instance.work.is_none()
-                && instance.session.is_none()
-                && instance.documents.private.status.phase != AgentInstancePhase::Stopped
-                && instance.documents.private.status.phase != AgentInstancePhase::Deleted
-            {
-                instance.documents.private.spec.desired_generation = self.documents.private.generation();
-                instance.documents.private.spec.target = AgentInstanceTarget::Inactive;
-                instance.documents.private.status.clear_readiness();
-                admit_instance_work(instance, AgentInstanceWork::Stopping);
-                spawn_stop_instance(
-                    services,
-                    Rc::clone(&instance.network_runtime),
-                    agent.clone(),
-                    instance.documents.private.clone(),
-                    instance.documents.private.metadata.id,
-                    instance.documents.private.spec.desired_generation,
-                );
-            }
+            self.reconcile_instance(id);
+        }
+    }
+
+    fn reconcile_cleanup_instances(&mut self) {
+        let ids = self
+            .instances
+            .iter()
+            .filter_map(|(id, state)| {
+                state.running_ref().and_then(|instance| {
+                    matches!(
+                        instance.documents.private.status.phase,
+                        AgentInstancePhase::Deleting | AgentInstancePhase::Deleted
+                    )
+                    .then_some(*id)
+                })
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.reconcile_instance(id);
         }
     }
 
     fn reconcile_base(&mut self) {
         let document = self.documents.private.clone();
+        let work_id = self.allocate_work_id();
         match self.base {
             AgentBaseState::Missing | AgentBaseState::Stopped => {
                 let generation = document.generation();
-                self.base = AgentBaseState::Preparing { generation };
-                spawn_prepare_base(self.input.clone(), self.context.clone(), document, generation);
+                self.base = AgentBaseState::Preparing { work_id };
+                spawn_prepare_base(self.input.clone(), self.context.clone(), document, work_id, generation);
             }
             AgentBaseState::Failed {
                 generation: failed,
                 ref key,
             } if failed != document.generation() || key.as_ref() != document.desired_agent_base_key() => {
                 let generation = document.generation();
-                self.base = AgentBaseState::Preparing { generation };
-                spawn_prepare_base(self.input.clone(), self.context.clone(), document, generation);
+                self.base = AgentBaseState::Preparing { work_id };
+                spawn_prepare_base(self.input.clone(), self.context.clone(), document, work_id, generation);
             }
             AgentBaseState::Ready { .. }
             | AgentBaseState::Preparing { .. }
             | AgentBaseState::Building { .. }
             | AgentBaseState::Failed { .. }
-            | AgentBaseState::Stopping => {}
+            | AgentBaseState::Stopping { .. } => {}
         }
     }
 
@@ -1976,10 +2553,10 @@ impl RunningAgentState {
         let Some(agent_base) = document.ready_agent_base_key().cloned() else {
             return;
         };
-        let manifest = document.manifest();
         let now = Instant::now();
         for slot in 0..document.replicas() {
             let id = AgentInstanceId::new(u32::from(slot));
+            let work_id = self.allocate_work_id();
             match self.instances.get_mut(&id) {
                 Some(AgentInstanceState::Running(_)) => continue,
                 Some(AgentInstanceState::Starting(starting)) => {
@@ -1988,12 +2565,14 @@ impl RunningAgentState {
                             continue;
                         }
                         starting.generation = document.generation();
+                        starting.work_id = work_id;
                         starting.retry_at = None;
                         starting.failure_count = 0;
                     } else if starting.retry_at.is_none_or(|retry| now < retry) {
                         continue;
                     }
                     starting.retry_at = None;
+                    starting.work_id = work_id;
                 }
                 None => {
                     let pending = StartingAgentInstanceState::new(
@@ -2001,6 +2580,7 @@ impl RunningAgentState {
                         &self.layout,
                         document.agent(),
                         id,
+                        work_id,
                         document.generation(),
                     );
                     self.instances.insert(id, AgentInstanceState::Starting(pending));
@@ -2013,61 +2593,15 @@ impl RunningAgentState {
                 self.layout.clone(),
                 id,
                 agent_base.clone(),
-                document.generation(),
+                TaskAttempt {
+                    work_id,
+                    generation: document.generation(),
+                },
             );
         }
         self.drop_retrying_starting_instances(|id| id.as_u32() >= u32::from(document.replicas()));
         let ids = self.instances.keys().copied().collect::<Vec<_>>();
         for id in ids {
-            let warning = {
-                let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
-                    continue;
-                };
-                let target = if id.as_u32() < u32::from(document.replicas()) {
-                    AgentInstanceTarget::Active
-                } else {
-                    AgentInstanceTarget::Inactive
-                };
-                let mut warning = None;
-                if instance.documents.private.spec.desired_generation != document.generation()
-                    || instance.documents.private.spec.agent_base != agent_base
-                    || instance.documents.private.spec.target != target
-                {
-                    let generation_changed =
-                        instance.documents.private.spec.desired_generation != document.generation();
-                    instance.documents.private.spec.desired_generation = document.generation();
-                    instance.documents.private.spec.agent_base = agent_base.clone();
-                    instance.documents.private.spec.target = target;
-                    if generation_changed {
-                        instance.host_inputs.next_at = Instant::now();
-                        instance.host_inputs.failure_count = 0;
-                    }
-                    instance.documents.private.status.clear_readiness();
-                    instance.documents.private.status.reconciliation = None;
-                    instance.documents.private.status.network.runtime = None;
-                    match assign_port_mappings(&manifest, id) {
-                        Ok(ports) => instance.documents.private.status.network.ports = ports,
-                        Err(error) => warning = Some(format!("{id}: failed to assign host ports: {error}")),
-                    }
-                    instance.documents.private.status.observed_generation = instance
-                        .documents
-                        .private
-                        .status
-                        .observed_generation
-                        .min(document.generation().saturating_sub(1));
-                    instance.bootstrap_retry = None;
-                }
-                warning
-            };
-            if let Some(message) = warning {
-                self.emit(
-                    AgentEventSource::Instance { id },
-                    AgentEvent::Diagnostic {
-                        level: EventLevel::Warn,
-                        message,
-                    },
-                );
-            }
             self.reconcile_instance(id);
         }
     }
@@ -2085,10 +2619,14 @@ impl RunningAgentState {
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
-        if instance.work.is_some() {
+        if instance.blocks_instance_transition() {
             return;
         }
-        if instance.session.is_some() {
+        if matches!(
+            instance.documents.private.status.phase,
+            AgentInstancePhase::Deleting | AgentInstancePhase::Deleted
+        ) {
+            self.reconcile_deleting_instance(id);
             return;
         }
         match instance.documents.private.spec.target {
@@ -2099,16 +2637,18 @@ impl RunningAgentState {
     }
 
     fn reconcile_active_instance(&mut self, id: AgentInstanceId) {
+        let work_id = self.allocate_work_id();
         let document = self.documents.private.clone();
         let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
         let generation = instance.documents.private.spec.desired_generation;
-        if instance.documents.private.status.phase == AgentInstancePhase::Running
-            && instance.documents.private.status.reconciliation.is_none()
+        if instance.runtime_repair == RuntimeRepairState::Due
+            && instance.documents.private.status.phase == AgentInstancePhase::Running
         {
-            admit_instance_work(instance, AgentInstanceWork::Reconciling);
+            instance.runtime_repair = RuntimeRepairState::Backoff;
+            admit_instance_work(instance, work_id, generation, AgentInstanceWorkKind::Repairing);
             spawn_reconcile_instance(
                 self.input.clone(),
                 self.backend.clone(),
@@ -2116,10 +2656,31 @@ impl RunningAgentState {
                 document,
                 instance.documents.private.clone(),
                 id,
-                generation,
+                TaskAttempt { work_id, generation },
+            );
+            return;
+        }
+        if instance.runtime_repair == RuntimeRepairState::Backoff
+            && instance.documents.private.status.phase == AgentInstancePhase::Running
+        {
+            return;
+        }
+        if instance.documents.private.status.phase == AgentInstancePhase::Running
+            && instance.documents.private.status.reconciliation.is_none()
+        {
+            admit_instance_work(instance, work_id, generation, AgentInstanceWorkKind::Reconciling);
+            spawn_reconcile_instance(
+                self.input.clone(),
+                self.backend.clone(),
+                Rc::clone(&instance.network_runtime),
+                document,
+                instance.documents.private.clone(),
+                id,
+                TaskAttempt { work_id, generation },
             );
         } else if instance.documents.private.status.phase != AgentInstancePhase::Running {
-            admit_instance_work(instance, AgentInstanceWork::Starting);
+            instance.control.take();
+            admit_instance_work(instance, work_id, generation, AgentInstanceWorkKind::Starting);
             spawn_start_instance(
                 self.input.clone(),
                 self.backend.clone(),
@@ -2127,7 +2688,7 @@ impl RunningAgentState {
                 document,
                 instance.documents.private.clone(),
                 id,
-                generation,
+                TaskAttempt { work_id, generation },
             );
         } else if instance
             .documents
@@ -2138,8 +2699,10 @@ impl RunningAgentState {
             .is_none_or(|state| !state.ready)
         {
             self.reconcile_instance_bootstrap(id);
-        } else if instance.documents.private.status.observed_generation != generation {
-            admit_instance_work(instance, AgentInstanceWork::Reconciling);
+        } else if instance.documents.private.status.host_inputs.is_ready_for(generation)
+            && instance.documents.private.status.observed_generation != generation
+        {
+            admit_instance_work(instance, work_id, generation, AgentInstanceWorkKind::Reconciling);
             spawn_reconcile_tailscale_serve(
                 services,
                 self.context.clone(),
@@ -2147,16 +2710,38 @@ impl RunningAgentState {
                 document,
                 instance.documents.private.clone(),
                 id,
-                generation,
+                TaskAttempt { work_id, generation },
             );
-        } else {
-            clear_instance_work(instance);
-            instance.documents.private.status.mark_observed_generation(generation);
-            self.reconcile_instance_host_inputs(id);
+        }
+    }
+
+    fn reconcile_runtime_secrets(&mut self) {
+        let agent_document = self.documents.private.clone();
+        let ids = self.instances.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let work_id = self.allocate_work_id();
+            let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
+                continue;
+            };
+            if !should_reconcile_runtime_secrets(instance) || Instant::now() < instance.runtime_secrets.next_at {
+                continue;
+            }
+            spawn_reconcile_runtime_secrets(ReconcileRuntimeSecretsTask {
+                input: self.input.clone(),
+                backend: self.backend.clone(),
+                network: Rc::clone(&instance.network_runtime),
+                agent_document: agent_document.clone(),
+                document: instance.documents.private.clone(),
+                id,
+                generation: instance.documents.private.spec.desired_generation,
+                work_id,
+            });
+            instance.runtime_secrets.active_work_id = Some(work_id);
         }
     }
 
     fn reconcile_instance_host_inputs(&mut self, id: AgentInstanceId) {
+        let work_id = self.allocate_work_id();
         let document = self.documents.private.clone();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
@@ -2164,19 +2749,34 @@ impl RunningAgentState {
         if !should_reconcile_host_inputs(instance) || Instant::now() < instance.host_inputs.next_at {
             return;
         }
-        instance.host_inputs.in_flight = true;
-        spawn_reconcile_host_inputs(
-            self.input.clone(),
-            self.backend.clone(),
-            Rc::clone(&instance.network_runtime),
-            document,
-            instance.documents.private.clone(),
+        let Some(secret_files) = instance.secret_host_files.clone() else {
+            return;
+        };
+        let control = instance.control.take();
+        spawn_reconcile_host_inputs(ReconcileHostInputsTask {
+            input: self.input.clone(),
+            backend: self.backend.clone(),
+            network: Rc::clone(&instance.network_runtime),
+            control,
+            agent_document: document,
+            document: instance.documents.private.clone(),
+            secret_files,
             id,
-            instance.documents.private.spec.desired_generation,
-        );
+            generation: instance.documents.private.spec.desired_generation,
+            work_id,
+        });
+        instance.host_inputs.active_work_id = Some(work_id);
+    }
+
+    fn reconcile_host_inputs(&mut self) {
+        let ids = self.instances.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            self.reconcile_instance_host_inputs(id);
+        }
     }
 
     fn reconcile_instance_bootstrap(&mut self, id: AgentInstanceId) {
+        let work_id = self.allocate_work_id();
         let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
@@ -2199,18 +2799,21 @@ impl RunningAgentState {
             return;
         }
         let generation = instance.documents.private.spec.desired_generation;
-        admit_instance_work(instance, AgentInstanceWork::Bootstrapping);
+        admit_instance_work(instance, work_id, generation, AgentInstanceWorkKind::Bootstrapping);
+        let control = instance.control.take();
         spawn_bootstrap_instance(
             services,
             self.layout.clone(),
             self.documents.private.clone(),
+            control,
             instance.documents.private.clone(),
             id,
-            generation,
+            TaskAttempt { work_id, generation },
         );
     }
 
     fn reconcile_inactive_instance(&mut self, id: AgentInstanceId) {
+        let work_id = self.allocate_work_id();
         let document = self.documents.private.clone();
         let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
@@ -2218,36 +2821,58 @@ impl RunningAgentState {
         };
         let generation = instance.documents.private.spec.desired_generation;
         if instance.documents.private.status.phase == AgentInstancePhase::Stopped {
-            clear_instance_work(instance);
-            instance.documents.private.status.mark_observed_generation(generation);
+            refresh_instance_observed_generation(instance);
         } else {
-            admit_instance_work(instance, AgentInstanceWork::Stopping);
+            admit_instance_work(instance, work_id, generation, AgentInstanceWorkKind::Stopping);
+            let control = instance.control.take();
             spawn_stop_instance(
                 services,
                 Rc::clone(&instance.network_runtime),
+                control,
                 document.agent().clone(),
                 instance.documents.private.clone(),
                 id,
-                generation,
+                TaskAttempt { work_id, generation },
             );
         }
     }
 
     fn reconcile_deleting_instance(&mut self, id: AgentInstanceId) {
+        let work_id = self.allocate_work_id();
         let services = self.work_services();
         let Some(instance) = self.instances.get_mut(&id).and_then(AgentInstanceState::running_mut) else {
             return;
         };
+        let cleanup_phase = instance.documents.private.status.phase;
+        if !cleanup_phase_persisted(instance, cleanup_phase)
+            || instance.cleanup_retry.is_some_and(|retry| Instant::now() < retry)
+        {
+            return;
+        }
+        instance.cleanup_retry = None;
         let generation = instance.documents.private.spec.desired_generation;
-        admit_instance_work(instance, AgentInstanceWork::Deleting);
-        spawn_delete_instance(
-            services,
-            Rc::clone(&instance.network_runtime),
-            self.layout.clone(),
-            instance.documents.private.clone(),
-            id,
-            generation,
-        );
+        if cleanup_phase == AgentInstancePhase::Deleting {
+            admit_instance_work(instance, work_id, generation, AgentInstanceWorkKind::Deleting);
+            let control = instance.control.take();
+            spawn_stop_instance_for_delete(
+                services,
+                Rc::clone(&instance.network_runtime),
+                control,
+                instance.documents.private.clone(),
+                id,
+                work_id,
+            );
+        } else {
+            // `Deleted` is the durable barrier for removing the instance directory.
+            // File removal is in-memory work only: persisting it would recreate the
+            // directory while the removal task owns it.
+            instance.work = Some(AgentInstanceWork {
+                id: work_id,
+                kind: AgentInstanceWorkKind::Deleting,
+                input_generation: generation,
+            });
+            spawn_remove_instance_files(self.input.clone(), self.layout.clone(), self.agent.clone(), id, work_id);
+        }
     }
 
     async fn commit_state(&mut self) -> bool {
@@ -2315,7 +2940,7 @@ impl RunningAgentState {
                     respond.try_send(committed_result(persist_error, || self.instance_document(id)));
                 }
                 PendingResponse::ListItems(respond) => {
-                    respond.try_send(self.list_items());
+                    respond.try_send(committed_result(persist_error, || Ok(self.list_items())));
                 }
                 PendingResponse::OpenStream {
                     replay_from_generation,
@@ -2642,11 +3267,18 @@ fn count_byte(bytes: &[u8], needle: u8) -> usize {
     bytes.iter().fold(0, |count, byte| count + usize::from(*byte == needle))
 }
 
-fn spawn_prepare_base(input: inbox::Sender<AgentInput>, context: Context, document: AgentDocument, generation: u64) {
+fn spawn_prepare_base(
+    input: inbox::Sender<AgentInput>,
+    context: Context,
+    document: AgentDocument,
+    work_id: u64,
+    generation: u64,
+) {
     tokio::task::spawn_local(async move {
         queue_bootstrap_event(
             &input,
             BootstrapSource::AgentBase,
+            work_id,
             generation,
             BootstrapEvent::Diagnostic {
                 level: EventLevel::Info,
@@ -2655,10 +3287,12 @@ fn spawn_prepare_base(input: inbox::Sender<AgentInput>, context: Context, docume
         );
         let completion = match AgentBasePreparation::from_document(&context, document).await {
             Ok(preparation) => WorkCompletion::BasePrepared {
+                work_id,
                 generation,
-                preparation,
+                preparation: Box::new(preparation),
             },
             Err(error) => WorkCompletion::BaseFailed {
+                work_id,
                 generation,
                 error: error.to_string(),
             },
@@ -2673,14 +3307,16 @@ fn spawn_build_base(
     backend: backend::BackendRef,
     layout: AgentdpLayout,
     document: AgentDocument,
-    generation: u64,
+    attempt: TaskAttempt,
     preparation: AgentBasePreparation,
 ) {
+    let TaskAttempt { work_id, generation } = attempt;
     tokio::task::spawn_local(async move {
         let key = preparation.key().clone();
         queue_bootstrap_event(
             &input,
             BootstrapSource::AgentBase,
+            work_id,
             generation,
             BootstrapEvent::Diagnostic {
                 level: EventLevel::Info,
@@ -2689,6 +3325,7 @@ fn spawn_build_base(
         );
         let mut events = BaseBootstrapEvents {
             input: input.clone(),
+            work_id,
             generation,
         };
         let result = ensure_agent_base_ready(
@@ -2703,8 +3340,13 @@ fn spawn_build_base(
         queue_completion(
             &input,
             match result {
-                Ok(()) => WorkCompletion::BaseBuilt { generation, key },
+                Ok(()) => WorkCompletion::BaseBuilt {
+                    work_id,
+                    generation,
+                    key,
+                },
                 Err(error) => WorkCompletion::BaseFailed {
+                    work_id,
                     generation,
                     error: error.to_string(),
                 },
@@ -2719,7 +3361,7 @@ fn spawn_stop_base(
     backend: backend::BackendRef,
     document: AgentDocument,
     layout: AgentdpLayout,
-    generation: u64,
+    work_id: u64,
 ) {
     tokio::task::spawn_local(async move {
         let context = Context::quiet();
@@ -2729,7 +3371,7 @@ fn spawn_stop_base(
             .cloned()
             .collect::<Vec<_>>();
         if keys.is_empty() {
-            queue_completion(&input, WorkCompletion::BaseStopped { generation }).await;
+            queue_completion(&input, WorkCompletion::BaseStopped { work_id }).await;
             return;
         }
         let mut result: Result<(), backend::Error> = Ok(());
@@ -2744,9 +3386,9 @@ fn spawn_stop_base(
             }
         }
         let completion = if result.is_ok() {
-            WorkCompletion::BaseStopped { generation }
+            WorkCompletion::BaseStopped { work_id }
         } else {
-            WorkCompletion::BaseStopTimedOut { generation }
+            WorkCompletion::BaseStopTimedOut { work_id }
         };
         queue_completion(&input, completion).await;
     });
@@ -2759,8 +3401,9 @@ fn spawn_create_instance(
     layout: AgentdpLayout,
     id: AgentInstanceId,
     agent_base: AgentBaseKey,
-    generation: u64,
+    attempt: TaskAttempt,
 ) {
+    let TaskAttempt { work_id, generation } = attempt;
     tokio::task::spawn_local(async move {
         let context = Context::quiet();
         let result = async {
@@ -2820,8 +3463,9 @@ fn spawn_create_instance(
             &input,
             WorkCompletion::InstanceCreated {
                 id,
+                work_id,
                 generation,
-                document: result,
+                document: Box::new(result),
             },
         )
         .await;
@@ -2835,8 +3479,9 @@ fn spawn_start_instance(
     agent_document: AgentDocument,
     mut document: AgentInstanceDocument,
     id: AgentInstanceId,
-    generation: u64,
+    attempt: TaskAttempt,
 ) {
+    let TaskAttempt { work_id, generation } = attempt;
     tokio::task::spawn_local(async move {
         let context = Context::quiet();
         let result = async {
@@ -2845,24 +3490,19 @@ fn spawn_start_instance(
                 .start_instance(&context, &network, &manifest, &mut document)
                 .await
                 .map_err(|error| error.to_string())?;
-            apply_bound_host_ports(&mut document.status.network, &started.host_ports);
-            document.status.phase = AgentInstancePhase::Running;
-            document.status.clear_readiness();
-            document.status.reconciliation = Some(agentdp_core::agent::ReconciliationState {
-                stale: false,
-                observed_status: started.process.status,
-                observed_pid: started.process.pid,
-                reason: started.process.message,
-            });
-            Ok::<_, String>(document)
+            Ok::<_, String>(started)
         }
         .await;
         queue_completion(
             &input,
             WorkCompletion::InstanceStarted {
                 id,
+                work_id,
                 generation,
-                document: result,
+                outcome: InstanceBackendOutcome {
+                    backend: document.status.backend,
+                    result,
+                },
             },
         )
         .await;
@@ -2876,8 +3516,9 @@ fn spawn_reconcile_instance(
     agent_document: AgentDocument,
     mut document: AgentInstanceDocument,
     id: AgentInstanceId,
-    generation: u64,
+    attempt: TaskAttempt,
 ) {
+    let TaskAttempt { work_id, generation } = attempt;
     tokio::task::spawn_local(async move {
         let context = Context::quiet();
         let result = async {
@@ -2886,65 +3527,131 @@ fn spawn_reconcile_instance(
                 .reconcile_instance(&context, &network, &manifest, &mut document)
                 .await
                 .map_err(|error| error.to_string())?;
-            apply_bound_host_ports(&mut document.status.network, &output.host_ports);
-            document.status.reconciliation = Some(agentdp_core::agent::ReconciliationState {
-                stale: output.stale,
-                observed_status: output.process.status,
-                observed_pid: output.process.pid,
-                reason: output.process.message,
-            });
-            if output.mark_stopped {
-                document.status.phase = AgentInstancePhase::Stopped;
-                document.status.clear_readiness();
-            }
-            Ok::<_, String>(document)
+            Ok::<_, String>(output)
         }
         .await;
         queue_completion(
             &input,
             WorkCompletion::InstanceReconciled {
                 id,
+                work_id,
                 generation,
-                document: result,
+                outcome: InstanceBackendOutcome {
+                    backend: document.status.backend,
+                    result,
+                },
             },
         )
         .await;
     });
 }
 
-fn spawn_reconcile_host_inputs(
+struct ReconcileRuntimeSecretsTask {
     input: inbox::Sender<AgentInput>,
     backend: backend::BackendRef,
     network: Rc<InstanceNetwork>,
     agent_document: AgentDocument,
-    mut document: AgentInstanceDocument,
+    document: AgentInstanceDocument,
     id: AgentInstanceId,
     generation: u64,
-) {
-    tokio::task::spawn_local(async move {
+    work_id: u64,
+}
+
+fn spawn_reconcile_runtime_secrets(task: ReconcileRuntimeSecretsTask) {
+    let _task = tokio::task::spawn_local(async move {
+        let ReconcileRuntimeSecretsTask {
+            input,
+            backend,
+            network,
+            agent_document,
+            mut document,
+            id,
+            generation,
+            work_id,
+        } = task;
         let context = Context::quiet();
         let result = match manifest_context(&agent_document) {
-            Ok(manifest) => match backend
-                .reconcile_host_inputs(&context, &network, &manifest, &mut document)
+            Ok(manifest) => backend
+                .reconcile_runtime_secrets(&context, &network, &manifest, &mut document)
                 .await
-            {
-                Ok(output) => Ok((document.status.backend, output)),
-                Err(error) => Err((document.status.backend, error.to_string())),
-            },
-            Err(error) => Err((document.status.backend, error.to_string())),
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
         };
-        queue_completion(&input, WorkCompletion::HostInputsReconciled { id, generation, result }).await;
+        queue_completion(
+            &input,
+            WorkCompletion::RuntimeSecretsReconciled {
+                id,
+                generation,
+                work_id,
+                outcome: InstanceBackendOutcome {
+                    backend: document.status.backend,
+                    result,
+                },
+            },
+        )
+        .await;
+    });
+}
+
+struct ReconcileHostInputsTask {
+    input: inbox::Sender<AgentInput>,
+    backend: backend::BackendRef,
+    network: Rc<InstanceNetwork>,
+    control: Option<backend::InstanceControl>,
+    agent_document: AgentDocument,
+    document: AgentInstanceDocument,
+    secret_files: Vec<SeedFile>,
+    id: AgentInstanceId,
+    generation: u64,
+    work_id: u64,
+}
+
+fn spawn_reconcile_host_inputs(task: ReconcileHostInputsTask) {
+    let _task = tokio::task::spawn_local(async move {
+        let ReconcileHostInputsTask {
+            input,
+            backend,
+            network,
+            mut control,
+            agent_document,
+            document,
+            secret_files,
+            id,
+            generation,
+            work_id,
+        } = task;
+        let context = Context::quiet();
+        let result = match manifest_context(&agent_document) {
+            Ok(manifest) => backend
+                .reconcile_host_inputs(&context, &network, &manifest, &document, &secret_files, &mut control)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        queue_completion(
+            &input,
+            WorkCompletion::HostInputsReconciled {
+                id,
+                generation,
+                work_id,
+                control,
+                result,
+            },
+        )
+        .await;
     });
 }
 
 fn spawn_stop_instance(
     services: AgentWorkServices,
     network: Rc<InstanceNetwork>,
+    mut control: Option<backend::InstanceControl>,
     agent: AgentName,
     mut document: AgentInstanceDocument,
     id: AgentInstanceId,
-    generation: u64,
+    attempt: TaskAttempt,
 ) {
+    let TaskAttempt { work_id, generation } = attempt;
     tokio::task::spawn_local(async move {
         let AgentWorkServices {
             input,
@@ -2976,55 +3683,52 @@ fn spawn_stop_instance(
                         status,
                     },
                     &mut document.status.backend,
+                    &mut control,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>({
-                document.status.phase = AgentInstancePhase::Stopped;
-                document.status.clear_readiness();
-                document.status.reconciliation = Some(agentdp_core::agent::ReconciliationState {
-                    stale: false,
-                    observed_status: stopped.process_status.to_owned(),
-                    observed_pid: None,
-                    reason: None,
-                });
-                document
-            })
+            Ok::<_, String>(stopped)
         }
         .await;
         queue_completion(
             &input,
             WorkCompletion::InstanceStopped {
                 id,
+                work_id,
                 generation,
-                document: result,
+                control,
+                outcome: InstanceStopOutcome {
+                    backend: document.status.backend,
+                    tailscale_serve: document.status.tailscale_serve,
+                    result,
+                },
             },
         )
         .await;
     });
 }
 
-fn spawn_delete_instance(
+fn spawn_stop_instance_for_delete(
     services: AgentWorkServices,
     network: Rc<InstanceNetwork>,
-    layout: AgentdpLayout,
+    mut control: Option<backend::InstanceControl>,
     mut document: AgentInstanceDocument,
     id: AgentInstanceId,
-    generation: u64,
+    work_id: u64,
 ) {
+    let generation = document.spec.desired_generation;
     tokio::task::spawn_local(async move {
         let AgentWorkServices {
             input,
             backend,
             tailscale,
         } = services;
-        let files = layout.instance(&document.metadata.agent, id).files();
         let name = document.name();
         let agent = document.metadata.agent.clone();
         let instance = document.metadata.name.clone();
         let status = document.status.phase;
         let context = Context::quiet();
-        let stop = async {
+        let result = async {
             document.status.tailscale_serve = tailscale
                 .reconcile(
                     &context,
@@ -3045,24 +3749,49 @@ fn spawn_delete_instance(
                         status,
                     },
                     &mut document.status.backend,
+                    &mut control,
                 )
                 .await
                 .map_err(|error| error.to_string())
         }
         .await;
-        let removed = match tokio::fs::remove_dir_all(&files.instance_dir).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("remove {}: {error}", files.instance_dir.display())),
-        };
-        let completion = if stop.is_ok() && removed.is_ok() {
-            WorkCompletion::InstanceDeleted { id, generation }
-        } else {
-            let error = stop
-                .err()
-                .or_else(|| removed.err())
-                .unwrap_or_else(|| "unknown cleanup error".to_owned());
-            WorkCompletion::InstanceDeleteTimedOut { id, generation, error }
+        queue_completion(
+            &input,
+            WorkCompletion::InstanceDeleteRuntimeStopped {
+                id,
+                work_id,
+                generation,
+                control,
+                outcome: InstanceStopOutcome {
+                    backend: document.status.backend,
+                    tailscale_serve: document.status.tailscale_serve,
+                    result,
+                },
+            },
+        )
+        .await;
+    });
+}
+
+fn spawn_remove_instance_files(
+    input: inbox::Sender<AgentInput>,
+    layout: AgentdpLayout,
+    agent: AgentName,
+    id: AgentInstanceId,
+    work_id: u64,
+) {
+    tokio::task::spawn_local(async move {
+        let files = layout.instance(&agent, id).files();
+        let completion = match tokio::fs::remove_dir_all(&files.instance_dir).await {
+            Ok(()) => WorkCompletion::InstanceDeleted { id, work_id },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                WorkCompletion::InstanceDeleted { id, work_id }
+            }
+            Err(error) => WorkCompletion::InstanceDeleteTimedOut {
+                id,
+                work_id,
+                error: format!("remove {}: {error}", files.instance_dir.display()),
+            },
         };
         queue_completion(&input, completion).await;
     });
@@ -3072,10 +3801,12 @@ fn spawn_bootstrap_instance(
     services: AgentWorkServices,
     layout: AgentdpLayout,
     agent_document: AgentDocument,
+    mut control: Option<backend::InstanceControl>,
     mut document: AgentInstanceDocument,
     id: AgentInstanceId,
-    generation: u64,
+    attempt: TaskAttempt,
 ) {
+    let TaskAttempt { work_id, generation } = attempt;
     tokio::task::spawn_local(async move {
         let AgentWorkServices {
             input,
@@ -3083,10 +3814,19 @@ fn spawn_bootstrap_instance(
             tailscale,
         } = services;
         let context = Context::quiet();
-        queue_completion(&input, WorkCompletion::BootstrapStarted { id, generation }).await;
+        queue_completion(
+            &input,
+            WorkCompletion::BootstrapStarted {
+                id,
+                work_id,
+                generation,
+            },
+        )
+        .await;
         queue_bootstrap_event(
             &input,
             BootstrapSource::Instance { id },
+            work_id,
             generation,
             BootstrapEvent::Diagnostic {
                 level: EventLevel::Info,
@@ -3096,21 +3836,40 @@ fn spawn_bootstrap_instance(
         let mut events = RuntimeBootstrapEvents {
             input: input.clone(),
             id,
+            work_id,
             generation,
         };
+        let retry_epoch = document
+            .status
+            .bootstrap
+            .as_ref()
+            .and_then(|state| state.attempt_epoch)
+            .and_then(|epoch| epoch.checked_add(1));
         let result = async {
-            backend.wait_bootstrap(&context, &document, Some(&mut events)).await?;
+            match backend
+                .wait_bootstrap(&context, &document, &mut control, retry_epoch, Some(&mut events))
+                .await
+                .map_err(BootstrapTaskFailure::unobserved)?
+            {
+                backend::BootstrapOutcome::Passed { .. } => {}
+                backend::BootstrapOutcome::Failed { attempt_epoch, error } => {
+                    return Err(BootstrapTaskFailure::observed(attempt_epoch, error));
+                }
+            }
             queue_bootstrap_event(
                 &input,
                 BootstrapSource::Instance { id },
+                work_id,
                 generation,
                 BootstrapEvent::Diagnostic {
                     level: EventLevel::Info,
                     message: "checking guest access".to_owned(),
                 },
             );
-            probe_guest_access(&context, &backend, &document).await?;
-            let manifest = manifest_context(&agent_document)?;
+            probe_guest_access(&context, &backend, &document)
+                .await
+                .map_err(BootstrapTaskFailure::unobserved)?;
+            let manifest = manifest_context(&agent_document).map_err(BootstrapTaskFailure::unobserved)?;
             let config_dir = layout.config_dir();
             document.status.tailscale_serve = tailscale
                 .reconcile(
@@ -3121,17 +3880,19 @@ fn spawn_bootstrap_instance(
                         document: &document,
                     },
                 )
-                .await?;
-            Ok::<_, Error>(document)
+                .await
+                .map_err(BootstrapTaskFailure::unobserved)?;
+            Ok(document.status.tailscale_serve)
         }
-        .await
-        .map_err(|error| error.to_string());
+        .await;
         queue_completion(
             &input,
             WorkCompletion::BootstrapFinished {
                 id,
+                work_id,
                 generation,
-                document: result,
+                control,
+                result,
             },
         )
         .await;
@@ -3145,8 +3906,9 @@ fn spawn_reconcile_tailscale_serve(
     agent_document: AgentDocument,
     mut document: AgentInstanceDocument,
     id: AgentInstanceId,
-    generation: u64,
+    attempt: TaskAttempt,
 ) {
+    let TaskAttempt { work_id, generation } = attempt;
     tokio::task::spawn_local(async move {
         let AgentWorkServices { input, tailscale, .. } = services;
         let result = async {
@@ -3162,7 +3924,7 @@ fn spawn_reconcile_tailscale_serve(
                     },
                 )
                 .await?;
-            Ok::<_, Error>(document)
+            Ok::<_, Error>(document.status.tailscale_serve)
         }
         .await
         .map_err(|error| error.to_string());
@@ -3170,8 +3932,9 @@ fn spawn_reconcile_tailscale_serve(
             &input,
             WorkCompletion::TailscaleServeReconciled {
                 id,
+                work_id,
                 generation,
-                document: result,
+                result,
             },
         )
         .await;
@@ -3186,7 +3949,7 @@ struct ExecTask {
     network: Rc<InstanceNetwork>,
     document: AgentInstanceDocument,
     id: AgentInstanceId,
-    generation: u64,
+    work_id: u64,
     command: Vec<String>,
     shell_command: String,
     output: Option<spsc::Sender<AgentInstanceSessionOutput>>,
@@ -3203,7 +3966,7 @@ fn spawn_exec(task: ExecTask) {
             network,
             document,
             id,
-            generation,
+            work_id,
             command,
             shell_command,
             output,
@@ -3231,7 +3994,7 @@ fn spawn_exec(task: ExecTask) {
             &input,
             WorkCompletion::ExecFinished {
                 id,
-                generation,
+                work_id,
                 command,
                 output: result,
             },
@@ -3247,11 +4010,13 @@ async fn queue_completion(input: &inbox::Sender<AgentInput>, completion: WorkCom
 fn queue_bootstrap_event(
     input: &inbox::Sender<AgentInput>,
     source: BootstrapSource,
+    work_id: u64,
     generation: u64,
     event: BootstrapEvent,
 ) {
     let _result = input.try_send(AgentInput::Work(Box::new(WorkCompletion::BootstrapEvent {
         source,
+        work_id,
         generation,
         event,
     })));
@@ -3330,6 +4095,7 @@ impl Drop for StreamingOutput {
 struct RuntimeBootstrapEvents {
     input: inbox::Sender<AgentInput>,
     id: AgentInstanceId,
+    work_id: u64,
     generation: u64,
 }
 
@@ -3338,6 +4104,7 @@ impl backend::BootstrapEventSink for RuntimeBootstrapEvents {
         queue_bootstrap_event(
             &self.input,
             BootstrapSource::Instance { id: self.id },
+            self.work_id,
             self.generation,
             event,
         );
@@ -3346,12 +4113,19 @@ impl backend::BootstrapEventSink for RuntimeBootstrapEvents {
 
 struct BaseBootstrapEvents {
     input: inbox::Sender<AgentInput>,
+    work_id: u64,
     generation: u64,
 }
 
 impl backend::BootstrapEventSink for BaseBootstrapEvents {
     fn emit(&mut self, event: BootstrapEvent) {
-        queue_bootstrap_event(&self.input, BootstrapSource::AgentBase, self.generation, event);
+        queue_bootstrap_event(
+            &self.input,
+            BootstrapSource::AgentBase,
+            self.work_id,
+            self.generation,
+            event,
+        );
     }
 }
 
@@ -3369,9 +4143,102 @@ fn committed_result<T>(persist_error: Option<&str>, value: impl FnOnce() -> Resu
     })
 }
 
-fn admit_instance_work(instance: &mut RunningAgentInstanceState, work: AgentInstanceWork) {
-    instance.work = Some(work);
-    instance.documents.private.status.work = work_status(work, instance.session.is_some());
+fn admit_instance_work(
+    instance: &mut RunningAgentInstanceState,
+    id: u64,
+    input_generation: u64,
+    kind: AgentInstanceWorkKind,
+) {
+    instance.work = Some(AgentInstanceWork {
+        id,
+        kind,
+        input_generation,
+    });
+    instance.documents.private.status.work = work_status(kind, instance.session.is_some());
+}
+
+fn project_instance_desired_state(
+    instance: &mut RunningAgentInstanceState,
+    document: &AgentDocument,
+    manifest: &agentdp_core::manifest::AgentManifest,
+    id: AgentInstanceId,
+    target: AgentInstanceTarget,
+) -> Option<String> {
+    if instance.documents.private.status.phase == AgentInstancePhase::Deleted {
+        return None;
+    }
+    let agent_base = document
+        .desired_agent_base_key()
+        .or_else(|| document.ready_agent_base_key())
+        .cloned()
+        .unwrap_or_else(|| instance.documents.private.spec.agent_base.clone());
+    let desired_changed = instance.documents.private.spec.desired_generation != document.generation()
+        || instance.documents.private.spec.agent_base != agent_base
+        || instance.documents.private.spec.template != *document.template()
+        || instance.documents.private.spec.target != target;
+    let stale_materialization = instance.documents.private.status.materialized_agent_base != agent_base
+        || instance.documents.private.status.materialized_template != *document.template();
+    let entering_cleanup = stale_materialization
+        && !matches!(
+            instance.documents.private.status.phase,
+            AgentInstancePhase::Deleting | AgentInstancePhase::Deleted
+        );
+    if !desired_changed && !entering_cleanup {
+        return None;
+    }
+    let generation_changed = instance.documents.private.spec.desired_generation != document.generation();
+    if desired_changed {
+        instance.runtime_repair = RuntimeRepairState::Idle;
+        instance.documents.private.spec.desired_generation = document.generation();
+        instance.documents.private.spec.agent_base = agent_base;
+        instance.documents.private.spec.template.clone_from(document.template());
+        instance.documents.private.spec.target = target;
+    }
+    if generation_changed {
+        instance.runtime_secrets.next_at = Instant::now();
+        instance.runtime_secrets.failure_count = 0;
+        instance.secret_host_files = None;
+        instance.host_inputs.next_at = Instant::now();
+        instance.host_inputs.failure_count = 0;
+        instance.documents.private.status.host_inputs.mark_pending();
+    }
+    if entering_cleanup {
+        instance.documents.private.status.phase = AgentInstancePhase::Deleting;
+        instance.cleanup_retry = None;
+    }
+    instance.documents.private.status.clear_readiness();
+    instance.documents.private.status.reconciliation = None;
+    instance.documents.private.status.network.allow = NetworkAllowState::from(&manifest.spec.network.allow);
+    instance.documents.private.status.network.runtime = None;
+    let warning = match assign_port_mappings(manifest, id) {
+        Ok(ports) => {
+            instance.documents.private.status.network.ports = ports;
+            None
+        }
+        Err(error) => Some(format!("{id}: failed to assign host ports: {error}")),
+    };
+    instance.documents.private.status.observed_generation = instance
+        .documents
+        .private
+        .status
+        .observed_generation
+        .min(document.generation().saturating_sub(1));
+    instance.bootstrap_retry = None;
+    warning
+}
+
+fn running_instance_from_created_document(
+    document: AgentInstanceDocument,
+    pending: StartingAgentInstanceState,
+) -> AgentInstanceState {
+    AgentInstanceState::running(
+        document,
+        None,
+        pending.event_sequence,
+        pending.events,
+        pending.network_runtime,
+        pending.network_events,
+    )
 }
 
 fn clear_instance_work(instance: &mut RunningAgentInstanceState) {
@@ -3381,22 +4248,73 @@ fn clear_instance_work(instance: &mut RunningAgentInstanceState) {
     instance.documents.private.status.work.sessions.active = u16::from(instance.session.is_some());
 }
 
+fn refresh_instance_observed_generation(instance: &mut RunningAgentInstanceState) {
+    if instance.work.is_some() {
+        return;
+    }
+    let status = &instance.documents.private.status;
+    let converged = match instance.documents.private.spec.target {
+        AgentInstanceTarget::Active => {
+            status.phase == AgentInstancePhase::Running
+                && status
+                    .reconciliation
+                    .as_ref()
+                    .is_some_and(|reconciliation| !reconciliation.stale)
+                && status
+                    .host_inputs
+                    .is_ready_for(instance.documents.private.spec.desired_generation)
+        }
+        AgentInstanceTarget::Inactive => status.phase == AgentInstancePhase::Stopped,
+        AgentInstanceTarget::Deleting => false,
+    };
+    if converged {
+        instance
+            .documents
+            .private
+            .status
+            .mark_observed_generation(instance.documents.private.spec.desired_generation);
+    }
+}
+
+fn cleanup_phase_persisted(instance: &RunningAgentInstanceState, phase: AgentInstancePhase) -> bool {
+    instance
+        .documents
+        .persisted
+        .as_ref()
+        .is_some_and(|document| document.status.phase == phase)
+}
+
+fn mark_instance_transition_failed(instance: &mut RunningAgentInstanceState, error: String) {
+    instance.documents.private.status.phase = AgentInstancePhase::Failed;
+    instance.documents.private.status.clear_readiness();
+    instance.documents.private.status.reconciliation = Some(agentdp_core::agent::ReconciliationState {
+        stale: true,
+        observed_status: "failed".to_owned(),
+        observed_pid: None,
+        reason: Some(error),
+    });
+}
+
+fn should_reconcile_runtime_secrets(instance: &RunningAgentInstanceState) -> bool {
+    instance.runtime_secrets.active_work_id.is_none()
+        && instance.host_inputs.active_work_id.is_none()
+        && instance
+            .work
+            .as_ref()
+            .is_none_or(|work| work.kind == AgentInstanceWorkKind::Bootstrapping)
+        && instance.documents.private.spec.target == AgentInstanceTarget::Active
+        && instance.documents.private.status.phase == AgentInstancePhase::Running
+}
+
 fn should_reconcile_host_inputs(instance: &RunningAgentInstanceState) -> bool {
-    if instance.host_inputs.in_flight
+    if instance.host_inputs.active_work_id.is_some()
+        || instance.runtime_secrets.active_work_id.is_some()
+        || !instance.runtime_repair.allows_auxiliary_work()
+        || instance.secret_host_files.is_none()
         || instance.work.is_some()
         || instance.session.is_some()
         || instance.documents.private.spec.target != AgentInstanceTarget::Active
         || instance.documents.private.status.phase != AgentInstancePhase::Running
-    {
-        return false;
-    }
-    if !instance
-        .documents
-        .private
-        .status
-        .readiness
-        .as_ref()
-        .is_some_and(|readiness| readiness.ready)
     {
         return false;
     }
@@ -3419,12 +4337,19 @@ fn instance_create_retry_delay(failure_count: u16) -> Duration {
     )
 }
 
+fn bootstrap_retry_delay(failure_count: u32) -> Duration {
+    let exponent = failure_count.saturating_sub(1).min(8);
+    INSTANCE_BOOTSTRAP_RETRY_DELAY
+        .saturating_mul(1 << exponent)
+        .min(INSTANCE_BOOTSTRAP_RETRY_MAX_DELAY)
+}
+
 fn retry_delay(initial: Duration, max: Duration, failure_count: u16) -> Duration {
     let exponent = u32::from(failure_count.saturating_sub(1)).min(8);
     initial.saturating_mul(1 << exponent).min(max)
 }
 
-fn work_status(work: AgentInstanceWork, session_active: bool) -> AgentInstanceWorkStatus {
+fn work_status(work: AgentInstanceWorkKind, session_active: bool) -> AgentInstanceWorkStatus {
     let mut status = AgentInstanceWorkStatus {
         sessions: AgentInstanceSessionsWorkStatus {
             active: u16::from(session_active),
@@ -3432,19 +4357,19 @@ fn work_status(work: AgentInstanceWork, session_active: bool) -> AgentInstanceWo
         ..AgentInstanceWorkStatus::default()
     };
     match work {
-        AgentInstanceWork::Reconciling => {
+        AgentInstanceWorkKind::Reconciling | AgentInstanceWorkKind::Repairing => {
             status.transition = Some(transition_work(AgentInstanceTransitionKind::Reconcile));
         }
-        AgentInstanceWork::Starting => {
+        AgentInstanceWorkKind::Starting => {
             status.transition = Some(transition_work(AgentInstanceTransitionKind::Start));
         }
-        AgentInstanceWork::Stopping => {
+        AgentInstanceWorkKind::Stopping => {
             status.transition = Some(transition_work(AgentInstanceTransitionKind::Stop));
         }
-        AgentInstanceWork::Deleting => {
+        AgentInstanceWorkKind::Deleting => {
             status.transition = Some(transition_work(AgentInstanceTransitionKind::Delete));
         }
-        AgentInstanceWork::Bootstrapping => {
+        AgentInstanceWorkKind::Bootstrapping => {
             status.bootstrap = Some(AgentInstanceBootstrapWorkStatus {
                 phase: AgentInstanceBootstrapWorkPhase::Running,
                 current_step: None,
@@ -3462,25 +4387,6 @@ fn transition_work(kind: AgentInstanceTransitionKind) -> AgentInstanceTransition
         kind,
         started_unix_seconds: Some(time::unix_seconds()),
         message: None,
-    }
-}
-
-fn apply_transition_document(
-    instance: &mut RunningAgentInstanceState,
-    document: Result<AgentInstanceDocument, String>,
-) {
-    match document {
-        Ok(document) => instance.documents.write(document),
-        Err(error) => {
-            instance.documents.private.status.phase = AgentInstancePhase::Failed;
-            instance.documents.private.status.clear_readiness();
-            instance.documents.private.status.reconciliation = Some(agentdp_core::agent::ReconciliationState {
-                stale: true,
-                observed_status: "failed".to_owned(),
-                observed_pid: None,
-                reason: Some(error),
-            });
-        }
     }
 }
 
@@ -3684,12 +4590,11 @@ async fn try_read_agent_document(path: &Path) -> Result<Option<AgentDocument>, E
     Ok(Some(document))
 }
 
-async fn load_instance_states(
-    context: &Context,
+async fn load_instance_documents(
     layout: &AgentdpLayout,
     agent: &AgentName,
-) -> Result<BTreeMap<AgentInstanceId, AgentInstanceState>, Error> {
-    let mut instances = BTreeMap::new();
+) -> Result<BTreeMap<AgentInstanceId, AgentInstanceDocument>, Error> {
+    let mut documents = BTreeMap::new();
     for (id, instance_layout) in layout.instance_layouts(agent).await? {
         let path = instance_layout.instance_state();
         let contents = match tokio::fs::read_to_string(&path).await {
@@ -3709,28 +4614,70 @@ async fn load_instance_states(
             }
         })?;
         if document.metadata.agent != *agent || document.metadata.id != id {
-            continue;
+            return Err(Error::PersistedStateIdentityMismatch {
+                path,
+                expected: format!("{agent}/{id}"),
+                actual: format!("{}/{}", document.metadata.agent, document.metadata.id),
+            });
         }
         reset_loaded_instance_runtime_status(&mut document);
-        let events_path = instance_layout.instance_events();
-        let event_sequence = event_log_next_sequence(&events_path).await?;
-        let (network_events, network_event_receiver) = spsc::bounded(1024);
-        instances.insert(
-            id,
-            AgentInstanceState::running(
-                document.clone(),
-                Some(document),
-                event_sequence,
-                EventLogWriter::spawn(context, events_path),
-                Rc::new(InstanceNetwork::new(network_events)),
-                network_event_receiver,
-            ),
-        );
+        documents.insert(id, document);
     }
-    Ok(instances)
+    Ok(documents)
+}
+
+async fn inspect_instance_states(
+    layout: &AgentdpLayout,
+    agent: &AgentName,
+    documents: BTreeMap<AgentInstanceId, AgentInstanceDocument>,
+) -> Result<BTreeMap<AgentInstanceId, (AgentInstanceDocument, SequencePlan)>, Error> {
+    let mut inspected = BTreeMap::new();
+    for (id, document) in documents {
+        let events_path = layout.instance(agent, id).instance_events();
+        let event_plan = inspect_event_sequence(&events_path).await?;
+        inspected.insert(id, (document, event_plan));
+    }
+    Ok(inspected)
+}
+
+async fn apply_instance_event_repairs(
+    inspected: BTreeMap<AgentInstanceId, (AgentInstanceDocument, SequencePlan)>,
+) -> Result<BTreeMap<AgentInstanceId, (AgentInstanceDocument, u64)>, Error> {
+    let mut prepared = BTreeMap::new();
+    for (id, (document, event_plan)) in inspected {
+        prepared.insert(id, (document, event_plan.apply().await?));
+    }
+    Ok(prepared)
+}
+
+fn start_instance_states(
+    context: &Context,
+    layout: &AgentdpLayout,
+    agent: &AgentName,
+    prepared: BTreeMap<AgentInstanceId, (AgentInstanceDocument, u64)>,
+) -> BTreeMap<AgentInstanceId, AgentInstanceState> {
+    prepared
+        .into_iter()
+        .map(|(id, (document, event_sequence))| {
+            let events_path = layout.instance(agent, id).instance_events();
+            let (network_events, network_event_receiver) = spsc::bounded(1024);
+            (
+                id,
+                AgentInstanceState::running(
+                    document.clone(),
+                    Some(document),
+                    event_sequence,
+                    EventLogWriter::spawn(context, events_path),
+                    Rc::new(InstanceNetwork::new(network_events)),
+                    network_event_receiver,
+                ),
+            )
+        })
+        .collect()
 }
 
 fn reset_loaded_instance_runtime_status(document: &mut AgentInstanceDocument) {
+    document.status.work = AgentInstanceWorkStatus::default();
     if document.status.phase == AgentInstancePhase::Running {
         document.status.clear_readiness();
         document.status.reconciliation = None;
@@ -3741,12 +4688,58 @@ fn reset_loaded_instance_runtime_status(document: &mut AgentInstanceDocument) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentBaseKey, AgentBaseState};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    use agentdp_core::Context;
+    use agentdp_core::agent::{
+        AgentInstanceDocument, AgentInstanceId, AgentInstancePhase, AgentInstanceTarget, AgentName, BackendState,
+        InstanceName, NetworkAllowState, NetworkIpv6State, NetworkState, QemuImageState, QemuMediatedCaState,
+        QemuState,
+    };
+    use agentdp_core::manifest::AgentManifest;
+    use agentdp_core::provisioning::secrets::SecretBindings;
+    use agentdp_ds::local::spsc;
+
+    use super::{
+        AgentBaseKey, AgentBaseState, EventLogWriter, INSTANCE_BOOTSTRAP_RETRY_DELAY,
+        INSTANCE_BOOTSTRAP_RETRY_MAX_DELAY, InstanceNetwork, RunningAgentInstanceState, RuntimeRepairState,
+        bootstrap_retry_delay,
+    };
+
+    #[test]
+    fn runtime_repair_blocks_auxiliary_work_until_recovered() {
+        assert!(RuntimeRepairState::Idle.allows_auxiliary_work());
+        assert!(!RuntimeRepairState::Due.allows_auxiliary_work());
+        assert!(!RuntimeRepairState::Backoff.allows_auxiliary_work());
+    }
+
+    #[test]
+    fn bootstrap_retry_delay_backs_off_to_cap() {
+        assert_eq!(bootstrap_retry_delay(1), INSTANCE_BOOTSTRAP_RETRY_DELAY);
+        assert_eq!(bootstrap_retry_delay(2), INSTANCE_BOOTSTRAP_RETRY_DELAY * 2);
+        assert_eq!(bootstrap_retry_delay(u32::MAX), INSTANCE_BOOTSTRAP_RETRY_MAX_DELAY);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn active_auxiliary_work_excludes_bootstrap_retry_wake() {
+        let mut instance = test_running_instance();
+        let retry = tokio::time::Instant::now();
+        instance.bootstrap_retry = Some(retry);
+        assert_eq!(instance.bootstrap_retry_wake(), Some(retry));
+
+        instance.host_inputs.active_work_id = Some(1);
+        assert_eq!(instance.bootstrap_retry_wake(), None);
+
+        instance.host_inputs.active_work_id = None;
+        instance.runtime_secrets.active_work_id = Some(2);
+        assert_eq!(instance.bootstrap_retry_wake(), None);
+    }
 
     #[test]
     fn base_provisioned_resources_require_external_state_or_base_key() {
         assert!(!AgentBaseState::Missing.has_provisioned_resources());
-        assert!(!AgentBaseState::Preparing { generation: 1 }.has_provisioned_resources());
+        assert!(!AgentBaseState::Preparing { work_id: 1 }.has_provisioned_resources());
         assert!(
             !AgentBaseState::Failed {
                 generation: 1,
@@ -3758,6 +4751,7 @@ mod tests {
         let key = AgentBaseKey::new("sha256-test");
         assert!(
             AgentBaseState::Building {
+                work_id: 1,
                 generation: 1,
                 key: key.clone()
             }
@@ -3771,7 +4765,79 @@ mod tests {
             }
             .has_provisioned_resources()
         );
-        assert!(AgentBaseState::Stopping.has_provisioned_resources());
+        assert!(AgentBaseState::Stopping { work_id: 1 }.has_provisioned_resources());
         assert!(AgentBaseState::Stopped.has_provisioned_resources());
+    }
+
+    fn test_running_instance() -> RunningAgentInstanceState {
+        let manifest: AgentManifest =
+            serde_yaml::from_str(agentdp_test_support::manifest::minimal()).expect("minimal manifest");
+        let agent = AgentName::new(manifest.name());
+        let id = AgentInstanceId::new(0);
+        let backend = test_backend_state();
+        let network = NetworkState::new(
+            &backend,
+            NetworkAllowState::default(),
+            NetworkIpv6State::default(),
+            BTreeMap::new(),
+        );
+        let document = AgentInstanceDocument::new(
+            agent,
+            id,
+            InstanceName::new("replica-0"),
+            1,
+            AgentBaseKey::new("sha256-test"),
+            manifest.spec.template,
+            AgentInstanceTarget::Active,
+            AgentInstancePhase::Running,
+            network,
+            Vec::new(),
+            None,
+            backend,
+        );
+        let (network_events, network_event_receiver) = spsc::bounded(1);
+        RunningAgentInstanceState::new(
+            document,
+            None,
+            1,
+            EventLogWriter::spawn(
+                &Context::quiet(),
+                std::env::temp_dir().join(format!("agentdp-wake-test-{}.jsonl", std::process::id())),
+            ),
+            Rc::new(InstanceNetwork::new(network_events)),
+            network_event_receiver,
+        )
+    }
+
+    fn test_backend_state() -> BackendState {
+        BackendState::Qemu(QemuState {
+            image: QemuImageState {
+                os: "archlinux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                variant: "default".to_owned(),
+                source_url: "https://example.invalid/image.qcow2".to_owned(),
+                cache_key: "image".to_owned(),
+                cache_path: "/tmp/image.qcow2".to_owned(),
+                download_path: "/tmp/image.download".to_owned(),
+                format: "qcow2".to_owned(),
+            },
+            disk: "/tmp/disk.qcow2".to_owned(),
+            work_dir: "/tmp/work".to_owned(),
+            seed_media: "/tmp/seed.img".to_owned(),
+            seed_meta_data: "/tmp/meta-data".to_owned(),
+            seed_network_config: "/tmp/network-config".to_owned(),
+            seed_user_data: "/tmp/user-data".to_owned(),
+            monitor_socket: "/tmp/monitor.sock".to_owned(),
+            qmp_socket: "/tmp/qmp.sock".to_owned(),
+            guest_control_socket: "/tmp/guest.sock".to_owned(),
+            pid_file: "/tmp/qemu.pid".to_owned(),
+            serial_log: "/tmp/serial.log".to_owned(),
+            qemu_log: "/tmp/qemu.log".to_owned(),
+            instance_network: None,
+            mediated_secrets: SecretBindings::default(),
+            mediated_ca: QemuMediatedCaState::default(),
+            pid: None,
+            last_start_unix_seconds: None,
+        })
     }
 }

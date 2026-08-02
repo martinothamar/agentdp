@@ -2,7 +2,9 @@ use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const GUEST_CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const BOOTSTRAP_PLAN_VERSION: u16 = 1;
+pub const GUEST_CONTROL_PROTOCOL_VERSION: u16 = 3;
+pub const RETRY_BOOTSTRAP_COMMAND: &str = "bootstrap.retry";
 pub const WRITE_USER_FILE_COMMAND: &str = "user_file.write";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -163,7 +165,7 @@ const GUEST_MESSAGE_TYPES: &[&str] = &[
     "guest.command_result",
     "guest.error",
 ];
-const HOST_MESSAGE_TYPES: &[&str] = &["host.accept", "host.cancel", "host.command"];
+const HOST_MESSAGE_TYPES: &[&str] = &["host.command"];
 
 fn decode_guest_message_kind<E>(message_type: &str, payload: Value) -> Result<GuestMessageKind, E>
 where
@@ -188,8 +190,6 @@ where
     E: de::Error,
 {
     match message_type {
-        "host.accept" => Ok(HostMessageKind::Accept(decode_payload(payload)?)),
-        "host.cancel" => Ok(HostMessageKind::Cancel(decode_payload(payload)?)),
         "host.command" => Ok(HostMessageKind::Command(decode_payload(payload)?)),
         _ => Err(de::Error::unknown_variant(message_type, HOST_MESSAGE_TYPES)),
     }
@@ -213,10 +213,6 @@ impl HostMessage {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "payload")]
 pub enum HostMessageKind {
-    #[serde(rename = "host.accept")]
-    Accept(HostAccept),
-    #[serde(rename = "host.cancel")]
-    Cancel(HostCancel),
     #[serde(rename = "host.command")]
     Command(HostCommand),
 }
@@ -246,6 +242,7 @@ pub enum GuestdRole {
 pub struct BootstrapStatusReport {
     pub plan_id: String,
     pub plan_hash: String,
+    pub attempt_epoch: u64,
     pub phase: BootstrapStepPhase,
     pub status: BootstrapLifecycleStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,14 +299,14 @@ pub struct BootstrapStepFinished {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapFinished {
     pub plan_hash: String,
-    pub status: BootstrapStepStatus,
+    pub attempt_epoch: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapFailed {
+    pub attempt_epoch: u64,
     pub step: String,
-    pub status: BootstrapStepStatus,
     pub exit_status: i32,
     pub duration_ms: u64,
     pub message: String,
@@ -348,15 +345,9 @@ pub struct WriteUserFileCommand {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct HostAccept {
-    pub instance: String,
-    pub protocol_version: u16,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct HostCancel {
-    pub reason: String,
+pub struct RetryBootstrapCommand {
+    pub plan_hash: String,
+    pub attempt_epoch: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -415,7 +406,7 @@ mod tests {
 
     use super::{
         BootstrapLifecycleStatus, BootstrapStatusReport, BootstrapStepPhase, GUEST_CONTROL_PROTOCOL_VERSION,
-        GuestCommandResult, GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostAccept, HostMessage,
+        GuestCommandResult, GuestHello, GuestMessage, GuestMessageKind, GuestdRole, HostCommand, HostMessage,
         HostMessageKind,
     };
     use crate::server_guest::{
@@ -447,7 +438,7 @@ mod tests {
                 "id": "msg_0",
                 "type": "guest.hello",
                 "payload": {
-                    "protocol_version": 1,
+                    "protocol_version": GUEST_CONTROL_PROTOCOL_VERSION,
                     "guestd_role": "system",
                     "guestd_version": "0.1.0",
                     "manifest": "basic",
@@ -462,12 +453,12 @@ mod tests {
     }
 
     #[test]
-    fn host_accept_uses_control_channel_json_line() {
+    fn host_command_uses_control_channel_json_line() {
         let message = HostMessage::new(
             "msg_1",
-            HostMessageKind::Accept(HostAccept {
-                instance: "basic/basic-0".to_owned(),
-                protocol_version: GUEST_CONTROL_PROTOCOL_VERSION,
+            HostMessageKind::Command(HostCommand {
+                command: "ping".to_owned(),
+                payload: json!({"sequence": 1}),
             }),
         );
 
@@ -478,10 +469,10 @@ mod tests {
             value,
             json!({
                 "id": "msg_1",
-                "type": "host.accept",
+                "type": "host.command",
                 "payload": {
-                    "instance": "basic/basic-0",
-                    "protocol_version": 1
+                    "command": "ping",
+                    "payload": {"sequence": 1}
                 }
             })
         );
@@ -495,6 +486,7 @@ mod tests {
             GuestMessageKind::BootstrapStatus(BootstrapStatusReport {
                 plan_id: "basic/basic-0".to_owned(),
                 plan_hash: "sha256:abc123".to_owned(),
+                attempt_epoch: 7,
                 phase: BootstrapStepPhase::System,
                 status: BootstrapLifecycleStatus::Running,
                 current_step: Some("system.packages".to_owned()),
@@ -515,6 +507,7 @@ mod tests {
                 "payload": {
                     "plan_id": "basic/basic-0",
                     "plan_hash": "sha256:abc123",
+                    "attempt_epoch": 7,
                     "phase": "system",
                     "status": "running",
                     "current_step": "system.packages",
@@ -563,7 +556,7 @@ mod tests {
 
     #[test]
     fn host_message_rejects_unknown_payload_fields() {
-        let line = br#"{"id":"msg_1","type":"host.accept","payload":{"instance":"basic/basic-0","protocol_version":1,"extra":true}}
+        let line = br#"{"id":"msg_1","type":"host.command","payload":{"command":"ping","payload":{},"extra":true}}
 "#;
 
         assert!(decode_host_message_line(line).is_err());

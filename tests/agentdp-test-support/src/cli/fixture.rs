@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agentdp_protocol::server_guest::GUEST_CONTROL_PROTOCOL_VERSION;
+
 use super::command::{CommandSnapshot, TestContext, agentctl_path_for_support};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
@@ -325,6 +327,20 @@ impl AgentFixture {
         self.instance_dir().join(suffix)
     }
 
+    pub fn wait_guest_control_command(&self, command: &str, timeout: Duration) -> bool {
+        let command_log = self.instance_file("run/guest-control.sock.commands");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if fs::read_to_string(&command_log).is_ok_and(|contents| contents.lines().any(|line| line == command)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn write_serial_log(&self, contents: &str) {
         fs::write(self.instance_file("logs/serial.log"), contents).expect("write serial log");
     }
@@ -468,7 +484,11 @@ fn write_fake_qemu_system(context: &TestContext, mode: QemuSystemMode) -> PathBu
 }
 
 fn fake_qemu_system_script(mode: QemuSystemMode) -> String {
-    format!("{}{}", FAKE_QEMU_STREAM_HELPER, fake_qemu_system_mode_script(mode))
+    let helper = FAKE_QEMU_STREAM_HELPER.replace(
+        "AGENTDP_GUEST_CONTROL_PROTOCOL_VERSION",
+        &GUEST_CONTROL_PROTOCOL_VERSION.to_string(),
+    );
+    format!("{helper}{}", fake_qemu_system_mode_script(mode))
 }
 
 const FAKE_QEMU_STREAM_HELPER: &str = r#"#!/bin/sh
@@ -541,18 +561,18 @@ server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(1)
 server.settimeout(120)
+command_log = path + ".commands"
 try:
-    conn, _ = server.accept()
-except TimeoutError:
-    server.close()
-    raise SystemExit(0)
+    os.unlink(command_log)
+except FileNotFoundError:
+    pass
 
 messages = [
     {
         "id": "msg_0",
         "type": "guest.hello",
         "payload": {
-            "protocol_version": 1,
+            "protocol_version": AGENTDP_GUEST_CONTROL_PROTOCOL_VERSION,
             "guestd_role": "system",
             "guestd_version": "0.1.0",
             "manifest": manifest,
@@ -568,6 +588,7 @@ messages = [
         "payload": {
             "plan_id": f"{manifest}/{instance}",
             "plan_hash": "sha256:test",
+            "attempt_epoch": 0,
             "phase": "system",
             "status": "passed",
             "completed_steps": [],
@@ -579,16 +600,65 @@ messages = [
         "type": "bootstrap.finished",
         "payload": {
             "plan_hash": "sha256:test",
-            "status": "passed",
+            "attempt_epoch": 0,
         },
     },
 ]
 
-with conn, server:
-    for index, message in enumerate(messages):
-        if index == len(messages) - 1 and finish_delay_seconds > 0:
-            time.sleep(finish_delay_seconds)
-        conn.sendall(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n")
+first_connection = True
+with server:
+    while True:
+        try:
+            conn, _ = server.accept()
+        except TimeoutError:
+            break
+        try:
+            with conn:
+                conn.settimeout(120)
+                for index, message in enumerate(messages):
+                    if index == len(messages) - 1 and first_connection and finish_delay_seconds > 0:
+                        time.sleep(finish_delay_seconds)
+                    conn.sendall(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n")
+                first_connection = False
+                buffered = b""
+                while True:
+                    try:
+                        chunk = conn.recv(4096)
+                    except TimeoutError:
+                        break
+                    if not chunk:
+                        break
+                    buffered += chunk
+                    while b"\n" in buffered:
+                        line, buffered = buffered.split(b"\n", 1)
+                        if not line:
+                            continue
+                        request = json.loads(line)
+                        payload = request.get("payload", {})
+                        command = payload.get("command")
+                        if request.get("type") != "host.command" or command != "user_file.write":
+                            response = {
+                                "id": request.get("id", "unknown"),
+                                "type": "guest.error",
+                                "payload": {
+                                    "code": "unsupported_test_command",
+                                    "message": f"unsupported fake guest command: {command}",
+                                },
+                            }
+                        else:
+                            with open(command_log, "a", encoding="utf-8") as log:
+                                log.write(command + "\n")
+                            response = {
+                                "id": request["id"],
+                                "type": "guest.command_result",
+                                "payload": {
+                                    "command": command,
+                                    "updated": True,
+                                },
+                            }
+                        conn.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 PY
 }
 

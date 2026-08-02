@@ -39,9 +39,6 @@ fn exec_runs_while_bootstrap_setup_is_pending() {
         return;
     }
 
-    let observed = fixture.wait_observed_with_timeout(5);
-    assert!(observed.stdout().contains("status: Satisfied"), "{}", observed.render());
-
     let bootstrap = fixture.wait_agent_status_contains("work:bootstrap", Duration::from_secs(2));
     assert!(bootstrap.stdout().contains("work:bootstrap"), "{}", bootstrap.render());
 

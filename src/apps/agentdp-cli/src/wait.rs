@@ -210,7 +210,7 @@ impl WaitProgress {
             self.print_instance_phase(*instance_id, status.phase);
             self.print_transition_work(*instance_id, status.work.transition.as_ref());
             self.print_bootstrap_work(*instance_id, status.work.bootstrap.as_ref());
-            self.print_ready(*instance_id, status);
+            self.print_ready(*instance_id, status, document.generation());
         }
     }
 
@@ -378,8 +378,9 @@ impl WaitProgress {
         self.bootstrap_steps.insert(instance_id, message);
     }
 
-    fn print_ready(&mut self, instance_id: AgentInstanceId, status: &AgentInstanceStatus) {
-        let ready = status.readiness.as_ref().is_some_and(|readiness| readiness.ready);
+    fn print_ready(&mut self, instance_id: AgentInstanceId, status: &AgentInstanceStatus, generation: u64) {
+        let ready = status.readiness.as_ref().is_some_and(|readiness| readiness.ready)
+            && status.host_inputs.is_ready_for(generation);
         if self.ready_instances.insert(instance_id, ready) == Some(ready) || !ready {
             return;
         }
