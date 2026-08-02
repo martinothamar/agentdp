@@ -1,6 +1,10 @@
 model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
+model_verbosity = "low"
 web_search = "cached"
+
+[features]
+multi_agent_v2 = true
 
 [tui]
 status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used", "five-hour-limit", "weekly-limit", "codex-version", "context-window-size", "fast-mode"]
@@ -10,7 +14,10 @@ status_line_use_colors = true
 insert_newline = ["ctrl-j", "ctrl-m", "enter", "shift-enter", "alt-enter"]
 
 [tui.model_availability_nux]
-"gpt-5.6-sol" = 1
+"gpt-5.6-sol" = 4
 
 [projects."/data/home/code"]
 trust_level = "trusted"
+
+[notice]
+hide_rate_limit_model_nudge = true
