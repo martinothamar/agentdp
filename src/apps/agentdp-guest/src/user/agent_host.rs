@@ -19,8 +19,7 @@ const QUEUE_MESSAGE_CLIENT_SEQUENCE: u64 = 1;
 #[derive(Debug, PartialEq, Eq)]
 enum DeliveryState {
     Absent,
-    Pending,
-    Complete,
+    Accepted,
 }
 
 pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], repo_paths: &[String]) -> Result<bool> {
@@ -43,25 +42,23 @@ pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], repo_paths: &
         .filter(|session| session_covers_repositories(session, repo_paths))
         .collect::<Vec<_>>();
     let mut available = Vec::new();
-    let mut pending = false;
     for session in matching_sessions {
         let (chat, snapshot) = client.default_chat(&session.resource).await?;
         match delivery_state(&snapshot, &message_id, &marker) {
-            DeliveryState::Complete => return Ok(true),
-            DeliveryState::Pending => pending = true,
+            DeliveryState::Accepted => return Ok(true),
             DeliveryState::Absent if session.status & SESSION_ARCHIVED == 0 => available.push(chat),
             DeliveryState::Absent => {}
         }
     }
 
-    if pending {
-        return Ok(false);
-    }
     let [chat] = available.as_slice() else {
         return Ok(false);
     };
     client.queue_message(chat, &message_id, &prompt).await?;
-    Ok(false)
+    // Agent Host owns delivery after accepting the queued action. Waiting for
+    // turn completion lets an overlapping user prompt erase the marker and
+    // makes the next poll deliver the same event again.
+    Ok(true)
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,28 +84,24 @@ fn delivery_state(subscription: &Value, message_id: &str, marker: &str) -> Deliv
     let Some(state) = subscription.pointer("/snapshot/state") else {
         return DeliveryState::Absent;
     };
-    if state.get("turns").and_then(Value::as_array).is_some_and(|turns| {
-        turns.iter().any(|turn| {
-            turn.get("state").and_then(Value::as_str) == Some("complete")
-                && message_contains(turn.get("message"), marker)
-        })
-    }) {
-        return DeliveryState::Complete;
-    }
     if state
-        .get("queuedMessages")
+        .get("turns")
         .and_then(Value::as_array)
-        .is_some_and(|messages| {
-            messages.iter().any(|pending| {
-                pending.get("id").and_then(Value::as_str) == Some(message_id)
-                    || message_contains(pending.get("message"), marker)
+        .is_some_and(|turns| turns.iter().any(|turn| message_contains(turn.get("message"), marker)))
+        || state
+            .get("queuedMessages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|pending| {
+                    pending.get("id").and_then(Value::as_str) == Some(message_id)
+                        || message_contains(pending.get("message"), marker)
+                })
             })
-        })
         || state
             .get("activeTurn")
             .is_some_and(|turn| message_contains(turn.get("message"), marker))
     {
-        return DeliveryState::Pending;
+        return DeliveryState::Accepted;
     }
     DeliveryState::Absent
 }
@@ -417,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_delivery_from_durable_chat_state() {
+    fn classifies_accepted_delivery_from_durable_chat_state() {
         let message_id = "agentdp-pr-batch";
         let marker = "<agentdp_delivery>agentdp-pr-batch</agentdp_delivery>";
         let message = json!({ "text": marker, "origin": { "kind": "user" } });
@@ -435,10 +428,10 @@ mod tests {
             "snapshot": { "state": { "activeTurn": { "message": message } } }
         });
 
-        assert_eq!(delivery_state(&complete, message_id, marker), DeliveryState::Complete);
-        assert_eq!(delivery_state(&failed, message_id, marker), DeliveryState::Absent);
-        assert_eq!(delivery_state(&queued, message_id, marker), DeliveryState::Pending);
-        assert_eq!(delivery_state(&active, message_id, marker), DeliveryState::Pending);
+        assert_eq!(delivery_state(&complete, message_id, marker), DeliveryState::Accepted);
+        assert_eq!(delivery_state(&failed, message_id, marker), DeliveryState::Accepted);
+        assert_eq!(delivery_state(&queued, message_id, marker), DeliveryState::Accepted);
+        assert_eq!(delivery_state(&active, message_id, marker), DeliveryState::Accepted);
         assert_eq!(
             delivery_state(&json!({ "snapshot": { "state": {} } }), message_id, marker),
             DeliveryState::Absent
@@ -489,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_events_until_the_marked_turn_completes_even_if_the_session_is_archived() -> TestResult<()> {
+    async fn accepted_queue_action_completes_delivery() -> TestResult<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let server = tokio::spawn(serve_mock_agent_host(listener));
@@ -499,11 +492,9 @@ mod tests {
         }];
         let repositories = ["/data/home/code/altinn-studio".to_owned()];
 
-        let dispatched = queue_pr_events(&format!("ws://{address}"), &events, &repositories).await?;
-        let completed = queue_pr_events(&format!("ws://{address}"), &events, &repositories).await?;
+        let delivered = queue_pr_events(&format!("ws://{address}"), &events, &repositories).await?;
 
-        assert!(!dispatched);
-        assert!(completed);
+        assert!(delivered);
         server.await??;
         Ok(())
     }
@@ -532,15 +523,6 @@ mod tests {
         assert!(prompt.contains("<agentdp_delivery>agentdp-pr-"));
         send_action(&mut socket, &action, "another-client", 3).await?;
         send_action(&mut socket, &action, &client_id, 4).await?;
-        drop(socket);
-
-        let completed_state = json!({
-            "turns": [{
-                "state": "complete",
-                "message": { "text": prompt, "origin": { "kind": "user" } }
-            }]
-        });
-        let _ = subscribe_mock_client(&listener, 65, completed_state).await?;
         Ok(())
     }
 
