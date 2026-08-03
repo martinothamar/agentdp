@@ -1,3 +1,4 @@
+mod agent_host;
 mod browser;
 mod claude;
 mod code_server;
@@ -46,6 +47,9 @@ pub(super) fn apply(plugins: &Plugins, builder: &mut ProvisioningBuilder<'_>) {
     browser::apply_claude_integration(plugins, builder);
     if let Some(codex) = &plugins.codex {
         codex.apply(builder);
+    }
+    if let Some(agent_host) = &plugins.agent_host {
+        agent_host.apply(builder);
     }
     browser::apply_codex_integration(plugins, builder);
     if let Some(github) = &plugins.github {

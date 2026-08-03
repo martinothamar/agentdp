@@ -2384,6 +2384,8 @@ fn manifest_with_codex_mediated_auth(replicas: u16) -> AgentManifest {
     manifest.spec.template.network.mode = NetworkMode::Mediated;
     manifest.spec.template.plugins.codex = Some(Codex {
         yolo: false,
+        version: "latest".to_owned(),
+        session: codex::CodexSession::Guestd,
         auth: AuthMode::Mediated,
         auth_source: Some(codex::CodexAuthSource::HostAuth),
     });

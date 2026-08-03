@@ -77,6 +77,20 @@ impl RenderedBootstrapPlan {
                 return Err(BootstrapGraphError::DuplicateStep { step: step.id.clone() });
             }
         }
+        for step in &self.steps {
+            for dependency in &step.depends_on {
+                if step.phase == BootstrapStepPhase::System
+                    && steps
+                        .get(dependency.as_str())
+                        .is_some_and(|dependency| dependency.phase == BootstrapStepPhase::User)
+                {
+                    return Err(BootstrapGraphError::InvalidPhaseDependency {
+                        step: step.id.clone(),
+                        dependency: dependency.clone(),
+                    });
+                }
+            }
+        }
 
         let mut visiting = BTreeSet::new();
         let mut visited = BTreeSet::new();
@@ -116,6 +130,8 @@ pub enum BootstrapGraphError {
     DuplicateStep { step: String },
     #[error("bootstrap step `{step}` depends on missing step `{dependency}`")]
     MissingDependency { step: String, dependency: String },
+    #[error("system bootstrap step `{step}` must not depend on user bootstrap step `{dependency}`")]
+    InvalidPhaseDependency { step: String, dependency: String },
     #[error("bootstrap step graph has a dependency cycle involving `{step}`")]
     Cycle { step: String },
 }
@@ -696,6 +712,16 @@ unexpected: value
             vec![test_step("a", ["b"]), test_step("b", ["a"])],
             BootstrapGraphError::Cycle { step: "a".to_owned() },
         );
+        assert_invalid_graph(
+            vec![
+                test_step("system", ["user"]),
+                test_step_with_phase("user", [], BootstrapStepPhase::User),
+            ],
+            BootstrapGraphError::InvalidPhaseDependency {
+                step: "system".to_owned(),
+                dependency: "user".to_owned(),
+            },
+        );
     }
 
     fn bootstrap_render_input(
@@ -738,8 +764,16 @@ unexpected: value
     }
 
     fn test_step<const N: usize>(id: &str, depends_on: [&str; N]) -> RenderedBootstrapStep {
+        test_step_with_phase(id, depends_on, BootstrapStepPhase::System)
+    }
+
+    fn test_step_with_phase<const N: usize>(
+        id: &str,
+        depends_on: [&str; N],
+        phase: BootstrapStepPhase,
+    ) -> RenderedBootstrapStep {
         RenderedBootstrapStep {
-            spec: bootstrap_step_spec(id, id, BootstrapStepPhase::System, depends_on, std::iter::empty(), 60),
+            spec: bootstrap_step_spec(id, id, phase, depends_on, std::iter::empty(), 60),
             placement: BootstrapStepPlacement::Base,
             contents: "#!/usr/bin/env bash\n:\n".to_owned(),
         }

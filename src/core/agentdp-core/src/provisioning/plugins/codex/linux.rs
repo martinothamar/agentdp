@@ -1,4 +1,4 @@
-use crate::manifest::plugins::codex::Codex;
+use crate::manifest::plugins::codex::{Codex, CodexSession};
 use crate::provisioning::bootstrap::ProvisioningBuilder;
 use crate::provisioning::guest_os::linux::shell;
 use agentdp_protocol::server_guest::BootstrapStepResource;
@@ -13,7 +13,7 @@ pub(super) fn apply(plugin: &Codex, builder: &mut ProvisioningBuilder<'_>) {
         "Install Codex",
         ["plugin.mise"],
         [BootstrapStepResource::AgentHome, BootstrapStepResource::NpmGlobal],
-        render_codex_install(plugin.yolo),
+        render_codex_install(plugin.yolo, &plugin.version),
     );
     let mut config = shell::ShellScript::new();
     config.block(&trust_code_dir(code_dir));
@@ -25,13 +25,15 @@ pub(super) fn apply(plugin: &Codex, builder: &mut ProvisioningBuilder<'_>) {
         [BootstrapStepResource::AgentHome],
         config.render(),
     );
-    builder.add_base_system_step(
-        "plugin.codex.session",
-        "Configure Codex session service",
-        ["system.guest_tooling"],
-        [BootstrapStepResource::Systemd],
-        enable_daemon_codex_session_management(),
-    );
+    if plugin.session == CodexSession::Guestd {
+        builder.add_base_system_step(
+            "plugin.codex.session",
+            "Configure Codex session service",
+            ["system.guest_tooling"],
+            [BootstrapStepResource::Systemd],
+            enable_daemon_codex_session_management(),
+        );
+    }
 }
 
 fn trust_code_dir(code_dir: &str) -> String {
@@ -55,14 +57,22 @@ fn trust_code_dir(code_dir: &str) -> String {
     script.render()
 }
 
-fn render_codex_install(yolo: bool) -> String {
+fn render_codex_install(yolo: bool, version: &str) -> String {
     let mut script = shell::ShellScript::new();
     script.line("install -d -m 0755 \"$HOME/.local/bin\" \"$HOME/.local/share/agentdp/codex\"");
-    script.line("npm install -g --prefix \"$HOME/.local/share/agentdp/codex\" @openai/codex@latest");
+    // A normal prefix install hoists the platform package beside @openai/codex,
+    // making this directory usable as VS Code's Codex SDK root as well as the
+    // source of the CLI. npm's global layout nests that package too deeply.
+    script.line(format!(
+        "npm install --prefix \"$HOME/.local/share/agentdp/codex\" {}",
+        shell::single_quote(&format!("@openai/codex@{version}"))
+    ));
     if yolo {
         script.block(CODEX_WRAPPER);
     } else {
-        script.line("ln -sf \"$HOME/.local/share/agentdp/codex/bin/codex\" \"$HOME/.local/bin/codex\"");
+        script.line(
+            "ln -sf \"$HOME/.local/share/agentdp/codex/node_modules/@openai/codex/bin/codex.js\" \"$HOME/.local/bin/codex\"",
+        );
     }
     script.render()
 }
@@ -71,7 +81,7 @@ const CODEX_WRAPPER: &str = r#"cat >"$HOME/.local/bin/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-codex_real="$HOME/.local/share/agentdp/codex/bin/codex"
+codex_real="$HOME/.local/share/agentdp/codex/node_modules/@openai/codex/bin/codex.js"
 if [ ! -x "$codex_real" ]; then
   echo "agentdp codex wrapper could not find $codex_real" >&2
   exit 127

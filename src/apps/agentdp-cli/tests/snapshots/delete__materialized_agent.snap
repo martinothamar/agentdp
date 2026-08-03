@@ -11,7 +11,7 @@ stopped replicas: 0
 deleting replicas: 0
 reconciling: false
 deleted: true
-agent base: Ready desired:sha256-f40d4659f3bd46966c7c768dc006167b029f9a1953a802322927c4572c8b7c33 ready:sha256-f40d4659f3bd46966c7c768dc006167b029f9a1953a802322927c4572c8b7c33
+agent base: Ready desired:sha256-66e9a00d5cbdaeb9ee0a6fb82a4e8a3dc3e7c233ea25c7ee53fd940e53a90507 ready:sha256-66e9a00d5cbdaeb9ee0a6fb82a4e8a3dc3e7c233ea25c7ee53fd940e53a90507
 instances: none
 --- stderr
 

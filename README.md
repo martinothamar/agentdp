@@ -12,7 +12,7 @@ Using `agentctl` to manage agents:
 
 ![agentctl](img/agentctl.gif)
 
-Me driving 2 [altinn-studio agent instances](examples/altinn-studio/agent.yaml) (code-server as UI and Codex CLI as harness in tmux session, inside the VM/sandbox):
+Historical recording of me driving two [altinn-studio agent instances](examples/altinn-studio/agent.yaml) through the previous code-server/tmux workflow:
 
 https://github.com/user-attachments/assets/4f0f7a27-5d3f-4a09-88cf-691574362c19
 
@@ -29,6 +29,7 @@ Current:
   - GH PR listener/subscription manager for auto-prompting agent session based on GH PR events 
 - Support Arch Linux and Rocky 9 as guest OS
 - Plugins for `gh`, `codex`, `docker`, `mise`, `tailscale`, browser (including Playwright MCP) and more
+- VS Code Agents Window integration through discovered, Tailscale-served Agent Host Protocol endpoints
 - Custom network stack for MITM proxying, allowing "mediated auth", meaning your agent never sees secrets; only placeholders
   - Automatically inject and register MITM CAs with guest OS, docker/podman containers 
 - OS-agnostic runtime, provisioning and guest-side modules to allow for future crossplatform support host- and guest-side for Windows, macOS and Linux
@@ -55,7 +56,7 @@ Ideas:
 ## Altinn Studio example
 
 The [altinn-studio agent example](examples/altinn-studio/agent.yaml) has been the main driver/user of the code in this repo.
-I personally use it installed on a cachyOS desktop PC with 6 replicas running. Reflections:
+I personally use it installed on a cachyOS desktop PC with 3 replicas running. Reflections:
 * Its a very technically capable agent, can take full advantage of "computer use" advances in models
   * Debugging and taking process dumps to [root-cause and fix hangs/deadlocks](https://github.com/Altinn/app-lib-dotnet/pull/1798)
   * Use advanced tools like [`strace` to debug and prove various facts important to decision-making](https://github.com/Altinn/app-lib-dotnet/pull/1811#issuecomment-4716265043)
@@ -69,10 +70,10 @@ I personally use it installed on a cachyOS desktop PC with 6 replicas running. R
 * Using open source infra and having IaC like e.g. GitOps is a major benefit. Both agents and human engineers do a lot better when there is awareness of the infastructure that binds and underpins the software they write
 
 Configuration
-* Codex as harness
+* Codex app-server through the pinned VS Code Agent Host
 * Mediated/MITM auth and networking, no access to secrets for gh, codex, studioctl
-* code-server as UI
-* tailscale serve for remote access (coding on the laptop/phone while away for instance)
+* VS Code Insiders Agents Window as UI, backed by the pinned VS Code Agent Host and Codex
+* Tailscale Serve and the AgentDP VS Code extension for automatic remote-instance discovery
 * lots of tools: browser, playwright, languages/compilers/toolchains, docker (normal install including daemon and systemd), kind (Kubernetes In Docker)
 
 
@@ -106,7 +107,7 @@ Configuration
 * Client (cli, frontend)
 * Server (controller/manager of agents)
 * Sandbox (e.g. QEMU VM)
-* Harness (e.g. Codex CLI + tmux + tooling in guestd/guestctl)
+* Harness (e.g. VS Code Agent Host + Codex + tooling in guestd/guestctl)
 
 ### General
 

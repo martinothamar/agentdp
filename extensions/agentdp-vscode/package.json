@@ -1,0 +1,67 @@
+{
+  "name": "agentdp",
+  "displayName": "AgentDP",
+  "description": "Discovers AgentDP Agent Host instances for the VS Code Agents Window.",
+  "version": "0.0.1",
+  "publisher": "martinothamar",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/martinothamar/agentdp.git"
+  },
+  "engines": {
+    "vscode": "^1.132.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:agentdp.addServer",
+    "onCommand:agentdp.removeServer",
+    "onCommand:agentdp.refreshAgentHosts"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentdp.addServer",
+        "title": "AgentDP: Add Server"
+      },
+      {
+        "command": "agentdp.removeServer",
+        "title": "AgentDP: Remove Server"
+      },
+      {
+        "command": "agentdp.refreshAgentHosts",
+        "title": "AgentDP: Refresh Agent Hosts"
+      }
+    ],
+    "configuration": {
+      "title": "AgentDP",
+      "properties": {
+        "agentdp.serverUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "AgentDP HTTPS control-plane URL on the local tailnet."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "package": "vsce package --out agentdp.vsix"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.2"
+  }
+}

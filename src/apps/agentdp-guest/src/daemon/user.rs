@@ -5,7 +5,8 @@ use agentdp_platform::fs::{ensure_private_dir, set_private_file};
 use agentdp_platform::socket;
 
 use crate::user::{
-    AgentSessionService, CLAUDE_SESSION_COMMAND, CODEX_SESSION_COMMAND, ControlHandler, GithubPrService, RuntimePaths,
+    AgentAutomation, CLAUDE_SESSION_COMMAND, CODEX_SESSION_COMMAND, ControlHandler, GithubPrService, RuntimePaths,
+    TmuxAgentSession,
 };
 use crate::user::{local_socket_io_error, remove_stale_socket};
 use crate::{Error, Result};
@@ -28,18 +29,31 @@ pub(crate) async fn run() -> Result<()> {
     set_private_file(&paths.socket).await?;
 
     let agent_launch_command = agent_launch_command();
-    let agent_session = Arc::new(AgentSessionService::new(
-        &paths,
-        agent_launch_command.unwrap_or_default(),
-        env_u64("AGENTDP_PR_IDLE_SECONDS").unwrap_or(DEFAULT_IDLE_SECONDS),
-    ));
+    let tmux_session = agent_launch_command.map(|command| {
+        Arc::new(TmuxAgentSession::new(
+            &paths,
+            command,
+            env_u64("AGENTDP_PR_IDLE_SECONDS").unwrap_or(DEFAULT_IDLE_SECONDS),
+        ))
+    });
+    let automation = std::env::var("AGENTDP_AGENT_HOST_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .map_or_else(
+            || {
+                tmux_session.as_ref().map_or(AgentAutomation::Unavailable, |tmux| {
+                    AgentAutomation::Tmux(Arc::clone(tmux))
+                })
+            },
+            AgentAutomation::AgentHost,
+        );
     let github_pr = Arc::new(GithubPrService::new(
         &paths,
-        Arc::clone(&agent_session),
+        Arc::new(automation),
         env_u64("AGENTDP_PR_POLL_SECONDS").unwrap_or(DEFAULT_POLL_SECONDS),
     ));
-    if agent_launch_command.is_some() {
-        tokio::spawn(agent_session_loop(Arc::clone(&agent_session)));
+    if let Some(tmux_session) = tmux_session {
+        tokio::spawn(agent_session_loop(tmux_session));
     }
     let control = Arc::new(ControlHandler::new(Arc::clone(&github_pr)));
     tokio::spawn(poll_loop(Arc::clone(&github_pr)));
@@ -65,7 +79,7 @@ async fn poll_loop(service: Arc<GithubPrService>) {
     }
 }
 
-async fn agent_session_loop(service: Arc<AgentSessionService>) {
+async fn agent_session_loop(service: Arc<TmuxAgentSession>) {
     loop {
         if let Err(error) = service.ensure_session().await {
             eprintln!("guestd: agent session startup failed: {error}");

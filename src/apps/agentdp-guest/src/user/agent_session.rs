@@ -11,7 +11,7 @@ use agentdp_platform::command::{run_capture, run_status};
 use agentdp_platform::fs::{read_optional_text, remove_file, write_atomic};
 
 #[derive(Debug)]
-pub(crate) struct AgentSessionService {
+pub(crate) struct TmuxAgentSession {
     code_dir: PathBuf,
     pane_file: PathBuf,
     state_dir: PathBuf,
@@ -20,7 +20,7 @@ pub(crate) struct AgentSessionService {
     idle_seconds: u64,
 }
 
-impl AgentSessionService {
+impl TmuxAgentSession {
     pub(crate) fn new(paths: &RuntimePaths, launch_command: impl Into<String>, idle_seconds: u64) -> Self {
         Self {
             code_dir: paths.code_dir.clone(),

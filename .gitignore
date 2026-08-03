@@ -3,6 +3,8 @@
 !.codex/rules/
 !.codex/rules/default.rules
 /target
+/extensions/agentdp-vscode/node_modules
+/extensions/agentdp-vscode/agentdp.vsix
 /tmp
 .env
 .env.*

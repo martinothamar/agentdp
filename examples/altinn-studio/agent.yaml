@@ -4,7 +4,7 @@ metadata:
   name: altinn-studio
 spec:
   phase: Running
-  replicas: 6
+  replicas: 3
   template:
   
     image:
@@ -16,7 +16,7 @@ spec:
     resources:
       cpus: 8
       memory: 16G
-      storage: 40G
+      storage: 100G
   
     network:
       mode: mediated
@@ -29,9 +29,9 @@ spec:
           names:
             - host.docker.internal
       ports:
-        code_server:
-          guest: 4090
-          host: 4090
+        agent_host:
+          guest: 18765
+          host: 18765
           protocol: tcp
         ssh:
           guest: 22
@@ -98,13 +98,6 @@ spec:
         - url: https://github.com/martinothamar-agent/altinn-receipt.git
           upstream: https://github.com/Altinn/altinn-receipt.git
   
-      healthchecks:
-        - name: code_server
-          kind: http
-          method: GET
-          url: http://127.0.0.1:4090/
-          timeout: 30m
-  
     secrets:
       - env: STUDIO_DEV_API_KEY
         allow_hosts:
@@ -158,26 +151,17 @@ spec:
         playwright:
           install: npm-global
       codex:
+        # Keep this pinned to a version verified with AgentDP's pinned Agent Host runtime.
+        # Bump it only after the AHP integration smoke test passes.
+        version: 0.146.0
+        session: none
         yolo: true
         auth: mediated
         auth_source: host-auth
       github:
         auth: mediated
         setup_git: true
+      agent_host: {}
       tailscale_serve:
         routes:
-          - service: code_server
-      code_server:
-        settings: data/home/.local/share/code-server/User/settings.json
-        trusted_domains:
-          - github.com
-          - "*.github.com"
-          - altinn.studio
-          - "*.altinn.studio"
-        restart_after_bootstrap: true
-        remove_extensions:
-          - github.copilot
-          - github.copilot-chat
-        extensions:
-          - EditorConfig.EditorConfig
-          - redhat.vscode-yaml
+          - service: agent_host

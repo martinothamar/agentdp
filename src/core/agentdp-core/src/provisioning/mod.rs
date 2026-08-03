@@ -120,6 +120,98 @@ mod tests {
     }
 
     #[test]
+    fn agent_host_owns_codex_sessions_and_uses_the_pinned_runtime() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: agent-host
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        agent_host:
+          guest: 18765
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      codex:
+        version: 0.146.0
+        session: none
+        auth: mediated
+      agent_host: {}
+    secrets: []
+",
+        )
+        .unwrap();
+        let plan = ProvisioningPlan::from_manifest(&manifest, &ProvisioningOptions::default());
+
+        let base = plan.render_base_bootstrap(&manifest).unwrap();
+        let instance = plan.render_instance_bootstrap(&manifest).unwrap();
+
+        assert!(base.steps.iter().any(|step| step.id == "plugin.agent_host.install"));
+        assert!(base.steps.iter().any(|step| step.id == "plugin.agent_host.service"));
+        assert!(!base.steps.iter().any(|step| step.id == "plugin.codex.session"));
+        assert!(base.steps.iter().any(|step| {
+            step.id == "plugin.codex.install"
+                && step.contents.contains("@openai/codex@0.146.0")
+                && step.contents.contains("npm install --prefix")
+                && step.contents.contains("codex/node_modules/@openai/codex/bin/codex.js")
+        }));
+        assert!(base.steps.iter().any(|step| {
+            step.id == "plugin.agent_host.install"
+                && step
+                    .contents
+                    .contains("https://update.code.visualstudio.com/commit:9e200810")
+                && step
+                    .contents
+                    .contains("88052267db310b0d5493e4f758b0f9606d2b3925c69caa371a1ace69560925f1")
+                && step.contents.contains("expected exactly one patch location")
+                && step.contents.contains("inherit web_search from the guest Codex config")
+                && step
+                    .contents
+                    .contains("default new sessions to unrestricted Codex permissions")
+        }));
+        assert!(base.steps.iter().any(|step| {
+            step.id == "plugin.agent_host.service"
+                && step.contents.contains("--agent-host-port 18765")
+                && step
+                    .contents
+                    .contains("/opt/agentdp/vscode-agent-host/server/bin/code-server-insiders")
+                && step
+                    .contents
+                    .contains("Environment=AGENTDP_AGENT_HOST_URL=ws://127.0.0.1:18765")
+                && step.contents.contains("VSCODE_AGENT_HOST_CODEX_SDK_ROOT")
+                && !step.contents.contains("--replace")
+        }));
+        assert!(instance.steps.iter().any(|step| {
+            step.id == "plugin.agent_host.config"
+                && step.depends_on == ["system.user_handoff"]
+                && step.contents.contains("codexUsageSource")
+                && step.contents.contains("openai")
+                && step.contents.contains("sudo -n systemctl restart agent-host.service")
+        }));
+        assert!(
+            instance
+                .healthchecks
+                .iter()
+                .any(|healthcheck| healthcheck.name == "agent_host")
+        );
+    }
+
+    #[test]
     fn claude_manifest_installs_guest_tooling() {
         let manifest = serde_yaml::from_str::<AgentManifest>(
             r"

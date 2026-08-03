@@ -65,6 +65,7 @@ proptest = "1.11.0"
 
 clap = { version = "4.6.1", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 flate2 = "1.1.9"
+futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
 libc = "0.2.186"
 mio = { version = "1.2.1", features = ["net", "os-poll"] }
 sha1 = "0.11.0"
@@ -84,4 +85,5 @@ serde_yaml = "0.9.34"
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "proto-dhcpv4", "socket-tcp", "socket-udp", "auto-icmp-echo-reply"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 windows-sys = "0.61.2"

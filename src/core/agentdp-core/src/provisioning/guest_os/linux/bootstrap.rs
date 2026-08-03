@@ -541,6 +541,14 @@ ExecStart=/usr/bin/install -D -m 0644 -o root -g root {PERSISTENT_CUSTOM_ENV_PAT
 WantedBy=multi-user.target"
     ));
     script.line("AGENTDP_RUNTIME_ENV_SERVICE");
+    script.line("  install -d -m 0755 /etc/systemd/system/user@.service.d");
+    script.line("  cat >/etc/systemd/system/user@.service.d/agentdp-runtime-env.conf <<'AGENTDP_USER_ENV_ORDERING'");
+    script.block(
+        "[Unit]
+Requires=agentdp-runtime-env.service
+After=agentdp-runtime-env.service",
+    );
+    script.line("AGENTDP_USER_ENV_ORDERING");
     script.line("  systemctl daemon-reload");
     script.line("  systemctl enable --now agentdp-runtime-env.service");
     script.line("fi");
@@ -674,7 +682,7 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    use super::{CODE_DIR, template, templates};
+    use super::{CODE_DIR, render_runtime_env_install, template, templates};
     use crate::provisioning::guest_os::linux::{paths, shell};
 
     #[test]
@@ -725,5 +733,14 @@ mod tests {
             .position(|entry| *entry == "/bin")
             .expect("PATH contains /bin");
         assert!(local_bin < bin, "expected /usr/local/bin before /bin, got {path:?}");
+    }
+
+    #[test]
+    fn runtime_environment_precedes_lingering_user_managers() {
+        let script = render_runtime_env_install();
+
+        assert!(script.contains("/etc/systemd/system/user@.service.d/agentdp-runtime-env.conf"));
+        assert!(script.contains("Requires=agentdp-runtime-env.service"));
+        assert!(script.contains("After=agentdp-runtime-env.service"));
     }
 }

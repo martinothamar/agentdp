@@ -1,3 +1,4 @@
+pub mod agent_host;
 pub mod browser;
 pub mod claude;
 pub mod code_server;
@@ -22,6 +23,7 @@ use super::Network;
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Plugins {
+    pub agent_host: Option<agent_host::AgentHost>,
     pub docker: Option<docker::Docker>,
     pub dotnet: Option<dotnet::DotNet>,
     pub git: Option<git::Git>,
@@ -39,7 +41,15 @@ pub struct Plugins {
 
 impl Plugins {
     pub(super) fn validate(&self, network: &Network, errors: &mut Vec<String>) {
-        if self.claude.is_some() && self.codex.is_some() {
+        if let Some(codex) = &self.codex {
+            codex.validate(errors);
+        }
+        if self.claude.is_some()
+            && self
+                .codex
+                .as_ref()
+                .is_some_and(|codex| codex.session == codex::CodexSession::Guestd)
+        {
             errors.push(
                 "plugins.claude and plugins.codex cannot both be enabled: both manage the agent tmux session"
                     .to_owned(),
@@ -65,6 +75,17 @@ impl Plugins {
         }
         if let Some(tailscale_serve) = &self.tailscale_serve {
             tailscale_serve.validate(network, errors);
+        }
+        if self.agent_host.is_some() {
+            agent_host::AgentHost::validate(network, errors);
+            match &self.codex {
+                Some(codex) if codex.session == codex::CodexSession::None => {}
+                Some(_) => errors.push(
+                    "plugins.agent_host requires plugins.codex.session to be `none` so only Agent Host owns Codex sessions"
+                        .to_owned(),
+                ),
+                None => errors.push("plugins.agent_host requires plugins.codex".to_owned()),
+            }
         }
     }
 

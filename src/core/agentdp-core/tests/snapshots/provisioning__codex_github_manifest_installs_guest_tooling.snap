@@ -461,12 +461,12 @@ base:
       . '/usr/local/lib/agentdp/env.sh'
 
       install -d -m 0755 "$HOME/.local/bin" "$HOME/.local/share/agentdp/codex"
-      npm install -g --prefix "$HOME/.local/share/agentdp/codex" @openai/codex@latest
+      npm install --prefix "$HOME/.local/share/agentdp/codex" '@openai/codex@latest'
       cat >"$HOME/.local/bin/codex" <<'EOF'
       #!/usr/bin/env bash
       set -euo pipefail
 
-      codex_real="$HOME/.local/share/agentdp/codex/bin/codex"
+      codex_real="$HOME/.local/share/agentdp/codex/node_modules/@openai/codex/bin/codex.js"
       if [ ! -x "$codex_real" ]; then
         echo "agentdp codex wrapper could not find $codex_real" >&2
         exit 127
@@ -580,6 +580,12 @@ instance:
       [Install]
       WantedBy=multi-user.target
       AGENTDP_RUNTIME_ENV_SERVICE
+        install -d -m 0755 /etc/systemd/system/user@.service.d
+        cat >/etc/systemd/system/user@.service.d/agentdp-runtime-env.conf <<'AGENTDP_USER_ENV_ORDERING'
+      [Unit]
+      Requires=agentdp-runtime-env.service
+      After=agentdp-runtime-env.service
+      AGENTDP_USER_ENV_ORDERING
         systemctl daemon-reload
         systemctl enable --now agentdp-runtime-env.service
       fi

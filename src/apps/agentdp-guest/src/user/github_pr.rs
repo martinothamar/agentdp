@@ -10,7 +10,7 @@ use agentdp_platform::fs::{files_with_extension, remove_file, write_atomic};
 
 use super::local_protocol::PrListItem;
 use super::paths::RuntimePaths;
-use crate::user::AgentSessionService;
+use crate::user::AgentAutomation;
 use crate::{Error, Result};
 
 const MAX_PREVIEW_LENGTH: usize = 220;
@@ -51,6 +51,7 @@ pub(super) struct PrEvent {
 #[derive(Debug, Serialize, Deserialize)]
 struct QueuedEvents {
     url: String,
+    repo_path: String,
     events: Vec<PrEvent>,
     updated_at: String,
 }
@@ -60,17 +61,17 @@ pub(crate) struct GithubPrService {
     registry: PathBuf,
     seen: PathBuf,
     queue_dir: PathBuf,
-    agent_session: Arc<AgentSessionService>,
+    automation: Arc<AgentAutomation>,
     poll_seconds: u64,
 }
 
 impl GithubPrService {
-    pub(crate) fn new(paths: &RuntimePaths, agent_session: Arc<AgentSessionService>, poll_seconds: u64) -> Self {
+    pub(crate) fn new(paths: &RuntimePaths, automation: Arc<AgentAutomation>, poll_seconds: u64) -> Self {
         Self {
             registry: paths.registry.clone(),
             seen: paths.seen.clone(),
             queue_dir: paths.queue_dir.clone(),
-            agent_session,
+            automation,
             poll_seconds,
         }
     }
@@ -137,10 +138,14 @@ impl GithubPrService {
     }
 
     pub(crate) async fn poll_once(&self) -> Result<()> {
+        if matches!(self.automation.as_ref(), AgentAutomation::AgentHost(_)) && !self.flush_queued_events().await? {
+            return Ok(());
+        }
         for entry in self.read_registry().await?.prs {
             self.handle_pr(&entry).await?;
         }
-        self.flush_queued_events().await
+        self.flush_queued_events().await?;
+        Ok(())
     }
 
     async fn handle_pr(&self, entry: &PrEntry) -> Result<()> {
@@ -157,7 +162,7 @@ impl GithubPrService {
         if new_events.is_empty() {
             return Ok(());
         }
-        self.queue_events(&entry.url, &new_events).await?;
+        self.queue_events(entry, &new_events).await?;
         for event in new_events {
             seen.events.insert(event.id);
         }
@@ -173,10 +178,11 @@ impl GithubPrService {
         self.write_seen(&seen).await
     }
 
-    async fn queue_events(&self, url: &str, events: &[PrEvent]) -> Result<()> {
-        let file = self.queue_dir.join(format!("{}.json", stable_hash_hex(url)));
+    async fn queue_events(&self, entry: &PrEntry, events: &[PrEvent]) -> Result<()> {
+        let file = self.queue_dir.join(format!("{}.json", stable_hash_hex(&entry.url)));
         let mut queue = read_json_file(&file).await?.unwrap_or_else(|| QueuedEvents {
-            url: url.to_owned(),
+            url: entry.url.clone(),
+            repo_path: entry.repo_path.clone(),
             events: Vec::new(),
             updated_at: String::new(),
         });
@@ -189,28 +195,53 @@ impl GithubPrService {
             by_id.insert(event.id.clone(), event.clone());
         }
         queue = QueuedEvents {
-            url: url.to_owned(),
+            url: entry.url.clone(),
+            repo_path: entry.repo_path.clone(),
             events: by_id.into_values().collect(),
             updated_at: now_marker(),
         };
         write_json_atomic(&file, &queue, 0o600).await
     }
 
-    async fn flush_queued_events(&self) -> Result<()> {
-        let files = json_files(&self.queue_dir).await?;
-        let mut events = Vec::new();
-        for file in &files {
-            if let Some(queue) = read_json_file::<QueuedEvents>(file).await? {
-                events.extend(queue.events);
+    async fn flush_queued_events(&self) -> Result<bool> {
+        match self.automation.as_ref() {
+            AgentAutomation::AgentHost(url) => {
+                let mut files = json_files(&self.queue_dir).await?;
+                files.sort_unstable();
+                for file in files {
+                    let Some(queue) = read_json_file::<QueuedEvents>(&file).await? else {
+                        continue;
+                    };
+                    if !queue.events.is_empty()
+                        && !super::agent_host::queue_pr_events(url, &queue.events, &[queue.repo_path]).await?
+                    {
+                        return Ok(false);
+                    }
+                    remove_file(&file).await?;
+                }
+                Ok(true)
             }
+            AgentAutomation::Tmux(tmux) => {
+                let files = json_files(&self.queue_dir).await?;
+                let mut events = Vec::new();
+                for file in &files {
+                    if let Some(queue) = read_json_file::<QueuedEvents>(file).await? {
+                        events.extend(queue.events);
+                    }
+                }
+                if events.is_empty() {
+                    return Ok(false);
+                }
+                if !tmux.inject_pr_events_if_idle(&events).await? {
+                    return Ok(false);
+                }
+                for file in files {
+                    remove_file(&file).await?;
+                }
+                Ok(true)
+            }
+            AgentAutomation::Unavailable => Ok(false),
         }
-        if events.is_empty() || !self.agent_session.inject_pr_events_if_idle(&events).await? {
-            return Ok(());
-        }
-        for file in files {
-            remove_file(&file).await?;
-        }
-        Ok(())
     }
 
     async fn read_registry(&self) -> Result<PrRegistry> {
@@ -545,8 +576,10 @@ fn now_marker() -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::sync::Arc;
 
-    use super::{compact_text, pr_events, stable_hash_hex};
+    use super::{GithubPrService, PrEvent, QueuedEvents, compact_text, pr_events, stable_hash_hex, write_json_atomic};
+    use crate::user::AgentAutomation;
 
     #[test]
     fn compact_text_removes_html_and_limits_length() {
@@ -570,6 +603,79 @@ mod tests {
     fn stable_hash_is_deterministic() {
         assert_eq!(stable_hash_hex("same"), stable_hash_hex("same"));
         assert_ne!(stable_hash_hex("same"), stable_hash_hex("different"));
+    }
+
+    #[tokio::test]
+    async fn non_agent_host_automation_does_not_apply_receipt_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "agentdp-pr-queue-test-{}-{}",
+            std::process::id(),
+            super::now_marker()
+        ));
+        let queue_dir = root.join("queue");
+        tokio::fs::create_dir_all(&queue_dir).await.expect("create test queue");
+        let registry = root.join("registry.json");
+        write_json_atomic(&registry, &super::PrRegistry::default(), 0o600)
+            .await
+            .expect("write test registry");
+        let empty_file = queue_dir.join("a-empty.json");
+        write_json_atomic(
+            &empty_file,
+            &QueuedEvents {
+                url: "https://example.test/pr/1".to_owned(),
+                repo_path: "/data/home/code/repo".to_owned(),
+                events: Vec::new(),
+                updated_at: "1".to_owned(),
+            },
+            0o600,
+        )
+        .await
+        .expect("write completed test queue");
+        let pending_file = queue_dir.join("b-pending.json");
+        write_json_atomic(
+            &pending_file,
+            &QueuedEvents {
+                url: "https://example.test/pr/2".to_owned(),
+                repo_path: "/data/home/code/repo".to_owned(),
+                events: vec![PrEvent {
+                    id: "event-1".to_owned(),
+                    line: "pr=#1 event=review".to_owned(),
+                }],
+                updated_at: "1".to_owned(),
+            },
+            0o600,
+        )
+        .await
+        .expect("write test queue");
+        let service = GithubPrService {
+            registry: registry.clone(),
+            seen: root.join("seen.json"),
+            queue_dir: queue_dir.clone(),
+            automation: Arc::new(AgentAutomation::Unavailable),
+            poll_seconds: 1,
+        };
+
+        service
+            .poll_once()
+            .await
+            .expect("unavailable automation should preserve the existing queue");
+
+        assert!(empty_file.exists());
+        assert!(pending_file.exists());
+        let restarted = GithubPrService {
+            registry,
+            seen: root.join("seen.json"),
+            queue_dir,
+            automation: Arc::new(AgentAutomation::Unavailable),
+            poll_seconds: 1,
+        };
+        restarted
+            .poll_once()
+            .await
+            .expect("restart should preserve the existing queue");
+        assert!(empty_file.exists());
+        assert!(pending_file.exists());
+        tokio::fs::remove_dir_all(root).await.expect("remove test queue");
     }
 
     #[test]

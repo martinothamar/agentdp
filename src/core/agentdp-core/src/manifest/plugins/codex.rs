@@ -16,11 +16,19 @@ const CODEX_AUTH_DEFAULT_HOME_PATH: &str = ".codex/auth.json";
 pub struct Codex {
     #[serde(default)]
     pub yolo: bool,
+    #[serde(default = "default_version")]
+    pub version: String,
+    #[serde(default)]
+    pub session: CodexSession,
     pub auth: AuthMode,
     pub auth_source: Option<CodexAuthSource>,
 }
 
 impl Codex {
+    pub(super) fn validate(&self, errors: &mut Vec<String>) {
+        super::super::validate_non_empty("plugins.codex.version", &self.version, errors);
+    }
+
     pub(super) fn host_input_requirements(&self, requirements: &mut HostInputRequirements) {
         match self.auth {
             AuthMode::Mediated => match self.auth_source.unwrap_or_default() {
@@ -49,6 +57,18 @@ impl Codex {
             }
         }
     }
+}
+
+fn default_version() -> String {
+    "latest".to_owned()
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSession {
+    #[default]
+    Guestd,
+    None,
 }
 
 static CODEX_AUTH_TRANSFORM: MediatedJsonAuthTransform = MediatedJsonAuthTransform {

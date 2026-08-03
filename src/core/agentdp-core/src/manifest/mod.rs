@@ -2309,6 +2309,101 @@ spec:
     }
 
     #[test]
+    fn accepts_agent_host_as_the_only_codex_session_owner() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: agent-host
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        agent_host:
+          guest: 18765
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      codex:
+        version: 0.146.0
+        session: none
+        auth: mediated
+      agent_host: {}
+    secrets: []
+",
+        )
+        .unwrap();
+
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_agent_host_artifact_configuration() {
+        let error = serde_yaml::from_str::<super::plugins::agent_host::AgentHost>(
+            "url: https://example.test/agent-host.tar.gz\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field `url`"));
+    }
+
+    #[test]
+    fn rejects_two_codex_session_owners() {
+        let manifest = serde_yaml::from_str::<AgentManifest>(
+            r"
+apiVersion: agentdp.dev/v1alpha1
+kind: Agent
+metadata:
+  name: agent-host
+spec:
+  phase: Running
+  replicas: 1
+  template:
+    image:
+      os: archlinux
+    user:
+      name: agent
+    resources:
+      cpus: 1
+      memory: 1G
+      storage: 10G
+    network:
+      mode: mediated
+      ports:
+        agent_host:
+          guest: 18765
+          protocol: tcp
+    bootstrap: {}
+    plugins:
+      codex:
+        auth: mediated
+      agent_host: {}
+    secrets: []
+",
+        )
+        .unwrap();
+
+        let errors = manifest.validate().unwrap_err();
+
+        assert!(errors.messages().iter().any(|message| {
+            message
+                == "spec.plugins.agent_host requires plugins.codex.session to be `none` so only Agent Host owns Codex sessions"
+        }));
+    }
+
+    #[test]
     fn top_level_secrets_declare_host_input_secret_destinations() {
         let manifest = serde_yaml::from_str::<AgentManifest>(
             r"
