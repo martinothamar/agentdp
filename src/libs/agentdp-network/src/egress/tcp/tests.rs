@@ -26,7 +26,7 @@ use crate::network::{
     ApplicationPolicy, BlockReason, EgressDecision, NetworkLimits, TcpEgressPolicy, TcpEgressRoute, TcpProxyId,
     TlsEgressPolicy,
 };
-use crate::policy::Authority;
+use crate::policy::{Authority, EgressPolicy};
 use crate::reactor::{ReactorBackend, ReactorInterest, ReactorReady, default_backend};
 use crate::reactor::{ReactorItemId, ReactorTcpListener, ReactorTcpStream, ReactorUdpSocket, ReactorWake};
 use crate::runtime::{NetworkRuntime, RuntimeContext};
@@ -841,7 +841,7 @@ async fn tls_intercept_not_queued_after_upstream_write_finished() -> Result<(), 
     let upstream = listener.local_addr()?;
     let buffers = test_buffers();
     let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
-    let policy = tls_policy(raw_decision());
+    let policy = tls_policy();
     let mut server_tls = TlsUpstream::connect(
         TcpProxyId(54),
         upstream,
@@ -887,7 +887,7 @@ async fn tls_guest_close_notify_keeps_upstream_finish_continuation() -> Result<(
     let upstream = listener.local_addr()?;
     let buffers = test_buffers();
     let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
-    let policy = tls_policy(raw_decision());
+    let policy = tls_policy();
     let server_tls = TlsUpstream::connect(
         TcpProxyId(56),
         upstream,
@@ -934,7 +934,7 @@ async fn tls_guest_output_local_work_requires_guest_send_capacity() -> Result<()
     let upstream = listener.local_addr()?;
     let buffers = test_buffers();
     let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
-    let policy = tls_policy(raw_decision());
+    let policy = tls_policy();
     let server_tls = TlsUpstream::connect(
         TcpProxyId(57),
         upstream,
@@ -984,7 +984,7 @@ async fn tls_connecting_server_has_no_write_work_after_handshake_flush_blocks_on
     });
     let buffers = test_buffers();
     let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
-    let policy = tls_policy(raw_decision());
+    let policy = tls_policy();
     let proxy_id = TcpProxyId(55);
     let server_tls = TlsUpstream::connect(proxy_id, upstream, "allowed.test", &policy.client_config, &mut runtime)?;
     let mut server_pending = WriteQueue::new();
@@ -1079,7 +1079,7 @@ async fn tls_connecting_server_pending_guest_bytes_wait_for_upstream_handshake()
     });
     let buffers = test_buffers();
     let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
-    let policy = tls_policy(raw_decision());
+    let policy = tls_policy();
     let server_tls = TlsUpstream::connect(
         TcpProxyId(58),
         upstream,
@@ -1471,28 +1471,22 @@ fn tls_guest_plaintext_and_close_notify_finishes_guest_write() {
 #[test]
 fn tls_route_respects_bypass_drop_and_intercept_decisions() -> Result<(), Box<dyn std::error::Error>> {
     let authority = Authority::new("allowed.test");
-    let mut policy = tls_policy(EgressDecision {
-        application: ApplicationPolicy::Raw,
-    });
+    let mut policy = tls_policy();
 
-    assert!(matches!(tls_route(&policy, "unknown.test"), Ok(TlsRoute::Bypass)));
+    assert!(tls_route(&policy, "unknown.test").is_err());
 
-    policy.fallback = EgressDecision {
-        application: ApplicationPolicy::Block {
-            reason: BlockReason::AuthorityNotAllowed,
-        },
-    };
+    policy.egress = EgressPolicy::allow_all().with_allowed_authority("allowed.test");
     assert!(matches!(
         tls_route(&policy, "unknown.test"),
         Ok(TlsRoute::Drop(BlockReason::AuthorityNotAllowed))
     ));
 
+    policy.egress = EgressPolicy::allow_all();
     policy.bypass_hosts = vec!["*.internal.test".to_owned()];
     policy.decisions.push((
         Authority::new("api.internal.test"),
         EgressDecision {
             application: ApplicationPolicy::Http1 {
-                authority: Authority::new("api.internal.test"),
                 secrets: RuntimeSecrets::new(),
             },
         },
@@ -1505,7 +1499,6 @@ fn tls_route_respects_bypass_drop_and_intercept_decisions() -> Result<(), Box<dy
         authority.clone(),
         EgressDecision {
             application: ApplicationPolicy::Http1 {
-                authority: authority.clone(),
                 secrets: RuntimeSecrets::new(),
             },
         },
@@ -1561,7 +1554,6 @@ fn plain_policy_processing_handles_raw_block_and_plain_http1() {
 
     let http1 = plain_policy(
         ApplicationPolicy::Http1 {
-            authority: Authority::new("allowed.test"),
             secrets: RuntimeSecrets::new(),
         },
         false,
@@ -1688,7 +1680,7 @@ fn relay_preserves_progress_blocked_when_existing_server_output_exhausts_pool() 
 async fn tls_client_hello_buffer_pressure_blocks_without_error() {
     let cold_buffers = BufferPool::default();
     let source_buffers = test_buffers();
-    let mut proxy_id = TlsTcpProxy::new(TcpProxyId(47), test_dst(), tls_policy(raw_decision()));
+    let mut proxy_id = TlsTcpProxy::new(TcpProxyId(47), test_dst(), tls_policy());
     let hello = client_hello_bytes("allowed.test");
     proxy_id.write(io_buf(&source_buffers, &hello[..7]));
     let mut runtime = runtime_context(
@@ -1712,7 +1704,7 @@ async fn tls_client_hello_buffer_pressure_blocks_without_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn tls_flow_close_before_client_hello_reports_closed() {
     let buffers = test_buffers();
-    let mut proxy_id = TlsTcpProxy::new(TcpProxyId(45), test_dst(), tls_policy(raw_decision()));
+    let mut proxy_id = TlsTcpProxy::new(TcpProxyId(45), test_dst(), tls_policy());
     proxy_id.close();
     let mut runtime = runtime_context(
         default_backend(NetworkLimits::default().reactor_event_capacity).expect("reactor should initialize"),
@@ -1733,7 +1725,7 @@ async fn tls_flow_close_before_client_hello_reports_closed() {
 #[tokio::test(flavor = "current_thread")]
 async fn tls_client_hello_waits_for_complete_sni() {
     let buffers = test_buffers();
-    let mut proxy_id = TlsTcpProxy::new(TcpProxyId(46), test_dst(), tls_policy(raw_decision()));
+    let mut proxy_id = TlsTcpProxy::new(TcpProxyId(46), test_dst(), tls_policy());
     let hello = client_hello_bytes("allowed.test");
     proxy_id.write(io_buf(&buffers, &hello[..7]));
     let mut runtime = runtime_context(
@@ -1762,11 +1754,13 @@ async fn tls_client_hello_state_extracts_fragmented_sni() {
     let mut runtime = runtime_context(
         default_backend(NetworkLimits::default().reactor_event_capacity).expect("reactor should initialize"),
     );
+    let mut policy = tls_policy();
+    policy.bypass_hosts.push("allowed.test".to_owned());
     let mut proxy_id = TcpProxy::connecting(
         TcpProxyId(44),
         dst,
         dst,
-        TcpEgressRoute::Tls(tls_policy(raw_decision())),
+        TcpEgressRoute::Tls(policy),
         &buffers,
         &mut runtime,
     )
@@ -1816,7 +1810,7 @@ async fn tls_client_hello_state_rejects_non_tls_input() {
         TcpProxyId(44),
         dst,
         dst,
-        TcpEgressRoute::Tls(tls_policy(raw_decision())),
+        TcpEgressRoute::Tls(tls_policy()),
         &buffers,
         &mut runtime,
     )
@@ -1844,13 +1838,12 @@ async fn tls_guest_handshake_setup_buffer_pressure_waits_without_progress() -> R
     });
     buffers.prewarm_instance_network();
 
-    let mut policy = tls_policy(raw_decision());
+    let mut policy = tls_policy();
     let authority = Authority::new("allowed.test");
     policy.decisions.push((
         authority.clone(),
         EgressDecision {
             application: ApplicationPolicy::Http1 {
-                authority: authority.clone(),
                 secrets: RuntimeSecrets::new(),
             },
         },
@@ -1897,7 +1890,7 @@ async fn tls_server_connect_failure_reports_error() -> Result<(), Box<dyn std::e
     let dst = listener.local_addr()?;
     drop(listener);
 
-    let policy = tls_policy(raw_decision());
+    let policy = tls_policy();
     let mut runtime = runtime_context(default_backend(NetworkLimits::default().reactor_event_capacity)?);
     let mut upstream = TlsUpstream::connect(TcpProxyId(47), dst, "allowed.test", &policy.client_config, &mut runtime)?;
     let mut readiness = Vec::new();
@@ -2048,25 +2041,24 @@ fn tcp_push_event_preserves_materialized_event_and_reports_exhaustion() {
     assert!(events.is_empty());
 }
 
-fn tls_policy(fallback: EgressDecision) -> TlsEgressPolicy {
+fn tls_policy() -> TlsEgressPolicy {
+    let ca = CertificateAuthorityPem::generate().expect("test certificate authority");
     TlsEgressPolicy {
         dst: test_dst(),
         client_config: TlsClientConfig::with_platform_roots(&[]).expect("empty root set should build"),
+        certificate_authority: std::sync::Arc::new(
+            CertificateAuthority::load(&ca.cert_pem, &ca.key_pem).expect("load test certificate authority"),
+        ),
+        egress: EgressPolicy::allow_all(),
+        secrets: RuntimeSecrets::new(),
         bypass_hosts: Vec::new(),
         server_configs: Vec::new(),
         decisions: Vec::new(),
-        fallback,
     }
 }
 
 fn test_dst() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)
-}
-
-fn raw_decision() -> EgressDecision {
-    EgressDecision {
-        application: ApplicationPolicy::Raw,
-    }
 }
 
 fn plain_policy(application: ApplicationPolicy, reject_secret_placeholders: bool) -> TcpEgressPolicy {

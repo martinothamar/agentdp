@@ -1,10 +1,11 @@
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use agentdp_crypto::{CertificateAuthority, CertificateValidity, TlsClientConfig, TlsServerConfig};
 
 use crate::clock::NetworkClock;
-use crate::network::{ApplicationPolicy, BlockReason, EgressDecision, TlsEgressPolicy};
+use crate::network::{ApplicationPolicy, EgressDecision, TlsEgressPolicy};
 use crate::policy::{Authority, NetworkPolicy};
 
 const CERT_VALIDITY: Duration = Duration::from_hours(24);
@@ -37,7 +38,7 @@ pub(crate) struct TlsIntercept {
 }
 
 struct TlsInterceptState {
-    ca: CertificateAuthority,
+    ca: Arc<CertificateAuthority>,
     client_config: TlsClientConfig,
     bypass_hosts: Vec<String>,
     certs: Vec<(Authority, CachedServerCert)>,
@@ -82,7 +83,6 @@ impl TlsIntercept {
                 EgressDecision {
                     application: ApplicationPolicy::Http1 {
                         secrets: policy.secrets.clone(),
-                        authority,
                     },
                 },
             );
@@ -90,10 +90,12 @@ impl TlsIntercept {
         Ok(TlsEgressPolicy {
             dst,
             client_config: state.client_config.clone(),
+            certificate_authority: Arc::clone(&state.ca),
+            egress: policy.egress.clone(),
+            secrets: policy.secrets.clone(),
             bypass_hosts: state.bypass_hosts.clone(),
             server_configs,
             decisions,
-            fallback: tls_fallback_decision(policy),
         })
     }
 
@@ -109,7 +111,7 @@ impl TlsIntercept {
 
 impl TlsInterceptState {
     fn new(config: &TlsInterceptConfig) -> io::Result<Self> {
-        let ca = CertificateAuthority::load(&config.ca_cert_pem, &config.ca_key_pem)?;
+        let ca = Arc::new(CertificateAuthority::load(&config.ca_cert_pem, &config.ca_key_pem)?);
         let client_config = TlsClientConfig::with_platform_roots(&config.upstream_root_ca_pems)?;
         Ok(Self {
             ca,
@@ -141,23 +143,23 @@ impl TlsInterceptState {
     }
 }
 
+impl TlsEgressPolicy {
+    pub(crate) fn server_config_for_sni(&self, authority: &Authority) -> io::Result<TlsServerConfig> {
+        if let Some(config) = self.server_config_for(authority) {
+            return Ok(config.clone());
+        }
+        // DNS attribution prewarms certificates, but SNI remains sufficient when
+        // the guest retained DNS state across a mediator restart.
+        generate_server_cert(authority.as_str(), &self.certificate_authority).map(|cert| cert.server_config)
+    }
+}
+
 fn upsert_authority_value<T>(entries: &mut Vec<(Authority, T)>, authority: Authority, value: T) {
     if let Some((_authority, existing)) = entries.iter_mut().find(|(candidate, _value)| candidate == &authority) {
         *existing = value;
         return;
     }
     entries.push((authority, value));
-}
-
-fn tls_fallback_decision(policy: &NetworkPolicy) -> EgressDecision {
-    let application = if policy.egress.restricts_authorities() {
-        ApplicationPolicy::Block {
-            reason: BlockReason::AuthorityNotAllowed,
-        }
-    } else {
-        ApplicationPolicy::Raw
-    };
-    EgressDecision { application }
 }
 
 fn generate_server_cert(host: &str, ca: &CertificateAuthority) -> io::Result<CachedServerCert> {
@@ -178,7 +180,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use crate::clock::SystemClock;
-    use crate::network::{ApplicationPolicy, BlockReason};
     use crate::policy::{Authority, EgressPolicy, NetworkPolicy};
     use agentdp_crypto::CertificateAuthorityPem;
 
@@ -195,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_egress_policy_builds_configs_for_allowed_authorities_and_blocks_fallback()
+    fn tls_egress_policy_builds_configs_for_allowed_authorities_and_preserves_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let ca = CertificateAuthorityPem::generate()?;
         let mut intercept = TlsIntercept::new(config(&ca.cert_pem, &ca.key_pem));
@@ -212,12 +213,8 @@ mod tests {
         assert!(egress.server_config_for(&Authority::new("allowed.test")).is_some());
         assert!(egress.decision_for(&Authority::new("allowed.test")).is_some());
         assert_eq!(egress.bypass_hosts, vec!["bypass.test"]);
-        assert!(matches!(
-            egress.fallback.application,
-            ApplicationPolicy::Block {
-                reason: BlockReason::AuthorityNotAllowed
-            }
-        ));
+        assert!(egress.egress.restricts_authorities());
+        assert!(!egress.egress.allows_authority(&Authority::new("blocked.test")));
         Ok(())
     }
 
@@ -244,7 +241,7 @@ mod tests {
         assert!(first.server_config_for(&authority).is_some());
         assert!(second.server_config_for(&authority).is_some());
         assert_eq!(intercept.state.as_ref().map(|state| state.certs.len()), Some(1));
-        assert!(matches!(second.fallback.application, ApplicationPolicy::Raw));
+        assert!(second.server_config_for_sni(&Authority::new("unknown.test")).is_ok());
         Ok(())
     }
 

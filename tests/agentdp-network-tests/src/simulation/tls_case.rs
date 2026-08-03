@@ -104,6 +104,7 @@ pub(super) struct HttpsHttp1Case {
     post_connect_link_actions: Vec<LinkAction>,
     post_tls_link_actions: Vec<LinkAction>,
     link_trace: Vec<LinkTraceContains>,
+    attribute_dns: bool,
 }
 
 impl HttpsHttp1Case {
@@ -130,6 +131,7 @@ impl HttpsHttp1Case {
             post_connect_link_actions: Vec::new(),
             post_tls_link_actions: Vec::new(),
             link_trace: Vec::new(),
+            attribute_dns: true,
         }
     }
 
@@ -145,6 +147,11 @@ impl HttpsHttp1Case {
 
     pub(super) const fn untrusted_upstream(mut self) -> Self {
         self.trust_upstream = false;
+        self
+    }
+
+    pub(super) const fn without_dns_attribution(mut self) -> Self {
+        self.attribute_dns = false;
         self
     }
 
@@ -295,7 +302,9 @@ impl HttpsHttp1Case {
             },
             guest_link.clone(),
         )?;
-        attribute_named_host_to_upstream(&mut sim, &mut running, &guest_link, self.authority.as_str())?;
+        if self.attribute_dns {
+            attribute_named_host_to_upstream(&mut sim, &mut running, &guest_link, self.authority.as_str())?;
+        }
 
         let mut guest = SmolTcpGuest::new(guest_link.clone())?;
         let tcp = guest.connect(&mut running, upstream_addr())?;

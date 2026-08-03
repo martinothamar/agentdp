@@ -1352,25 +1352,27 @@ struct CompletedGuestTlsHandshake {
 }
 
 pub(super) fn tls_route(policy: &TlsEgressPolicy, host: &str) -> Result<TlsRoute, InterceptedTls> {
-    let host = Authority::new(host);
-    let decision = policy.decision_for(&host).unwrap_or(&policy.fallback);
-    match &decision.application {
-        ApplicationPolicy::Raw => Ok(TlsRoute::Bypass),
-        ApplicationPolicy::Block { reason } => Ok(TlsRoute::Drop(*reason)),
-        ApplicationPolicy::Http1 { authority, .. } if should_bypass_tls(&policy.bypass_hosts, authority.as_str()) => {
-            Ok(TlsRoute::Bypass)
+    let authority = Authority::new(host);
+    let secrets = match policy.decision_for(&authority).map(|decision| &decision.application) {
+        Some(ApplicationPolicy::Raw) => return Ok(TlsRoute::Bypass),
+        Some(ApplicationPolicy::Block { reason }) => return Ok(TlsRoute::Drop(*reason)),
+        Some(ApplicationPolicy::Http1 { secrets, .. }) => secrets,
+        None if policy.egress.restricts_authorities() && !policy.egress.allows_authority(&authority) => {
+            return Ok(TlsRoute::Drop(BlockReason::AuthorityNotAllowed));
         }
-        ApplicationPolicy::Http1 { authority, secrets } => {
-            let Some(server_config) = policy.server_config_for(authority) else {
-                return Ok(TlsRoute::Drop(BlockReason::TlsInterceptUnavailable));
-            };
-            Err(InterceptedTls {
-                authority: authority.clone(),
-                secrets: secrets.clone(),
-                server_config: server_config.clone(),
-            })
-        }
+        None => &policy.secrets,
+    };
+    if should_bypass_tls(&policy.bypass_hosts, authority.as_str()) {
+        return Ok(TlsRoute::Bypass);
     }
+    let Ok(server_config) = policy.server_config_for_sni(&authority) else {
+        return Ok(TlsRoute::Drop(BlockReason::TlsInterceptUnavailable));
+    };
+    Err(InterceptedTls {
+        authority,
+        secrets: secrets.clone(),
+        server_config,
+    })
 }
 
 pub(super) fn should_bypass_tls(patterns: &[String], host: &str) -> bool {

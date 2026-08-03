@@ -3,7 +3,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use agentdp_crypto::{TlsClientConfig, TlsServerConfig};
+use agentdp_crypto::{CertificateAuthority, TlsClientConfig, TlsServerConfig};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
@@ -722,10 +722,12 @@ pub(crate) struct TcpEgressPolicy {
 pub(crate) struct TlsEgressPolicy {
     pub(crate) dst: SocketAddr,
     pub(crate) client_config: TlsClientConfig,
+    pub(crate) certificate_authority: std::sync::Arc<CertificateAuthority>,
+    pub(crate) egress: EgressPolicy,
+    pub(crate) secrets: RuntimeSecrets,
     pub(crate) bypass_hosts: Vec<String>,
     pub(crate) server_configs: Vec<(Authority, TlsServerConfig)>,
     pub(crate) decisions: Vec<(Authority, EgressDecision)>,
-    pub(crate) fallback: EgressDecision,
 }
 
 impl TlsEgressPolicy {
@@ -750,6 +752,7 @@ impl std::fmt::Debug for TlsEgressPolicy {
         formatter
             .debug_struct("TlsEgressPolicy")
             .field("dst", &self.dst)
+            .field("egress", &self.egress)
             .field("bypass_hosts", &self.bypass_hosts)
             .field(
                 "server_configs",
@@ -760,7 +763,6 @@ impl std::fmt::Debug for TlsEgressPolicy {
                     .collect::<Vec<_>>(),
             )
             .field("decisions", &self.decisions)
-            .field("fallback", &self.fallback)
             .finish_non_exhaustive()
     }
 }
@@ -773,13 +775,8 @@ pub(crate) struct EgressDecision {
 #[derive(Debug, Clone)]
 pub(crate) enum ApplicationPolicy {
     Raw,
-    Http1 {
-        authority: Authority,
-        secrets: RuntimeSecrets,
-    },
-    Block {
-        reason: BlockReason,
-    },
+    Http1 { secrets: RuntimeSecrets },
+    Block { reason: BlockReason },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

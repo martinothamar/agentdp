@@ -39,6 +39,27 @@ fn simulated_guest_https_http1_substitutes_authorized_secret_header() -> Result<
         .run::<AgentdpNetworkSim>()
 }
 
+/// Verifies that TLS SNI is sufficient for interception after a mediator restart clears DNS attribution.
+///
+/// # Errors
+///
+/// Returns an error when the request is not intercepted or its authorized secret is not substituted.
+#[test]
+fn simulated_guest_https_http1_substitutes_secret_without_dns_attribution() -> Result<()> {
+    https_http1_case(
+        "guest_https_http1_substitutes_secret_without_dns_attribution",
+        0x202,
+    )
+    .authority(HOST)
+    .without_dns_attribution()
+    .secret(PLACEHOLDER, SECRET_VALUE, [HOST])
+    .upstream_response(b"agentdp-simulated-https\n")
+    .request(format!(
+        "GET /cached-address HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {PLACEHOLDER}\r\nConnection: close\r\n\r\n"
+    ))
+    .run::<AgentdpNetworkSim>()
+}
+
 /// Verifies that a parsed `ClientHello` is retried after another TLS flow releases local buffer capacity.
 ///
 /// # Errors

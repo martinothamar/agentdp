@@ -586,7 +586,7 @@ pub(super) async fn reconcile_runtime_secrets(
 ) -> Result<backend::ReconcileRuntimeSecretsOutput, Error> {
     if should_clear_runtime_secrets(input.manifest.value(), state) {
         let secrets = SecretBindings::default();
-        update_running_instance_network_secrets(&input, state, &secrets)?;
+        reconcile_running_instance_network_secrets(&input, state, &secrets).await?;
         state.mediated_secrets = secrets;
         return Ok(backend::ReconcileRuntimeSecretsOutput::default());
     }
@@ -598,7 +598,7 @@ pub(super) async fn reconcile_runtime_secrets(
     )
     .await?;
 
-    update_running_instance_network_secrets(&input, state, &collected.live)?;
+    reconcile_running_instance_network_secrets(&input, state, &collected.live).await?;
     state.mediated_secrets = collected.stored_secrets;
     Ok(backend::ReconcileRuntimeSecretsOutput {
         secret_files: collected.files,
@@ -680,11 +680,24 @@ pub(super) async fn reconcile_host_inputs(
     })
 }
 
-fn update_running_instance_network_secrets(
+async fn reconcile_running_instance_network_secrets(
     input: &RuntimeInput<'_>,
     state: &State,
     secrets: &SecretBindings,
 ) -> Result<(), Error> {
+    if ensure_instance_network_attached(
+        input.context,
+        input.instance_network,
+        input.agent,
+        input.instance,
+        input.network,
+        state,
+        secrets.clone(),
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let updated = update_instance_network_secrets(input.instance_network, input.agent, input.instance, secrets)?;
     if state.instance_network.is_some() && !updated {
         return Err(ErrorKind::InstanceNetworkNotRunning {

@@ -251,7 +251,7 @@ async fn unconfigured_runtime_secrets_are_cleared_before_runtime_host_input_coll
 }
 
 #[tokio::test(flavor = "local")]
-async fn runtime_secret_refresh_fails_when_mediated_network_is_not_running() {
+async fn runtime_secret_refresh_attaches_mediated_network_when_not_running() {
     let network_runtime = test_instance_network();
     let qemu_dir = test_runtime_dir();
     let mut state = test_state(&qemu_dir, test_network_in_dir(&qemu_dir));
@@ -274,7 +274,7 @@ async fn runtime_secret_refresh_fails_when_mediated_network_is_not_running() {
     let context = Context::quiet();
     let manifest = test_loaded_manifest().await;
 
-    let error = super::reconcile_runtime_secrets(
+    let output = super::reconcile_runtime_secrets(
         super::RuntimeInput {
             context: &context,
             instance_network: &network_runtime,
@@ -287,9 +287,15 @@ async fn runtime_secret_refresh_fails_when_mediated_network_is_not_running() {
         &mut state,
     )
     .await
-    .expect_err("missing mediated network must be retried");
+    .expect("runtime secret refresh should attach the mediated network");
 
-    assert!(error.to_string().contains("network is not running"));
+    assert!(output.secret_files.is_empty());
+    assert!(state.mediated_secrets.is_empty());
+    assert!(network_runtime.is_running());
+    let (agent, instance) = test_instance_names();
+    cleanup_runtime_files(&network_runtime, &agent, &instance, &state)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "local")]

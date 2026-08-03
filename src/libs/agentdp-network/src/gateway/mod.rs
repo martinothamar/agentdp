@@ -439,10 +439,18 @@ impl<C: NetworkClock> Gateway<C> {
         if syn.dst.ip() == IpAddr::V4(self.config.gateway) && syn.dst.port() == 53 {
             return true;
         }
+        // Intercepted TLS can enforce the authority after the handshake exposes SNI,
+        // including when a guest reused a DNS result from before a mediator restart.
+        let tls_can_authorize_sni = self
+            .config
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.intercepts_port(syn.dst.port()));
         self.config.policy.egress.check_destination(syn.dst.ip()).is_ok()
-            && self
-                .dns
-                .has_allowed_authority_for_ip(syn.dst.ip(), &self.config.policy.egress, &self.clock)
+            && (tls_can_authorize_sni
+                || self
+                    .dns
+                    .has_allowed_authority_for_ip(syn.dst.ip(), &self.config.policy.egress, &self.clock))
     }
 }
 
