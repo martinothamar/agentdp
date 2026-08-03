@@ -3,6 +3,8 @@ use std::rc::Rc;
 
 use crate::network::NetworkLimits;
 
+const GATEWAY_FRAME_RESERVE: usize = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("{kind:?} buffer pool exhausted for requested capacity {capacity}")]
 pub(crate) struct PoolExhausted {
@@ -43,11 +45,18 @@ impl BufferPool {
     }
 
     pub(crate) fn try_frame(&self) -> Result<FrameBuf, PoolExhausted> {
-        self.frames.try_take(self.limits.frame_buffer_capacity)
+        self.frames.try_take(self.limits.frame_buffer_capacity, 0)
+    }
+
+    /// Keeps one frame available for smoltcp's receive-side transmit token so
+    /// a guest input batch cannot prevent the gateway from consuming that batch.
+    pub(crate) fn try_guest_frame(&self) -> Result<FrameBuf, PoolExhausted> {
+        self.frames
+            .try_take(self.limits.frame_buffer_capacity, GATEWAY_FRAME_RESERVE)
     }
 
     pub(crate) fn try_frame_with_capacity(&self, capacity: usize) -> Result<FrameBuf, PoolExhausted> {
-        self.frames.try_take(capacity)
+        self.frames.try_take(capacity, 0)
     }
 
     pub(crate) fn try_byte_with_capacity(&self, capacity: usize) -> Result<ByteBuf, PoolExhausted> {
@@ -128,7 +137,7 @@ impl FramePool {
         }
     }
 
-    fn try_take(&self, capacity: usize) -> Result<FrameBuf, PoolExhausted> {
+    fn try_take(&self, capacity: usize, reserve: usize) -> Result<FrameBuf, PoolExhausted> {
         #[cfg(any(test, feature = "simulation"))]
         let checked_out = self.checked_out.get();
         let capacity = capacity.max(self.limits.frame_buffer_capacity);
@@ -138,19 +147,25 @@ impl FramePool {
                 capacity,
             });
         }
-        let Some(bytes) = self.inner.borrow_mut().pop() else {
-            return Err(PoolExhausted {
-                kind: PoolKind::Frame,
-                capacity,
-            });
-        };
-        if bytes.capacity() < capacity {
-            self.inner.borrow_mut().push(bytes);
+        let mut frames = self.inner.borrow_mut();
+        if frames.len() <= reserve {
             return Err(PoolExhausted {
                 kind: PoolKind::Frame,
                 capacity,
             });
         }
+        let bytes = frames.pop().ok_or(PoolExhausted {
+            kind: PoolKind::Frame,
+            capacity,
+        })?;
+        if bytes.capacity() < capacity {
+            frames.push(bytes);
+            return Err(PoolExhausted {
+                kind: PoolKind::Frame,
+                capacity,
+            });
+        }
+        drop(frames);
         #[cfg(any(test, feature = "simulation"))]
         self.checked_out.set(checked_out.saturating_add(1));
         Ok(FrameBuf {

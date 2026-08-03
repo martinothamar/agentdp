@@ -1019,7 +1019,7 @@ impl<'a> DriveTurn<'a> {
         {
             return Ok(DriveGuestFrameRead::Blocked);
         }
-        let Ok(mut frame) = buffers.try_frame() else {
+        let Ok(mut frame) = buffers.try_guest_frame() else {
             self.wait_for_local_buffer_capacity_with_continuation();
             return Ok(DriveGuestFrameRead::Blocked);
         };

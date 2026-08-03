@@ -295,6 +295,47 @@ fn simulated_saturated_guest_reads_do_not_starve_gateway_replies() -> Result<()>
     Ok(())
 }
 
+/// Verifies a full guest-read batch cannot consume the buffers needed to process that batch.
+///
+/// # Errors
+///
+/// Returns an error when guest input exhausts the shared frame pool and prevents gateway replies.
+#[test]
+fn simulated_guest_read_batch_preserves_gateway_output_capacity() -> Result<()> {
+    let mut sim = Simulator::new(Seed::new(0x10a));
+    let guest_link = sim.guest_link()?;
+    let mut network = allow_all_network_config();
+    network.limits.frame_buffer_pool_capacity = 2;
+    let mut running = AgentdpNetworkSim::start(
+        ScenarioNetworkConfig {
+            seed: sim.seed(),
+            network,
+            upstreams: SimulationUpstreams::default(),
+        },
+        guest_link.clone(),
+    )?;
+    let guest = RawFrameGuest::new(guest_link);
+
+    guest.send_frame(arp_request())?;
+    guest.send_frame(arp_request())?;
+
+    let reply = guest.recv_frame(
+        &mut sim,
+        &mut running,
+        "ARP reply after a full guest-read batch",
+        DriveBudget {
+            max_steps: 4,
+            step_time: Duration::ZERO,
+        },
+    )?;
+    verify_arp_reply(&reply)?;
+
+    let _stop = running
+        .stop()
+        .map_err(|error| super::Error::new(format!("stop simulated network: {error}")))?;
+    Ok(())
+}
+
 /// Verifies scheduler capacity rejects excess queued guest frames without corrupting the accepted frame.
 ///
 /// # Errors

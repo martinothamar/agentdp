@@ -207,6 +207,11 @@ impl NetworkLimits {
     }
 
     pub(crate) fn validate_for_event_loop(&self) -> Result<(), String> {
+        if self.frame_buffer_pool_capacity < 2 {
+            return Err(
+                "frame_buffer_pool_capacity must be at least two so guest input preserves gateway capacity".to_owned(),
+            );
+        }
         if self.drive_event_budget == 0 {
             return Err("drive_event_budget must be greater than zero".to_owned());
         }
@@ -999,6 +1004,20 @@ mod tests {
             .expect_err("zero byte budget must be rejected");
 
         assert!(error.contains("drive_byte_budget"));
+    }
+
+    #[test]
+    fn network_limits_require_separate_guest_and_gateway_frame_capacity() {
+        let limits = NetworkLimits {
+            frame_buffer_pool_capacity: 1,
+            ..NetworkLimits::default()
+        };
+
+        let error = limits
+            .validate_for_event_loop()
+            .expect_err("one frame cannot serve guest input and gateway output");
+
+        assert!(error.contains("frame_buffer_pool_capacity"));
     }
 
     #[tokio::test(flavor = "current_thread")]
