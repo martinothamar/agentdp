@@ -71,7 +71,7 @@ async fn run_control_command(command: Command) -> Result<()> {
         Command::Ping => Request::Ping,
         Command::Pr { command } => match command {
             PrCommand::Register { target } => Request::PrRegister { target, cwd },
-            PrCommand::Unregister { target } => Request::PrUnregister { target },
+            PrCommand::Unregister { target } => Request::PrUnregister { target, cwd },
             PrCommand::List => Request::PrList,
         },
         Command::DockerCli(_) | Command::PodmanCli(_) => {

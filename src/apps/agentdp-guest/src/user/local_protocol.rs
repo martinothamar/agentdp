@@ -9,7 +9,7 @@ use crate::{Error, Result};
 pub(crate) enum Request {
     Ping,
     PrRegister { target: Option<String>, cwd: String },
-    PrUnregister { target: Option<String> },
+    PrUnregister { target: Option<String>, cwd: String },
     PrList,
 }
 
@@ -95,4 +95,37 @@ pub(crate) async fn write_response(stream: &mut AsyncLocalSocket, response: &Res
     let mut frame = Vec::new();
     jsonl::encode_into(response, &mut frame)?;
     stream.write_all(&frame).await.map_err(Error::WriteResponse)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::Request;
+
+    #[test]
+    fn pr_requests_include_the_callers_working_directory() {
+        let cwd = "/data/home/code/altinn-studio".to_owned();
+
+        assert_eq!(
+            serde_json::to_value(Request::PrRegister {
+                target: Some("19634".to_owned()),
+                cwd: cwd.clone(),
+            })
+            .expect("serialize register request"),
+            json!({
+                "command": "pr_register",
+                "target": "19634",
+                "cwd": "/data/home/code/altinn-studio",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Request::PrUnregister { target: None, cwd }).expect("serialize unregister request"),
+            json!({
+                "command": "pr_unregister",
+                "target": null,
+                "cwd": "/data/home/code/altinn-studio",
+            })
+        );
+    }
 }

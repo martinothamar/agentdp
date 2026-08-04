@@ -86,7 +86,7 @@ impl GithubPrService {
         let pr_target = target
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| branch.trim());
-        let view = pr_view(pr_target).await?;
+        let view = pr_view(pr_target, Some(cwd)).await?;
         let entry = PrEntry {
             number: json_u64(&view, "number").unwrap_or_default(),
             url: required_json_string(&view, "url")?,
@@ -102,12 +102,12 @@ impl GithubPrService {
         Ok(entry)
     }
 
-    pub(crate) async fn unregister(&self, target: Option<&str>) -> Result<String> {
+    pub(crate) async fn unregister(&self, target: Option<&str>, cwd: &Path) -> Result<String> {
         let remove_target = if let Some(target) = target.filter(|value| !value.is_empty()) {
             target.to_owned()
         } else {
-            let branch = run_capture("git", &["branch", "--show-current"], None).await?;
-            required_json_string(&pr_view(branch.trim()).await?, "url")?
+            let branch = run_capture("git", &["branch", "--show-current"], Some(cwd)).await?;
+            required_json_string(&pr_view(branch.trim(), Some(cwd)).await?, "url")?
         };
         let mut registry = self.read_registry().await?;
         let before = registry.prs.len();
@@ -152,7 +152,7 @@ impl GithubPrService {
         if entry.url.is_empty() {
             return Ok(());
         }
-        let view = pr_view(&entry.url).await?;
+        let view = pr_view(&entry.url, None).await?;
         let events = pr_events(&view, &current_gh_login().await.unwrap_or_default());
         let mut seen = self.read_seen().await?;
         let new_events = events
@@ -170,7 +170,7 @@ impl GithubPrService {
     }
 
     async fn mark_seen_events_at_registration(&self, url: &str) -> Result<()> {
-        let view = pr_view(url).await?;
+        let view = pr_view(url, None).await?;
         let mut seen = self.read_seen().await?;
         for event in pr_events(&view, &current_gh_login().await.unwrap_or_default()) {
             seen.events.insert(event.id);
@@ -285,7 +285,7 @@ async fn json_files(path: &Path) -> Result<Vec<PathBuf>> {
     files_with_extension(path, "json").await.map_err(Error::from)
 }
 
-async fn pr_view(target: &str) -> Result<Value> {
+async fn pr_view(target: &str, cwd: Option<&Path>) -> Result<Value> {
     let stdout = run_capture(
         "gh",
         &[
@@ -295,7 +295,7 @@ async fn pr_view(target: &str) -> Result<Value> {
             "--json",
             "number,url,headRefName,baseRefName,title,state,updatedAt,mergedAt,mergedBy,reviewDecision,statusCheckRollup,reviews,comments",
         ],
-        None,
+        cwd,
     )
     .await?;
     serde_json::from_str(&stdout).map_err(Error::from)

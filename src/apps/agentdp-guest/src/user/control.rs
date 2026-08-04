@@ -37,7 +37,9 @@ impl ControlHandler {
                 let entry = self.github_pr.register(target.as_deref(), Path::new(&cwd)).await?;
                 Ok(Response::ok(entry.url))
             }
-            Request::PrUnregister { target } => Ok(Response::ok(self.github_pr.unregister(target.as_deref()).await?)),
+            Request::PrUnregister { target, cwd } => Ok(Response::ok(
+                self.github_pr.unregister(target.as_deref(), Path::new(&cwd)).await?,
+            )),
             Request::PrList => Ok(Response::with_prs(self.github_pr.list().await?)),
         }
     }
