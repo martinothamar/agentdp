@@ -29,23 +29,25 @@ use crate::backend::{
     ReconcileHostInputsOutput, ReconcileOutput, ReconcileRuntimeSecretsOutput, StartOutput, StopInstanceInput,
     StopOutput,
 };
-use crate::host::{HostSshError, execute_host_shell_command, interactive_host_shell_command};
+use crate::host::{HostCredentialService, HostSshError, execute_host_shell_command, interactive_host_shell_command};
 use crate::services::InstanceNetwork;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct QemuBackend {
     qemu_img: Option<disk::QemuImg>,
     qemu_system: Option<system::QemuSystem>,
     ssh_keygen: Option<SshKeygen>,
+    credentials: HostCredentialService,
 }
 
 impl QemuBackend {
     #[must_use]
-    pub(crate) const fn for_host() -> Self {
+    pub(crate) fn for_host() -> Self {
         Self {
             qemu_img: None,
             qemu_system: None,
             ssh_keygen: None,
+            credentials: HostCredentialService::new(),
         }
     }
 
@@ -184,7 +186,7 @@ impl Backend for QemuBackend {
         Box::pin(async move {
             let qemu_img = self.qemu_img().await.map_err(BackendError::Qemu)?;
             let ssh_keygen = self.ssh_keygen().await.map_err(BackendError::Qemu)?;
-            lifecycle::create_instance(context, input, &qemu_img, &ssh_keygen)
+            lifecycle::create_instance(context, input, &qemu_img, &ssh_keygen, &self.credentials)
                 .await
                 .map_err(BackendError::Qemu)
         })
@@ -211,6 +213,7 @@ impl Backend for QemuBackend {
                     agent: agent.as_str(),
                     instance: instance.as_str(),
                     network: &network,
+                    credentials: &self.credentials,
                 },
                 qemu_state_mut(&mut state.status.backend),
             )
@@ -289,6 +292,7 @@ impl Backend for QemuBackend {
                     instance: state.metadata.name.as_str(),
                     network: &state.status.network,
                     manifest,
+                    credentials: &self.credentials,
                 },
                 qemu_state_mut(&mut state.status.backend),
             )
@@ -314,6 +318,7 @@ impl Backend for QemuBackend {
                     instance: state.metadata.name.as_str(),
                     network: &state.status.network,
                     manifest,
+                    credentials: &self.credentials,
                 },
                 qemu_state_mut(&mut state.status.backend),
             )
@@ -347,6 +352,7 @@ impl Backend for QemuBackend {
                     instance: instance.as_str(),
                     network: &network,
                     manifest,
+                    credentials: &self.credentials,
                 },
                 qemu_state(&state.status.backend),
                 secret_files,
@@ -374,6 +380,7 @@ impl Backend for QemuBackend {
                     instance: state.metadata.name.as_str(),
                     network: &state.status.network,
                     manifest,
+                    credentials: &self.credentials,
                 },
                 qemu_state(&state.status.backend),
             )

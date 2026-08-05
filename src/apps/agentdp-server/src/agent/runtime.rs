@@ -2143,6 +2143,7 @@ impl RunningAgentState {
             match outcome.result {
                 Ok(output) => {
                     instance.documents.private.status.backend = outcome.backend;
+                    instance.documents.private.status.host_inputs.credentials = output.credentials;
                     instance.runtime_repair = RuntimeRepairState::Idle;
                     instance.secret_host_files = Some(output.secret_files);
                     instance.runtime_secrets.failure_count = 0;

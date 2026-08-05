@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agentdp_core::Context;
 use agentdp_core::agent::{
     AgentBaseKey, AgentDocument, AgentEvent, AgentInstanceBootstrapState, AgentInstanceBootstrapStepStatus,
-    AgentInstanceDocument, AgentInstanceEvent, AgentInstanceEventEnvelope, AgentInstanceEventSource,
-    AgentInstanceHostInputsPhase, AgentInstanceId, AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind,
-    AgentInstancePhase, AgentInstanceTarget, AgentStatusPhase, BackendState, BootstrapEvent, EventLevel, InstanceName,
-    NetworkAllowState, NetworkIpv6State, NetworkModeState, NetworkState, OperationResult, PortProtocolState,
-    ProcessStatus, QemuImageState, QemuInstanceNetworkState, QemuMediatedCaState, QemuState, ReconciliationState,
-    assign_port_mappings,
+    AgentInstanceCredentialPhase, AgentInstanceCredentialState, AgentInstanceDocument, AgentInstanceEvent,
+    AgentInstanceEventEnvelope, AgentInstanceEventSource, AgentInstanceHostInputsPhase, AgentInstanceId,
+    AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind, AgentInstancePhase, AgentInstanceTarget,
+    AgentStatusPhase, BackendState, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State,
+    NetworkModeState, NetworkState, OperationResult, PortProtocolState, ProcessStatus, QemuImageState,
+    QemuInstanceNetworkState, QemuMediatedCaState, QemuState, ReconciliationState, assign_port_mappings,
 };
 use agentdp_core::doctor::DoctorReport;
 use agentdp_core::manifest::plugins::codex::Codex;
@@ -248,6 +248,41 @@ async fn mediated_runtime_secrets_refresh_while_bootstrap_is_running() {
 
     release_bootstrap.try_send(());
     wait_for_ready(&mut stream, 1).await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn credential_health_from_runtime_reconcile_is_persisted() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let backend = Rc::new(FakeBackend::default());
+    backend.set_runtime_credentials(std::collections::BTreeMap::from([(
+        "codex".to_owned(),
+        AgentInstanceCredentialState {
+            phase: AgentInstanceCredentialPhase::RefreshFailed,
+            expires_at_unix_seconds: Some(4_102_444_800),
+            last_refresh_at: Some("2026-08-05T10:00:00Z".to_owned()),
+            last_error: Some("refresh unavailable".to_owned()),
+        },
+    )]));
+    let agent_backend: backend::BackendRef = backend;
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    let document = wait_for_document(&mut stream, |document| {
+        document
+            .status
+            .instances
+            .get(&AgentInstanceId::new(0))
+            .and_then(|instance| instance.host_inputs.credentials.get("codex"))
+            .is_some()
+    })
+    .await;
+    let credential = &document.status.instances[&AgentInstanceId::new(0)]
+        .host_inputs
+        .credentials["codex"];
+    assert_eq!(credential.phase, AgentInstanceCredentialPhase::RefreshFailed);
+    assert_eq!(credential.last_error.as_deref(), Some("refresh unavailable"));
 }
 
 #[tokio::test(flavor = "local")]
@@ -2644,6 +2679,7 @@ struct FakeBackend {
     runtime_secret_reconciles: RefCell<u32>,
     fail_runtime_secret_reconciles: RefCell<u32>,
     runtime_secret_files: RefCell<Vec<SeedFile>>,
+    runtime_credentials: RefCell<std::collections::BTreeMap<String, AgentInstanceCredentialState>>,
     host_input_reconciles: RefCell<u32>,
     reconciled_secret_files: RefCell<Vec<SeedFile>>,
     host_input_side_effects: RefCell<u32>,
@@ -2688,6 +2724,10 @@ impl FakeBackend {
 
     fn set_runtime_secret_files(&self, files: Vec<SeedFile>) {
         *self.runtime_secret_files.borrow_mut() = files;
+    }
+
+    fn set_runtime_credentials(&self, credentials: std::collections::BTreeMap<String, AgentInstanceCredentialState>) {
+        *self.runtime_credentials.borrow_mut() = credentials;
     }
 
     fn pause_next_instance_create(&self) -> oneshot::Sender<()> {
@@ -3117,6 +3157,7 @@ impl backend::Backend for FakeBackend {
     ) -> backend::BackendFuture<'a, backend::ReconcileRuntimeSecretsOutput> {
         *self.runtime_secret_reconciles.borrow_mut() += 1;
         let secret_files = self.runtime_secret_files.borrow().clone();
+        let credentials = self.runtime_credentials.borrow().clone();
         let pause = self.take_runtime_secret_reconcile_pause();
         let fail = self.take_runtime_secret_reconcile_failure();
         Box::pin(async move {
@@ -3126,7 +3167,10 @@ impl backend::Backend for FakeBackend {
             if fail {
                 return Err(fake_backend_error());
             }
-            Ok(backend::ReconcileRuntimeSecretsOutput { secret_files })
+            Ok(backend::ReconcileRuntimeSecretsOutput {
+                secret_files,
+                credentials,
+            })
         })
     }
 

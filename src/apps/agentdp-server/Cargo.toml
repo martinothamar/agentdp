@@ -6,6 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+agentdp-base64.workspace = true
 agentdp-core.workspace = true
 agentdp-crypto.workspace = true
 agentdp-ds = { workspace = true, features = ["serde"] }
@@ -14,12 +15,14 @@ agentdp-platform.workspace = true
 agentdp-protocol.workspace = true
 agentdp-qemu.workspace = true
 flate2.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

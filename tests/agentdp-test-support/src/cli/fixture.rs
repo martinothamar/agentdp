@@ -462,7 +462,7 @@ fn write_fake_guest_tool_binaries(context: &TestContext) -> PathBuf {
 fn write_fake_codex_auth(context: &TestContext) -> PathBuf {
     context.write(
         "codex-auth.json",
-        r#"{"tokens":{"access_token":"test-access","refresh_token":"test-refresh"}}
+        r#"{"tokens":{"access_token":"header.eyJleHAiOjQxMDI0NDQ4MDB9.signature","refresh_token":"test-refresh"}}
 "#,
     )
 }

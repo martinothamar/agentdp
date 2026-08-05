@@ -35,6 +35,7 @@ impl AgentRegistry {
         tailscale: Rc<TailscaleService>,
     ) -> Result<Self, Error> {
         let mut state = RegistryState::default();
+        let backend = backend::resolve_for_kind(BackendKind::Qemu);
         for agent in layout.deployed_agents().await? {
             state.agents.insert(
                 agent.clone(),
@@ -42,17 +43,18 @@ impl AgentRegistry {
                     context.clone(),
                     agent,
                     layout.clone(),
-                    backend::resolve_for_kind(BackendKind::Qemu),
+                    backend.clone(),
                     Rc::clone(&tailscale),
                 ),
             );
         }
-        Ok(Self::from_state(context, layout, tailscale, state))
+        Ok(Self::from_state(context, layout, backend, tailscale, state))
     }
 
     fn from_state(
         context: Context,
         layout: AgentdpLayout,
+        backend: backend::BackendRef,
         tailscale: Rc<TailscaleService>,
         state: RegistryState,
     ) -> Self {
@@ -60,6 +62,7 @@ impl AgentRegistry {
         let inner = Rc::new(AgentRegistryInner {
             context,
             layout,
+            backend,
             tailscale,
             commands: RefCell::new(command_tx),
         });
@@ -161,6 +164,7 @@ const REGISTRY_COMMAND_CAPACITY: usize = 1024;
 struct AgentRegistryInner {
     context: Context,
     layout: AgentdpLayout,
+    backend: backend::BackendRef,
     tailscale: Rc<TailscaleService>,
     commands: RefCell<spsc::Sender<RegistryCommand>>,
 }
@@ -229,7 +233,7 @@ impl AgentRegistryInner {
             self.context.clone(),
             name.clone(),
             self.layout.clone(),
-            backend::resolve_for_manifest(manifest.value())?,
+            backend::ensure_manifest_supported(manifest.value(), self.backend.clone())?,
             Rc::clone(&self.tailscale),
         );
         state.agents.insert(name, agent.clone());

@@ -2106,7 +2106,7 @@ spec:
 
         let auth: serde_json::Value = serde_json::from_str(&auth_json).unwrap();
         let first_access = auth["tokens"]["access_token"].as_str().unwrap().to_owned();
-        let first_refresh = auth["tokens"]["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(auth["tokens"]["refresh_token"], "");
         let persisted_secrets = materialized.secrets.redacted();
         assert!(persisted_secrets.iter().all(|binding| binding.value().is_none()));
 
@@ -2118,7 +2118,7 @@ spec:
             .unwrap();
         let nested_expiry_json = String::from_utf8(nested_expiry_auth.contents).unwrap();
         assert!(!nested_expiry_json.contains("nested-secret"));
-        assert_eq!(nested_expiry_auth.secrets.iter().count(), 1);
+        assert!(nested_expiry_auth.secrets.is_empty());
 
         let rematerialized = file
             .materialize(
@@ -2128,7 +2128,7 @@ spec:
             .unwrap();
         let refreshed_auth: serde_json::Value = serde_json::from_slice(&rematerialized.contents).unwrap();
         assert_eq!(refreshed_auth["tokens"]["access_token"], first_access);
-        assert_eq!(refreshed_auth["tokens"]["refresh_token"], first_refresh);
+        assert_eq!(refreshed_auth["tokens"]["refresh_token"], "");
         assert_eq!(refreshed_auth["tokens"]["expires_at"], 4_102_444_800_u64);
         assert_eq!(
             rematerialized
@@ -2138,13 +2138,11 @@ spec:
                 .and_then(|binding| binding.value()),
             Some("new-access")
         );
-        assert_eq!(
+        assert!(
             rematerialized
                 .secrets
-                .iter()
-                .find(|binding| binding.placeholder == first_refresh)
-                .and_then(|binding| binding.value()),
-            Some("new-refresh")
+                .placeholder_for_name("CODEX_AUTH_TOKENS_REFRESH_TOKEN")
+                .is_none()
         );
     }
 

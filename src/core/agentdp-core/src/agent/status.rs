@@ -105,12 +105,49 @@ pub struct AgentInstanceHostInputsState {
     pub phase: AgentInstanceHostInputsPhase,
     #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    pub credentials: BTreeMap<String, AgentInstanceCredentialState>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstanceCredentialState {
+    pub phase: AgentInstanceCredentialPhase,
+    #[serde(rename = "expiresAtUnixSeconds", skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_seconds: Option<u64>,
+    #[serde(rename = "lastRefreshAt", skip_serializing_if = "Option::is_none")]
+    pub last_refresh_at: Option<String>,
+    #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentInstanceCredentialPhase {
+    Ready,
+    RefreshFailed,
+    Expired,
+}
+
+impl AgentInstanceCredentialPhase {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::RefreshFailed => "refresh-failed",
+            Self::Expired => "expired",
+        }
+    }
 }
 
 impl AgentInstanceHostInputsState {
     #[must_use]
-    pub const fn is_ready_for(&self, generation: u64) -> bool {
-        self.observed_generation == generation && matches!(self.phase, AgentInstanceHostInputsPhase::Ready)
+    pub fn is_ready_for(&self, generation: u64) -> bool {
+        self.observed_generation == generation
+            && matches!(self.phase, AgentInstanceHostInputsPhase::Ready)
+            && self
+                .credentials
+                .values()
+                .all(|credential| credential.phase != AgentInstanceCredentialPhase::Expired)
     }
 
     pub fn mark_pending(&mut self) {
@@ -128,6 +165,30 @@ impl AgentInstanceHostInputsState {
         self.observed_generation = generation;
         self.phase = AgentInstanceHostInputsPhase::Failed;
         self.last_error = Some(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentInstanceCredentialPhase, AgentInstanceCredentialState, AgentInstanceHostInputsState};
+
+    #[test]
+    fn expired_credentials_block_host_input_readiness() {
+        let mut state = AgentInstanceHostInputsState::default();
+        state.mark_ready(3);
+        state.credentials.insert(
+            "codex".to_owned(),
+            AgentInstanceCredentialState {
+                phase: AgentInstanceCredentialPhase::Expired,
+                expires_at_unix_seconds: Some(1_000),
+                last_refresh_at: None,
+                last_error: Some("expired".to_owned()),
+            },
+        );
+        assert!(!state.is_ready_for(3));
+
+        state.credentials.get_mut("codex").unwrap().phase = AgentInstanceCredentialPhase::RefreshFailed;
+        assert!(state.is_ready_for(3));
     }
 }
 

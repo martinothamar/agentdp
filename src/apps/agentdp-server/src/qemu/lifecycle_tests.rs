@@ -211,6 +211,7 @@ async fn reconcile_reattaches_instance_network_without_marking_instance_stale() 
             instance: "test-instance",
             network: &instance_network,
             manifest: &manifest,
+            credentials: &crate::host::HostCredentialService::new(),
         },
         &mut state,
     )
@@ -283,6 +284,7 @@ async fn runtime_secret_refresh_attaches_mediated_network_when_not_running() {
             instance: "test-instance",
             network: &instance_network,
             manifest: &manifest,
+            credentials: &crate::host::HostCredentialService::new(),
         },
         &mut state,
     )
@@ -326,6 +328,7 @@ async fn instance_network_status_reports_live_attach_progress() {
             instance: "test-instance",
             network: &instance_network,
             manifest: &manifest,
+            credentials: &crate::host::HostCredentialService::new(),
         },
         &mut state,
     )
@@ -404,6 +407,7 @@ async fn reconcile_connects_existing_qemu_socket_and_republishes_ports() {
             instance: "test-instance",
             network: &instance_network,
             manifest: &manifest,
+            credentials: &crate::host::HostCredentialService::new(),
         },
         &mut state,
     )

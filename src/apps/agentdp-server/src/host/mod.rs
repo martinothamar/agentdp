@@ -1,7 +1,9 @@
+mod credentials;
 mod seed;
 mod ssh;
 pub(crate) mod tailscale;
 
+pub(crate) use credentials::{Error as HostCredentialError, HostCredentialService};
 pub(crate) use seed::{
     Error as HostSeedError, collect as collect_host_seed, collect_guest_tool_seeds, collect_runtime_host_files,
     collect_runtime_secrets,

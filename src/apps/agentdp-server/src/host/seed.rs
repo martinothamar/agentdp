@@ -517,7 +517,7 @@ fn is_env_file(path: &Path) -> bool {
     name == ".env" || name.starts_with(".env.")
 }
 
-fn resolve_host_input_file_source(source: &HostInputFileSource) -> PathBuf {
+pub(super) fn resolve_host_input_file_source(source: &HostInputFileSource) -> PathBuf {
     match source {
         HostInputFileSource::HomeRelative {
             path_env,
@@ -1309,8 +1309,8 @@ spec:
         assert!(!auth_json.contains("access-secret"));
         assert!(!auth_json.contains("refresh-secret"));
         assert!(!auth_json.contains("id-secret"));
-        assert!(auth_json.contains("AGENTDP_SECRET_CODEX_AUTH_TOKENS_ACCESS_TOKEN_"));
-        assert!(auth_json.contains("AGENTDP_SECRET_CODEX_AUTH_TOKENS_REFRESH_TOKEN_"));
+        assert!(auth_json.contains("\"access_token\": \"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."));
+        assert!(auth_json.contains("\"refresh_token\": \"\""));
         assert!(auth_json.contains("\"id_token\": \"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."));
         assert_secret(
             &secrets,
@@ -1319,12 +1319,10 @@ spec:
             "access-secret",
             "api.openai.com",
         );
-        assert_secret(
-            &secrets,
-            &json_string_field(&auth_json, "refresh_token"),
-            "CODEX_AUTH_TOKENS_REFRESH_TOKEN",
-            "refresh-secret",
-            "api.openai.com",
+        assert!(
+            secrets
+                .placeholder_for_name("CODEX_AUTH_TOKENS_REFRESH_TOKEN")
+                .is_none()
         );
         let id_token_placeholder = json_string_field(&auth_json, "id_token");
         assert_secret(

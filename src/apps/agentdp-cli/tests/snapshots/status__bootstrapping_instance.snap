@@ -10,6 +10,8 @@ process: running
 pid: $PID
 work: bootstrap
 host inputs: pending (observed generation 0)
+credential codex: ready
+credential codex expires at unix seconds: 4102444800
 readiness: unknown
 disk: $TMP/home/.agentdp/agents/altinn-studio/instances/0/disk.qcow2
 seed: $TMP/home/.agentdp/agents/altinn-studio/instances/0/seed.img

@@ -187,6 +187,18 @@ fn print_instance_document(document: &AgentInstanceDocument) {
     if let Some(error) = &document.status.host_inputs.last_error {
         println!("host inputs error: {error}");
     }
+    for (name, credential) in &document.status.host_inputs.credentials {
+        println!("credential {name}: {}", credential.phase.label());
+        if let Some(expires_at) = credential.expires_at_unix_seconds {
+            println!("credential {name} expires at unix seconds: {expires_at}");
+        }
+        if let Some(last_refresh) = &credential.last_refresh_at {
+            println!("credential {name} last refresh: {last_refresh}");
+        }
+        if let Some(error) = &credential.last_error {
+            println!("credential {name} error: {error}");
+        }
+    }
     print_readiness(document);
     print_backend(document);
     print_ports("ports", document.status.network.ports.iter());

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::provisioning::host_input::{HostInputFile, HostInputFileSource, HostInputGuestPath, HostInputRequirements};
+use crate::provisioning::host_input::{
+    HostInputFile, HostInputFileSource, HostInputGuestPath, HostInputRequirements, ManagedHostCredential,
+};
 
 use super::AuthMode;
 use super::mediated_json_auth::MediatedJsonAuthTransform;
@@ -76,6 +78,11 @@ static CODEX_AUTH_TRANSFORM: MediatedJsonAuthTransform = MediatedJsonAuthTransfo
     prefix: "CODEX_AUTH",
     hosts: &["api.openai.com", "chatgpt.com"],
     normalize_expiry: true,
+    // Codex inspects JWT expiry locally. The host owns refresh, so the guest gets
+    // an unexpired JWT-shaped access placeholder and no refresh authority.
+    jwt_access_token_placeholder: true,
+    omit_refresh_token: true,
+    managed_credential: Some(ManagedHostCredential::Codex),
 };
 
 fn codex_auth_guest_path() -> HostInputGuestPath {

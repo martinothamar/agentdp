@@ -223,6 +223,10 @@ impl<'a> MaterializationContext<'a> {
 pub trait HostInputTransform: Sync {
     fn name(&self) -> &'static str;
 
+    fn managed_credential(&self) -> Option<ManagedHostCredential> {
+        None
+    }
+
     fn produces_secrets(&self) -> bool {
         false
     }
@@ -239,6 +243,11 @@ pub trait HostInputTransform: Sync {
         contents: &[u8],
         context: MaterializationContext<'_>,
     ) -> Result<MaterializedHostInput, Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedHostCredential {
+    Codex,
 }
 
 #[derive(Clone, Copy)]
@@ -259,6 +268,13 @@ impl HostInputTransformRef {
         match self {
             Self::Copy => false,
             Self::Plugin(transform) => transform.produces_secrets(),
+        }
+    }
+
+    fn managed_credential(self) -> Option<ManagedHostCredential> {
+        match self {
+            Self::Copy => None,
+            Self::Plugin(transform) => transform.managed_credential(),
         }
     }
 
@@ -369,6 +385,11 @@ impl HostInputFile {
     #[must_use]
     pub fn produces_secrets(&self) -> bool {
         self.transform.produces_secrets()
+    }
+
+    #[must_use]
+    pub fn managed_credential(&self) -> Option<ManagedHostCredential> {
+        self.transform.managed_credential()
     }
 
     /// Materializes this host input for seed-file emission.

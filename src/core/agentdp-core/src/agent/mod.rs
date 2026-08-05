@@ -16,12 +16,13 @@ pub use event::{
 pub use identity::{AgentBaseKey, AgentInstanceId, AgentName, IdentityError, InstanceName};
 pub use status::{
     AgentBasePhase, AgentBaseStatus, AgentInstanceBootstrapState, AgentInstanceBootstrapStepStatus,
-    AgentInstanceBootstrapWorkPhase, AgentInstanceBootstrapWorkStatus, AgentInstanceHostInputsPhase,
-    AgentInstanceHostInputsState, AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind, AgentInstanceNetworkStatus,
-    AgentInstancePhase, AgentInstanceSessionsWorkStatus, AgentInstanceStatus, AgentInstanceTarget,
-    AgentInstanceTransitionKind, AgentInstanceTransitionWorkStatus, AgentInstanceWorkStatus, AgentStatus,
-    AgentStatusPhase, BackendState, GuestAccessState, HealthcheckStatus, NetworkAllowState, NetworkIpv6State,
-    NetworkModeState, NetworkState, OperationResult, PortMappingState, PortProtocolState, ProcessStatus,
-    QemuImageState, QemuInstanceNetworkState, QemuMediatedCaState, QemuState, ReadinessResult, ReadinessState,
-    ReconciliationState, ReplicaStatus, ServiceStatus, TailscaleServeRouteState, TailscaleServeState,
+    AgentInstanceBootstrapWorkPhase, AgentInstanceBootstrapWorkStatus, AgentInstanceCredentialPhase,
+    AgentInstanceCredentialState, AgentInstanceHostInputsPhase, AgentInstanceHostInputsState,
+    AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind, AgentInstanceNetworkStatus, AgentInstancePhase,
+    AgentInstanceSessionsWorkStatus, AgentInstanceStatus, AgentInstanceTarget, AgentInstanceTransitionKind,
+    AgentInstanceTransitionWorkStatus, AgentInstanceWorkStatus, AgentStatus, AgentStatusPhase, BackendState,
+    GuestAccessState, HealthcheckStatus, NetworkAllowState, NetworkIpv6State, NetworkModeState, NetworkState,
+    OperationResult, PortMappingState, PortProtocolState, ProcessStatus, QemuImageState, QemuInstanceNetworkState,
+    QemuMediatedCaState, QemuState, ReadinessResult, ReadinessState, ReconciliationState, ReplicaStatus, ServiceStatus,
+    TailscaleServeRouteState, TailscaleServeState,
 };

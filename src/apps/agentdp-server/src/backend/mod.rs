@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use agentdp_core::Context;
 use agentdp_core::agent::{
-    AgentInstanceDocument, AgentInstancePhase, BackendState, BootstrapEvent, GuestAccessState, PortMappingState,
-    ProcessStatus,
+    AgentInstanceCredentialState, AgentInstanceDocument, AgentInstancePhase, BackendState, BootstrapEvent,
+    GuestAccessState, PortMappingState, ProcessStatus,
 };
 use agentdp_core::doctor::DoctorReport;
 use agentdp_core::manifest::AgentManifest;
@@ -193,10 +193,13 @@ pub(crate) fn resolve_for_kind(kind: BackendKind) -> BackendRef {
 }
 
 pub(crate) fn resolve_for_manifest(manifest: &AgentManifest) -> Result<BackendRef, Error> {
+    ensure_manifest_supported(manifest, resolve_for_kind(BackendKind::Qemu))
+}
+
+pub(crate) fn ensure_manifest_supported(manifest: &AgentManifest, backend: BackendRef) -> Result<BackendRef, Error> {
     let image = ImageCatalog::resolve(ImageRequest {
         os: manifest.spec.image.os,
     });
-    let backend = resolve_for_kind(BackendKind::Qemu);
     if backend.supports_image(image) {
         return Ok(backend);
     }
@@ -281,6 +284,7 @@ pub(crate) struct ReconcileOutput {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReconcileRuntimeSecretsOutput {
     pub secret_files: Vec<SeedFile>,
+    pub credentials: std::collections::BTreeMap<String, AgentInstanceCredentialState>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]

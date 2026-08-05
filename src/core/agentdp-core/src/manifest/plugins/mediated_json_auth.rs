@@ -1,5 +1,5 @@
 use crate::provisioning::host_input::{
-    Error as HostInputError, HostInputTransform, MaterializationContext, MaterializedHostInput,
+    Error as HostInputError, HostInputTransform, ManagedHostCredential, MaterializationContext, MaterializedHostInput,
 };
 use crate::provisioning::secrets::{SecretBinding, SecretBindings};
 
@@ -10,6 +10,9 @@ pub(super) struct MediatedJsonAuthTransform {
     pub(super) prefix: &'static str,
     pub(super) hosts: &'static [&'static str],
     pub(super) normalize_expiry: bool,
+    pub(super) jwt_access_token_placeholder: bool,
+    pub(super) omit_refresh_token: bool,
+    pub(super) managed_credential: Option<ManagedHostCredential>,
 }
 
 impl HostInputTransform for MediatedJsonAuthTransform {
@@ -19,6 +22,10 @@ impl HostInputTransform for MediatedJsonAuthTransform {
 
     fn produces_secrets(&self) -> bool {
         true
+    }
+
+    fn managed_credential(&self) -> Option<ManagedHostCredential> {
+        self.managed_credential
     }
 
     fn materialize(
@@ -56,6 +63,10 @@ impl MediatedJsonAuthTransform {
         match value {
             serde_json::Value::Object(object) => {
                 for (key, child) in object {
+                    if self.omit_refresh_token && key.eq_ignore_ascii_case("refresh_token") {
+                        *child = serde_json::Value::String(String::new());
+                        continue;
+                    }
                     if self.normalize_expiry && is_auth_expiry_key(key) && normalize_expiry_value(child) {
                         continue;
                     }
@@ -76,7 +87,9 @@ impl MediatedJsonAuthTransform {
                 }
             }
             serde_json::Value::String(secret) if sensitive_context && !secret.is_empty() => {
-                let placeholder = auth_placeholder(name_path, context)?;
+                let jwt_placeholder = name_path.ends_with("_ID_TOKEN")
+                    || (self.jwt_access_token_placeholder && name_path.ends_with("_ACCESS_TOKEN"));
+                let placeholder = auth_placeholder(name_path, context, jwt_placeholder)?;
                 let binding = SecretBinding::new_with_placeholder(
                     name_path,
                     placeholder,
@@ -96,17 +109,31 @@ impl MediatedJsonAuthTransform {
     }
 }
 
-fn auth_placeholder(name_path: &str, context: MaterializationContext<'_>) -> Result<Option<String>, HostInputError> {
+fn auth_placeholder(
+    name_path: &str,
+    context: MaterializationContext<'_>,
+    jwt_placeholder: bool,
+) -> Result<Option<String>, HostInputError> {
     if let Some(placeholder) = context.placeholder_for_name(name_path) {
-        return Ok(Some(placeholder.to_owned()));
+        return Ok(Some(if jwt_placeholder && !looks_like_jwt(placeholder) {
+            jwt_placeholder_for(placeholder)
+        } else {
+            placeholder.to_owned()
+        }));
     }
-    if !name_path.ends_with("_ID_TOKEN") {
+    if !jwt_placeholder {
         return Ok(None);
     }
     let placeholder = SecretBinding::new(name_path, "placeholder-value", &[])?.placeholder;
-    Ok(Some(format!(
-        "{JWT_PLACEHOLDER_HEADER}.{JWT_PLACEHOLDER_PAYLOAD}.{placeholder}"
-    )))
+    Ok(Some(jwt_placeholder_for(&placeholder)))
+}
+
+fn jwt_placeholder_for(signature: &str) -> String {
+    format!("{JWT_PLACEHOLDER_HEADER}.{JWT_PLACEHOLDER_PAYLOAD}.{signature}")
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    value.split('.').count() == 3
 }
 
 const JWT_PLACEHOLDER_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";

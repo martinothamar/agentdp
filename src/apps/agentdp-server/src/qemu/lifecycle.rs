@@ -22,7 +22,7 @@ use agentdp_qemu::{command, disk, image, qmp, system};
 use crate::agent::{AGENT_BASE_INSTANCE, AgentBaseFiles, AgentBaseKey, AgentInstanceFiles, AgentManifestContext};
 use crate::agent::{AgentName, InstanceName};
 use crate::backend::{self, BackendBaseImageIdentity, CreateBaseInput, CreateBaseOutput};
-use crate::host::{collect_runtime_host_files, collect_runtime_secrets};
+use crate::host::{HostCredentialService, collect_runtime_host_files, collect_runtime_secrets};
 use crate::services::InstanceNetwork;
 
 use super::control;
@@ -50,7 +50,11 @@ pub(super) async fn create_instance(
     input: backend::CreateInstanceInput<'_>,
     qemu_img: &disk::QemuImg,
     ssh_keygen: &SshKeygen,
+    credentials: &HostCredentialService,
 ) -> Result<backend::CreateInstanceOutput, Error> {
+    credentials
+        .prepare(&input.manifest.value().host_input_requirements())
+        .await?;
     let prepared = provisioning::prepare_create_with_keygen(
         context,
         provisioning::PrepareCreateInput {
@@ -236,11 +240,13 @@ pub(super) async fn start_instance(
         agent,
         instance,
         network,
+        credentials,
     } = input;
     let agent_name = AgentName::new(agent);
     let instance_name = InstanceName::new(instance);
     let spec = spec_from_state(manifest.value(), agent, instance, network, qemu_state)?;
     clear_stored_runtime_secrets_if_unconfigured(manifest.value(), qemu_state);
+    credentials.prepare(&manifest.value().host_input_requirements()).await?;
     let secrets = collect_runtime_secrets(
         context,
         manifest.source_path(),
@@ -309,6 +315,7 @@ pub(super) struct StartInstanceInput<'a> {
     pub agent: &'a str,
     pub instance: &'a str,
     pub network: &'a NetworkState,
+    pub credentials: &'a HostCredentialService,
 }
 
 pub(super) struct RuntimeInput<'a> {
@@ -319,6 +326,7 @@ pub(super) struct RuntimeInput<'a> {
     pub instance: &'a str,
     pub network: &'a NetworkState,
     pub manifest: &'a AgentManifestContext,
+    pub credentials: &'a HostCredentialService,
 }
 
 pub(super) async fn stop_instance(
@@ -494,6 +502,10 @@ pub(super) async fn ensure_attached(input: RuntimeInput<'_>, state: &State) -> R
     let agent = AgentName::new(input.agent);
     let instance = InstanceName::new(input.instance);
     if !instance_network_is_attached(input.instance_network, &agent, &instance, state).await {
+        input
+            .credentials
+            .prepare(&input.manifest.value().host_input_requirements())
+            .await?;
         let secrets = collect_runtime_secrets(
             input.context,
             input.manifest.source_path(),
@@ -528,6 +540,10 @@ pub(super) async fn reconcile(input: RuntimeInput<'_>, state: &mut State) -> Res
         && !instance_network_is_attached(input.instance_network, &agent, &instance, state).await
     {
         clear_live_runtime_secrets_if_unconfigured(&input, state)?;
+        input
+            .credentials
+            .prepare(&input.manifest.value().host_input_requirements())
+            .await?;
         let secrets = collect_runtime_secrets(
             input.context,
             input.manifest.source_path(),
@@ -584,11 +600,18 @@ pub(super) async fn reconcile_runtime_secrets(
     input: RuntimeInput<'_>,
     state: &mut State,
 ) -> Result<backend::ReconcileRuntimeSecretsOutput, Error> {
+    let credentials = input
+        .credentials
+        .prepare(&input.manifest.value().host_input_requirements())
+        .await?;
     if should_clear_runtime_secrets(input.manifest.value(), state) {
         let secrets = SecretBindings::default();
         reconcile_running_instance_network_secrets(&input, state, &secrets).await?;
         state.mediated_secrets = secrets;
-        return Ok(backend::ReconcileRuntimeSecretsOutput::default());
+        return Ok(backend::ReconcileRuntimeSecretsOutput {
+            secret_files: Vec::new(),
+            credentials,
+        });
     }
     let collected = collect_runtime_secrets(
         input.context,
@@ -602,6 +625,7 @@ pub(super) async fn reconcile_runtime_secrets(
     state.mediated_secrets = collected.stored_secrets;
     Ok(backend::ReconcileRuntimeSecretsOutput {
         secret_files: collected.files,
+        credentials,
     })
 }
 

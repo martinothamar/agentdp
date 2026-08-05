@@ -74,8 +74,9 @@ tar = "0.4.44"
 
 # TLS/certificate stack. Keep features explicit so rustls/rcgen do not pull unused crypto providers.
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "system-proxy"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-time = "0.3.44"
+time = { version = "0.3.44", features = ["parsing"] }
 tokio-rustls = { version = "0.26.4", default-features = false }
 webpki-roots = "1.0.7"
 

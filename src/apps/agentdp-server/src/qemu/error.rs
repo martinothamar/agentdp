@@ -2,7 +2,7 @@ use agentdp_platform as platform;
 use agentdp_protocol::Error as ProtocolError;
 use agentdp_qemu::{disk, image, net::stream, system};
 
-use crate::host::{HostSeedError, HostSshError};
+use crate::host::{HostCredentialError, HostSeedError, HostSshError};
 
 use super::provisioning;
 
@@ -27,6 +27,8 @@ pub(super) enum ErrorKind {
     Provisioning(provisioning::Error),
     #[error("{0}")]
     HostSeed(HostSeedError),
+    #[error("{0}")]
+    HostCredential(HostCredentialError),
     #[error("{0}")]
     BootstrapGraph(agentdp_core::provisioning::bootstrap::BootstrapGraphError),
     #[error("QEMU does not support image {os} {architecture} {variant}")]
@@ -144,6 +146,12 @@ impl From<provisioning::Error> for Error {
 impl From<HostSeedError> for Error {
     fn from(source: HostSeedError) -> Self {
         ErrorKind::HostSeed(source).into()
+    }
+}
+
+impl From<HostCredentialError> for Error {
+    fn from(source: HostCredentialError) -> Self {
+        ErrorKind::HostCredential(source).into()
     }
 }
 
