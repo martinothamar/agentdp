@@ -14,17 +14,22 @@ use crate::user::AgentAutomation;
 use crate::{Error, Result};
 
 const MAX_PREVIEW_LENGTH: usize = 220;
+const PR_REGISTRY_VERSION: u32 = 2;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PrRegistry {
-    #[serde(default = "registry_version")]
     version: u32,
     #[serde(default)]
     pub prs: Vec<PrEntry>,
 }
 
-const fn registry_version() -> u32 {
-    1
+impl Default for PrRegistry {
+    fn default() -> Self {
+        Self {
+            version: PR_REGISTRY_VERSION,
+            prs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,8 +37,15 @@ pub(crate) struct PrEntry {
     pub number: u64,
     pub url: String,
     pub branch: Option<String>,
-    pub repo_path: String,
+    pub delivery: PrDelivery,
     pub registered_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PrDelivery {
+    AgentHost { session: String },
+    Tmux,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -51,7 +63,7 @@ pub(super) struct PrEvent {
 #[derive(Debug, Serialize, Deserialize)]
 struct QueuedEvents {
     url: String,
-    repo_path: String,
+    delivery: PrDelivery,
     events: Vec<PrEvent>,
     updated_at: String,
 }
@@ -81,17 +93,50 @@ impl GithubPrService {
     }
 
     pub(crate) async fn register(&self, target: Option<&str>, cwd: &Path) -> Result<PrEntry> {
-        let repo = run_capture("git", &["rev-parse", "--show-toplevel"], Some(cwd)).await?;
+        if !matches!(self.automation.as_ref(), AgentAutomation::Tmux(_)) {
+            return Err(Error::Message(
+                "guestctl PR registration is only available for tmux sessions; use the Agent Host PR registration tool"
+                    .to_owned(),
+            ));
+        }
         let branch = run_capture("git", &["branch", "--show-current"], Some(cwd)).await?;
         let pr_target = target
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| branch.trim());
         let view = pr_view(pr_target, Some(cwd)).await?;
+        let branch = Some(branch.trim().to_owned()).filter(|value| !value.is_empty());
+        self.register_view(view, branch, PrDelivery::Tmux).await
+    }
+
+    pub(crate) async fn register_agent_host(&self, url: &str, session: &str) -> Result<PrEntry> {
+        if !matches!(self.automation.as_ref(), AgentAutomation::AgentHost(_)) {
+            return Err(Error::Message(
+                "Agent Host PR registration requires Agent Host automation".to_owned(),
+            ));
+        }
+        if url.is_empty() || session.is_empty() {
+            return Err(Error::Message(
+                "PR URL and Agent Host session must not be empty".to_owned(),
+            ));
+        }
+        let view = pr_view(url, None).await?;
+        let branch = json_string(&view, "headRefName");
+        self.register_view(
+            view,
+            branch,
+            PrDelivery::AgentHost {
+                session: session.to_owned(),
+            },
+        )
+        .await
+    }
+
+    async fn register_view(&self, view: Value, branch: Option<String>, delivery: PrDelivery) -> Result<PrEntry> {
         let entry = PrEntry {
             number: json_u64(&view, "number").unwrap_or_default(),
             url: required_json_string(&view, "url")?,
-            branch: Some(branch.trim().to_owned()).filter(|value| !value.is_empty()),
-            repo_path: repo.trim().to_owned(),
+            branch,
+            delivery,
             registered_at: now_marker(),
         };
         let mut registry = self.read_registry().await?;
@@ -103,6 +148,12 @@ impl GithubPrService {
     }
 
     pub(crate) async fn unregister(&self, target: Option<&str>, cwd: &Path) -> Result<String> {
+        if !matches!(self.automation.as_ref(), AgentAutomation::Tmux(_)) {
+            return Err(Error::Message(
+                "guestctl PR unregistration is only available for tmux sessions; use the Agent Host PR unregistration tool"
+                    .to_owned(),
+            ));
+        }
         let remove_target = if let Some(target) = target.filter(|value| !value.is_empty()) {
             target.to_owned()
         } else {
@@ -121,6 +172,28 @@ impl GithubPrService {
         }
         self.write_registry(&registry).await?;
         Ok(remove_target)
+    }
+
+    pub(crate) async fn unregister_agent_host(&self, url: &str, session: &str) -> Result<String> {
+        if !matches!(self.automation.as_ref(), AgentAutomation::AgentHost(_)) {
+            return Err(Error::Message(
+                "Agent Host PR unregistration requires Agent Host automation".to_owned(),
+            ));
+        }
+        let mut registry = self.read_registry().await?;
+        let before = registry.prs.len();
+        registry.prs.retain(|entry| {
+            entry.url != url
+                || entry.delivery
+                    != (PrDelivery::AgentHost {
+                        session: session.to_owned(),
+                    })
+        });
+        if registry.prs.len() == before {
+            return Err(Error::Message(format!("not registered by this session: {url}")));
+        }
+        self.write_registry(&registry).await?;
+        Ok(url.to_owned())
     }
 
     pub(crate) async fn list(&self) -> Result<Vec<PrListItem>> {
@@ -182,7 +255,7 @@ impl GithubPrService {
         let file = self.queue_dir.join(format!("{}.json", stable_hash_hex(&entry.url)));
         let mut queue = read_json_file(&file).await?.unwrap_or_else(|| QueuedEvents {
             url: entry.url.clone(),
-            repo_path: entry.repo_path.clone(),
+            delivery: entry.delivery.clone(),
             events: Vec::new(),
             updated_at: String::new(),
         });
@@ -196,7 +269,7 @@ impl GithubPrService {
         }
         queue = QueuedEvents {
             url: entry.url.clone(),
-            repo_path: entry.repo_path.clone(),
+            delivery: entry.delivery.clone(),
             events: by_id.into_values().collect(),
             updated_at: now_marker(),
         };
@@ -212,10 +285,16 @@ impl GithubPrService {
                     let Some(queue) = read_json_file::<QueuedEvents>(&file).await? else {
                         continue;
                     };
-                    if !queue.events.is_empty()
-                        && !super::agent_host::queue_pr_events(url, &queue.events, &[queue.repo_path]).await?
-                    {
-                        return Ok(false);
+                    if !queue.events.is_empty() {
+                        let PrDelivery::AgentHost { session } = &queue.delivery else {
+                            return Err(Error::Message(format!(
+                                "tmux PR event queue cannot be delivered through Agent Host: {}",
+                                queue.url
+                            )));
+                        };
+                        if !super::agent_host::queue_pr_events(url, &queue.events, session).await? {
+                            return Ok(false);
+                        }
                     }
                     remove_file(&file).await?;
                 }
@@ -226,6 +305,12 @@ impl GithubPrService {
                 let mut events = Vec::new();
                 for file in &files {
                     if let Some(queue) = read_json_file::<QueuedEvents>(file).await? {
+                        if !matches!(queue.delivery, PrDelivery::Tmux) {
+                            return Err(Error::Message(format!(
+                                "Agent Host PR event queue cannot be delivered through tmux: {}",
+                                queue.url
+                            )));
+                        }
                         events.extend(queue.events);
                     }
                 }
@@ -245,7 +330,14 @@ impl GithubPrService {
     }
 
     async fn read_registry(&self) -> Result<PrRegistry> {
-        Ok(read_json_file(&self.registry).await?.unwrap_or_default())
+        let registry: PrRegistry = read_json_file(&self.registry).await?.unwrap_or_default();
+        if registry.version != PR_REGISTRY_VERSION {
+            return Err(Error::Message(format!(
+                "unsupported PR registry version {}; expected {} (manual migration required)",
+                registry.version, PR_REGISTRY_VERSION
+            )));
+        }
+        Ok(registry)
     }
 
     async fn write_registry(&self, registry: &PrRegistry) -> Result<()> {
@@ -623,7 +715,7 @@ mod tests {
             &empty_file,
             &QueuedEvents {
                 url: "https://example.test/pr/1".to_owned(),
-                repo_path: "/data/home/code/repo".to_owned(),
+                delivery: super::PrDelivery::Tmux,
                 events: Vec::new(),
                 updated_at: "1".to_owned(),
             },
@@ -636,7 +728,7 @@ mod tests {
             &pending_file,
             &QueuedEvents {
                 url: "https://example.test/pr/2".to_owned(),
-                repo_path: "/data/home/code/repo".to_owned(),
+                delivery: super::PrDelivery::Tmux,
                 events: vec![PrEvent {
                     id: "event-1".to_owned(),
                     line: "pr=#1 event=review".to_owned(),

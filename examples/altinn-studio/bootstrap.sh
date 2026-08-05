@@ -22,7 +22,11 @@ section() {
 prepare_workspace() {
   section "Preparing workspace:"
 
-  mkdir -p "$AGENTDP_CODE_DIR/.reference/" "$AGENTDP_CODE_DIR/.scripts/" "$AGENTDP_CODE_DIR/apps/"
+  mkdir -p \
+    "$AGENTDP_CODE_DIR/.reference/" \
+    "$AGENTDP_CODE_DIR/.scripts/" \
+    "$AGENTDP_CODE_DIR/.worktrees/" \
+    "$AGENTDP_CODE_DIR/apps/"
 }
 
 install_studioctl() {

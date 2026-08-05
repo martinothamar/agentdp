@@ -21,9 +21,13 @@ are not advertised, and AHP bearer-token authentication is rejected. Codex,
 GitHub, and Studio credentials continue to use AgentDP's mediated guest
 credentials; desktop VS Code credentials are never forwarded into the VM.
 
-The existing `guestctl pr` workflow remains available. `guestd` delivers queued
-pull-request events through AHP to the unique matching Codex session and keeps
-each event on disk until the marked turn completes.
+Agent Host provides session-bound tools for registering and unregistering pull
+requests. `guestd` stores the registering AHP session URI and delivers each
+queued event to that exact session, independent of the underlying harness.
+
+Task work happens in dedicated worktrees under
+`/data/home/code/.worktrees/`; primary checkouts remain clean for repository
+maintenance.
 
 Copy `sample.env` to the ignored `.env`, populate the required host values, and
 apply `agent.yaml`. The local `bootstrap.sh`, seeded Codex instructions and

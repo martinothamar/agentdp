@@ -110,8 +110,10 @@ Apps should be cloned to `/data/home/code/apps`.
 ### Development
 
 - Start branches/development from a clean slate; from main/master (if forked, make sure it is updated from upstream)
+- Always do task work in a dedicated Git worktree under `/data/home/code/.worktrees/`; never edit in the primary repository checkout
+  - Use one worktree per task, with a path such as `/data/home/code/.worktrees/<repo>-<task>`
+  - Use primary checkouts only to sync remotes and create, inspect, or remove worktrees
 - Prefer small, verifiable changes. Read local repository (and subfolder) instructions before editing code, and keep changes scoped to the task.
-- Worktrees are allowed, create them in the code/ folder and remember to clean up afterwards after merging
 - Use Playwright for browser automation, testing, PDFs and screenshots
 - Make sure that builds, tests, lints and formatting is OK (there are often Makefile targets)
 - For user-facing behavior changes, check whether docs should also be updated in `altinn-studio-docs`.
@@ -167,7 +169,7 @@ IMPORTANT: this is how you must work on PRs:
 - Description (usually part of PR/issue template) should explain what was done, why it was done and how it was tested
   - Provide brower screenshots when frontend/web interface changes is involved
   - Provide command input and output history/transcript when CLI changes is involved 
-- Create PRs with `gh pr create`, then use the installed guestctl skill to register the PR for event notifications
+- Create PRs with `gh pr create`, then call the `agentdp_register_pr` tool with the full PR URL
   - Example from a fork: `gh pr create --fill --repo Altinn/altinn-studio --base main --head martinothamar-agent:<branch-name>`
   - After a PR is registered, you will receive PR event notifications regarding failing CI, reviews and top-level PR comments
   - Do not manually poll or watch PR status after registration
@@ -175,14 +177,14 @@ IMPORTANT: this is how you must work on PRs:
 - Once review comments have been received, make further changes in follow up commits only, so it is simple to keep track for reviewer
 - PRs should be focused on a single topic/item. If unrelated problems/items are discovered and need fixes, fix in separate PRs to main branch
 - When PRs get merged, start cleanup procedure
-  - Unregister the PR
-  - Sync forks to upstream
-  - Cleanup worktree
+  - Call `agentdp_unregister_pr` with the full PR URL
+  - Sync the fork to upstream
+  - Remove the worktree
   - State that you are ready for new work
 
 Example lifecycle:
 
-1. Open PR with `gh pr create`, then register it
+1. Open PR with `gh pr create`, then call `agentdp_register_pr` with its full URL
 2. Wait for the PR event notifications
 3. Local commit with CI fixes
 4. Check review comments
@@ -191,7 +193,7 @@ Example lifecycle:
 7. Rebase on latest and synced (upstream) main
 8. Push any changes, then go to step 2 (wait for next iteration)
 9. PR gets merged
-10. Cleanup procedure (unregister, sync from upstream, cleanup worktree, state readiness)
+10. Cleanup procedure (`agentdp_unregister_pr`, sync from upstream, cleanup worktree, state readiness)
 
 
 ##### GitHub CLI Comments

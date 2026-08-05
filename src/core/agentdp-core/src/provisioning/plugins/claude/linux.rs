@@ -3,8 +3,6 @@ use crate::provisioning::bootstrap::ProvisioningBuilder;
 use crate::provisioning::guest_os::linux::shell;
 use agentdp_protocol::server_guest::BootstrapStepResource;
 
-const GUESTCTL_SKILL: &str = include_str!("../resources/guestctl-skill.md");
-
 pub(super) fn apply(plugin: &Claude, builder: &mut ProvisioningBuilder<'_>) {
     builder.require_mise_package("node@lts");
     let code_dir = builder.code_dir();
@@ -20,7 +18,6 @@ pub(super) fn apply(plugin: &Claude, builder: &mut ProvisioningBuilder<'_>) {
     if plugin.yolo {
         config.block(&accept_bypass_permissions());
     }
-    config.block(&install_guestctl_skill());
     builder.add_instance_user_step(
         "plugin.claude.config",
         "Configure Claude Code",
@@ -112,13 +109,4 @@ fn enable_daemon_claude_session_management() -> String {
      Environment=AGENTDP_CLAUDE_SESSION=1\n\
      EOF"
     .to_owned()
-}
-
-fn install_guestctl_skill() -> String {
-    format!(
-        "install -d -m 0755 \"$HOME/.claude/skills/agentdp-guestctl\"\n\
-         cat >\"$HOME/.claude/skills/agentdp-guestctl/SKILL.md\" <<'EOF'\n\
-         {GUESTCTL_SKILL}\n\
-         EOF"
-    )
 }

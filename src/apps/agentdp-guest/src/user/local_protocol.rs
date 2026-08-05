@@ -9,7 +9,9 @@ use crate::{Error, Result};
 pub(crate) enum Request {
     Ping,
     PrRegister { target: Option<String>, cwd: String },
+    PrRegisterAgentHost { url: String, session: String },
     PrUnregister { target: Option<String>, cwd: String },
+    PrUnregisterAgentHost { url: String, session: String },
     PrList,
 }
 
@@ -125,6 +127,22 @@ mod tests {
                 "command": "pr_unregister",
                 "target": null,
                 "cwd": "/data/home/code/altinn-studio",
+            })
+        );
+    }
+
+    #[test]
+    fn agent_host_pr_requests_include_the_owning_session() {
+        assert_eq!(
+            serde_json::to_value(Request::PrRegisterAgentHost {
+                url: "https://github.com/Altinn/altinn-studio/pull/1".to_owned(),
+                session: "claude:/session-1".to_owned(),
+            })
+            .expect("serialize Agent Host registration request"),
+            json!({
+                "command": "pr_register_agent_host",
+                "url": "https://github.com/Altinn/altinn-studio/pull/1",
+                "session": "claude:/session-1",
             })
         );
     }

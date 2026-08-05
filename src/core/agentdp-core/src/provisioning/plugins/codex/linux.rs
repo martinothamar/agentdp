@@ -3,8 +3,6 @@ use crate::provisioning::bootstrap::ProvisioningBuilder;
 use crate::provisioning::guest_os::linux::shell;
 use agentdp_protocol::server_guest::BootstrapStepResource;
 
-const GUESTCTL_SKILL: &str = include_str!("../resources/guestctl-skill.md");
-
 pub(super) fn apply(plugin: &Codex, builder: &mut ProvisioningBuilder<'_>) {
     builder.require_mise_package("node@lts");
     let code_dir = builder.code_dir();
@@ -17,7 +15,6 @@ pub(super) fn apply(plugin: &Codex, builder: &mut ProvisioningBuilder<'_>) {
     );
     let mut config = shell::ShellScript::new();
     config.block(&trust_code_dir(code_dir));
-    config.block(&install_guestctl_skill());
     builder.add_instance_user_step(
         "plugin.codex.config",
         "Configure Codex",
@@ -97,13 +94,4 @@ fn enable_daemon_codex_session_management() -> String {
      Environment=AGENTDP_CODEX_SESSION=1\n\
      EOF"
     .to_owned()
-}
-
-fn install_guestctl_skill() -> String {
-    format!(
-        "install -d -m 0755 \"$HOME/.codex/skills/agentdp-guestctl\"\n\
-         cat >\"$HOME/.codex/skills/agentdp-guestctl/SKILL.md\" <<'EOF'\n\
-         {GUESTCTL_SKILL}\n\
-         EOF"
-    )
 }

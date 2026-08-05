@@ -29,8 +29,22 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum PrCommand {
-    Register { target: Option<String> },
-    Unregister { target: Option<String> },
+    Register {
+        target: Option<String>,
+    },
+    #[command(hide = true)]
+    RegisterAgentHost {
+        session: String,
+        url: String,
+    },
+    Unregister {
+        target: Option<String>,
+    },
+    #[command(hide = true)]
+    UnregisterAgentHost {
+        session: String,
+        url: String,
+    },
     List,
 }
 
@@ -71,7 +85,9 @@ async fn run_control_command(command: Command) -> Result<()> {
         Command::Ping => Request::Ping,
         Command::Pr { command } => match command {
             PrCommand::Register { target } => Request::PrRegister { target, cwd },
+            PrCommand::RegisterAgentHost { session, url } => Request::PrRegisterAgentHost { url, session },
             PrCommand::Unregister { target } => Request::PrUnregister { target, cwd },
+            PrCommand::UnregisterAgentHost { session, url } => Request::PrUnregisterAgentHost { url, session },
             PrCommand::List => Request::PrList,
         },
         Command::DockerCli(_) | Command::PodmanCli(_) => {

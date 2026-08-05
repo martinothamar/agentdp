@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -22,8 +21,8 @@ enum DeliveryState {
     Accepted,
 }
 
-pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], repo_paths: &[String]) -> Result<bool> {
-    if events.is_empty() || repo_paths.is_empty() {
+pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], target_session: &str) -> Result<bool> {
+    if events.is_empty() || target_session.is_empty() {
         return Ok(false);
     }
 
@@ -37,24 +36,17 @@ pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], repo_paths: &
     let marker = format!("<agentdp_delivery>{message_id}</agentdp_delivery>");
     let prompt = format!("{marker}\n{}", render_prompt(events));
 
-    let matching_sessions = sessions
-        .iter()
-        .filter(|session| session_covers_repositories(session, repo_paths))
-        .collect::<Vec<_>>();
-    let mut available = Vec::new();
-    for session in matching_sessions {
-        let (chat, snapshot) = client.default_chat(&session.resource).await?;
-        match delivery_state(&snapshot, &message_id, &marker) {
-            DeliveryState::Accepted => return Ok(true),
-            DeliveryState::Absent if session.status & SESSION_ARCHIVED == 0 => available.push(chat),
-            DeliveryState::Absent => {}
-        }
-    }
-
-    let [chat] = available.as_slice() else {
+    let Some(session) = sessions.iter().find(|session| session.resource == target_session) else {
         return Ok(false);
     };
-    client.queue_message(chat, &message_id, &prompt).await?;
+    if session.status & SESSION_ARCHIVED != 0 {
+        return Ok(false);
+    }
+    let (chat, snapshot) = client.default_chat(&session.resource).await?;
+    if delivery_state(&snapshot, &message_id, &marker) == DeliveryState::Accepted {
+        return Ok(true);
+    }
+    client.queue_message(&chat, &message_id, &prompt).await?;
     // Agent Host owns delivery after accepting the queued action. Waiting for
     // turn completion lets an overlapping user prompt erase the marker and
     // makes the next poll deliver the same event again.
@@ -65,19 +57,7 @@ pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], repo_paths: &
 #[serde(rename_all = "camelCase")]
 struct SessionSummary {
     resource: String,
-    provider: String,
     status: u64,
-    #[serde(default)]
-    working_directories: Vec<String>,
-}
-
-fn session_covers_repositories(session: &SessionSummary, repo_paths: &[String]) -> bool {
-    session.provider == "codex"
-        && repo_paths.iter().all(|repo| {
-            session.working_directories.iter().any(|directory| {
-                file_uri_path(directory).is_some_and(|working_directory| Path::new(repo).starts_with(working_directory))
-            })
-        })
 }
 
 fn delivery_state(subscription: &Value, message_id: &str, marker: &str) -> DeliveryState {
@@ -131,37 +111,6 @@ fn queued_message_outcome(message: &Value, chat: &str, message_id: &str, client_
                 Err(Error::Message(format!("Agent Host rejected queued message: {reason}")))
             }),
     )
-}
-
-fn file_uri_path(uri: &str) -> Option<PathBuf> {
-    let encoded = uri.strip_prefix("file://")?;
-    if !encoded.starts_with('/') {
-        return None;
-    }
-    let bytes = encoded.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            decoded.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        let high = hex_value(*bytes.get(index + 1)?)?;
-        let low = hex_value(*bytes.get(index + 2)?)?;
-        decoded.push((high << 4) | low);
-        index += 3;
-    }
-    String::from_utf8(decoded).ok().map(PathBuf::from)
-}
-
-const fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
 }
 
 type AgentHostWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -362,52 +311,14 @@ impl AhpClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DeliveryState, SessionSummary, delivery_state, file_uri_path, queue_pr_events, queued_message_outcome,
-        session_covers_repositories,
-    };
+    use super::{DeliveryState, delivery_state, queue_pr_events, queued_message_outcome};
     use crate::user::github_pr::PrEvent;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
-    use std::path::Path;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn session(resource: &str, status: u64, directories: &[&str]) -> SessionSummary {
-        SessionSummary {
-            resource: resource.to_owned(),
-            provider: "codex".to_owned(),
-            status,
-            working_directories: directories.iter().map(|value| (*value).to_owned()).collect(),
-        }
-    }
-
-    #[test]
-    fn matches_codex_sessions_covering_every_repository_including_archived_sessions() {
-        let repositories = [
-            "/data/home/code/altinn-studio".to_owned(),
-            "/data/home/code/app-lib-dotnet".to_owned(),
-        ];
-
-        assert!(session_covers_repositories(
-            &session("codex:/archived", 65, &["file:///data/home/code"]),
-            &repositories
-        ));
-        assert!(!session_covers_repositories(
-            &session("codex:/other", 1, &["file:///data/home/other"]),
-            &repositories
-        ));
-    }
-
-    #[test]
-    fn decodes_file_uri_paths_without_treating_prefixes_as_directories() {
-        let path = file_uri_path("file:///data/home/code/repo%20name");
-
-        assert_eq!(path.as_deref(), Some(Path::new("/data/home/code/repo name")));
-        assert!(!Path::new("/data/home/code-other").starts_with(Path::new("/data/home/code")));
-    }
 
     #[test]
     fn classifies_accepted_delivery_from_durable_chat_state() {
@@ -482,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_queue_action_completes_delivery() -> TestResult<()> {
+    async fn exact_session_registration_disambiguates_shared_workspaces() -> TestResult<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let server = tokio::spawn(serve_mock_agent_host(listener));
@@ -490,9 +401,8 @@ mod tests {
             id: "event-1".to_owned(),
             line: "pr=#1 event=review".to_owned(),
         }];
-        let repositories = ["/data/home/code/altinn-studio".to_owned()];
 
-        let delivered = queue_pr_events(&format!("ws://{address}"), &events, &repositories).await?;
+        let delivered = queue_pr_events(&format!("ws://{address}"), &events, "claude:/target").await?;
 
         assert!(delivered);
         server.await??;
@@ -553,12 +463,20 @@ mod tests {
             &mut socket,
             &list,
             json!({
-                "items": [{
-                    "resource": "codex:/target",
-                    "provider": "codex",
-                    "status": session_status,
-                    "workingDirectories": ["file:///data/home/code"]
-                }]
+                "items": [
+                    {
+                        "resource": "codex:/other",
+                        "provider": "codex",
+                        "status": 1,
+                        "workingDirectories": ["file:///data/home/code"]
+                    },
+                    {
+                        "resource": "claude:/target",
+                        "provider": "claude",
+                        "status": session_status,
+                        "workingDirectories": ["file:///data/home/code"]
+                    }
+                ]
             }),
         )
         .await?;
@@ -566,14 +484,14 @@ mod tests {
         let session_subscription = receive_json(&mut socket).await?;
         assert_eq!(
             session_subscription.pointer("/params/channel").and_then(Value::as_str),
-            Some("codex:/target")
+            Some("claude:/target")
         );
         send_result(
             &mut socket,
             &session_subscription,
             json!({
                 "snapshot": {
-                    "channel": "codex:/target",
+                    "channel": "claude:/target",
                     "serverSeq": 1,
                     "state": { "defaultChat": "ahp-chat://default/target" }
                 }

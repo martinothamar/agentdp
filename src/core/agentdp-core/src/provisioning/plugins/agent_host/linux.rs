@@ -152,6 +152,14 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         "description:f(970,null),default:\"high\",enum:[...bc]",
         "default the model picker to high reasoning effort",
     ),
+    // `_h` is this pinned bundle's currentSessionUri helper. Normalizing here
+    // matters because Copilot invokes server tools on a chat URI while Codex
+    // and Claude invoke them on their owning session URI.
+    (
+        "function PI(o){return[Yk,a1(o)]}",
+        r#"function PI(o){return[Yk,a1(o),{definitions:[{name:"agentdp_register_pr",title:"Register Pull Request",description:"Register a GitHub pull request for event notifications in this Agent Host session. Call this once after creating each pull request.",inputSchema:{type:"object",properties:{url:{type:"string",description:"Full GitHub pull request URL."}},required:["url"]},annotations:{readOnlyHint:!1,idempotentHint:!0}},{name:"agentdp_unregister_pr",title:"Unregister Pull Request",description:"Stop pull request event notifications previously registered by this Agent Host session.",inputSchema:{type:"object",properties:{url:{type:"string",description:"Full GitHub pull request URL."}},required:["url"]},annotations:{readOnlyHint:!1,idempotentHint:!0}}],execute(n,e,t,r){if(t!=="agentdp_register_pr"&&t!=="agentdp_unregister_pr")throw new Error(`Unknown AgentDP server tool: ${t}`);if(r===null||typeof r!=="object"||Array.isArray(r)||typeof r.url!=="string"||r.url.length===0)throw new Error(`${t} requires a pull request URL`);let i=t==="agentdp_register_pr"?"register-agent-host":"unregister-agent-host";return new Promise((s,a)=>{process.getBuiltinModule("child_process").execFile("/usr/local/bin/guestctl",["pr",i,_h(e).toString(),r.url],{encoding:"utf8",timeout:6e4},(l,c,d)=>{if(l){a(new Error((d.trim()||c.trim()||l.message)));return}s(c.trim()||r.url)})})}}]}"#,
+        "add session-bound AgentDP PR server tools",
+    ),
 ];
 
 fn render_service(user: &str, group: &str, agent_home: &str, code_dir: &str, guest_port: u16) -> String {
@@ -234,6 +242,9 @@ mod tests {
         assert!(script.contains("reject protected-resource bearer tokens"));
         assert!(script.contains("protectedResources:void 0"));
         assert!(script.contains("return{authenticated:!1}"));
+        assert!(script.contains("add session-bound AgentDP PR server tools"));
+        assert!(script.contains("agentdp_register_pr"));
+        assert!(script.contains("agentdp_unregister_pr"));
     }
 
     #[test]

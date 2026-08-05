@@ -37,8 +37,15 @@ impl ControlHandler {
                 let entry = self.github_pr.register(target.as_deref(), Path::new(&cwd)).await?;
                 Ok(Response::ok(entry.url))
             }
+            Request::PrRegisterAgentHost { url, session } => {
+                let entry = self.github_pr.register_agent_host(&url, &session).await?;
+                Ok(Response::ok(entry.url))
+            }
             Request::PrUnregister { target, cwd } => Ok(Response::ok(
                 self.github_pr.unregister(target.as_deref(), Path::new(&cwd)).await?,
+            )),
+            Request::PrUnregisterAgentHost { url, session } => Ok(Response::ok(
+                self.github_pr.unregister_agent_host(&url, &session).await?,
             )),
             Request::PrList => Ok(Response::with_prs(self.github_pr.list().await?)),
         }
