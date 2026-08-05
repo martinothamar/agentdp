@@ -1,7 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -28,7 +27,6 @@ pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], target_sessio
 
     let mut client = AhpClient::connect(url).await?;
     client.initialize().await?;
-    let sessions = client.list_sessions().await?;
     let mut event_ids = events.iter().map(|event| event.id.as_str()).collect::<Vec<_>>();
     event_ids.sort_unstable();
     event_ids.dedup();
@@ -36,13 +34,23 @@ pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], target_sessio
     let marker = format!("<agentdp_delivery>{message_id}</agentdp_delivery>");
     let prompt = format!("{marker}\n{}", render_prompt(events));
 
-    let Some(session) = sessions.iter().find(|session| session.resource == target_session) else {
-        return Ok(false);
-    };
-    if session.status & SESSION_ARCHIVED != 0 {
+    // Subscribing is AHP's restore path for an evicted session. Catalog listing
+    // is insufficient because a provider may temporarily expose the same
+    // durable thread under a different URI while its session alias is evicted.
+    let session = client.subscribe(target_session).await?;
+    let session_status = session
+        .pointer("/snapshot/state/status")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Error::Message(format!("Agent Host session {target_session} has no status")))?;
+    if session_status & SESSION_ARCHIVED != 0 {
         return Ok(false);
     }
-    let (chat, snapshot) = client.default_chat(&session.resource).await?;
+    let chat = session
+        .pointer("/snapshot/state/defaultChat")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Message(format!("Agent Host session {target_session} has no default chat")))?
+        .to_owned();
+    let snapshot = client.subscribe(&chat).await?;
     if delivery_state(&snapshot, &message_id, &marker) == DeliveryState::Accepted {
         return Ok(true);
     }
@@ -51,13 +59,6 @@ pub(super) async fn queue_pr_events(url: &str, events: &[PrEvent], target_sessio
     // turn completion lets an overlapping user prompt erase the marker and
     // makes the next poll deliver the same event again.
     Ok(true)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionSummary {
-    resource: String,
-    status: u64,
 }
 
 fn delivery_state(subscription: &Value, message_id: &str, marker: &str) -> DeliveryState {
@@ -158,35 +159,6 @@ impl AhpClient {
             )));
         }
         Ok(())
-    }
-
-    async fn list_sessions(&mut self) -> Result<Vec<SessionSummary>> {
-        let result = self
-            .call(
-                "listSessions",
-                json!({
-                    "channel": "ahp-root://"
-                }),
-            )
-            .await?;
-        serde_json::from_value(
-            result
-                .get("items")
-                .cloned()
-                .ok_or_else(|| Error::Message("Agent Host listSessions result omitted items".to_owned()))?,
-        )
-        .map_err(Error::from)
-    }
-
-    async fn default_chat(&mut self, session: &str) -> Result<(String, Value)> {
-        let result = self.subscribe(session).await?;
-        let chat = result
-            .pointer("/snapshot/state/defaultChat")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| Error::Message(format!("Agent Host session {session} has no default chat")))?;
-        let snapshot = self.subscribe(&chat).await?;
-        Ok((chat, snapshot))
     }
 
     async fn subscribe(&mut self, channel: &str) -> Result<Value> {
@@ -310,15 +282,186 @@ impl AhpClient {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{DeliveryState, delivery_state, queue_pr_events, queued_message_outcome};
-    use crate::user::github_pr::PrEvent;
+pub(super) mod test_support {
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
-    type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+    pub(crate) type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    pub(crate) async fn serve_missing_session(listener: &TcpListener, session: &str) -> TestResult<()> {
+        let (mut socket, _) = accept_initialized(listener).await?;
+        let subscription = receive_json(&mut socket).await?;
+        assert_method(&subscription, "subscribe");
+        assert_eq!(
+            subscription.pointer("/params/channel").and_then(Value::as_str),
+            Some(session)
+        );
+        let id = subscription
+            .get("id")
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("request omitted id"))?;
+        socket
+            .send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32004, "message": "session not found" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn serve_delivery_attempt(listener: &TcpListener, session: &str, status: u64) -> TestResult<()> {
+        let (mut socket, client_id) = accept_initialized(listener).await?;
+
+        let session_subscription = receive_json(&mut socket).await?;
+        assert_method(&session_subscription, "subscribe");
+        assert_eq!(
+            session_subscription.pointer("/params/channel").and_then(Value::as_str),
+            Some(session)
+        );
+        let chat = format!("ahp-chat://default/{}", session.replace([':', '/'], "-"));
+        let state = if status & super::SESSION_ARCHIVED == 0 {
+            json!({ "status": status, "defaultChat": chat })
+        } else {
+            json!({ "status": status })
+        };
+        send_result(
+            &mut socket,
+            &session_subscription,
+            json!({
+                "snapshot": {
+                    "channel": session,
+                    "serverSeq": 1,
+                    "state": state
+                }
+            }),
+        )
+        .await?;
+        if status & super::SESSION_ARCHIVED != 0 {
+            return Ok(());
+        }
+
+        let chat_subscription = receive_json(&mut socket).await?;
+        assert_method(&chat_subscription, "subscribe");
+        assert_eq!(
+            chat_subscription.pointer("/params/channel").and_then(Value::as_str),
+            Some(chat.as_str())
+        );
+        send_result(
+            &mut socket,
+            &chat_subscription,
+            json!({
+                "snapshot": {
+                    "channel": chat,
+                    "serverSeq": 2,
+                    "state": { "turns": [] }
+                }
+            }),
+        )
+        .await?;
+
+        let dispatch = receive_json(&mut socket).await?;
+        assert_eq!(dispatch.get("method").and_then(Value::as_str), Some("dispatchAction"));
+        assert_eq!(
+            dispatch.pointer("/params/action/type").and_then(Value::as_str),
+            Some("chat/pendingMessageSet")
+        );
+        assert_eq!(
+            dispatch.pointer("/params/action/kind").and_then(Value::as_str),
+            Some("queued")
+        );
+        assert!(
+            dispatch
+                .pointer("/params/action/message/text")
+                .and_then(Value::as_str)
+                .is_some_and(|prompt| prompt.contains("<agentdp_delivery>agentdp-pr-"))
+        );
+        let action = dispatch
+            .pointer("/params/action")
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("dispatch omitted action"))?;
+        socket
+            .send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "action",
+                    "params": {
+                        "channel": chat,
+                        "serverSeq": 3,
+                        "origin": { "clientId": client_id, "clientSeq": 1 },
+                        "action": action
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn accept_initialized(listener: &TcpListener) -> TestResult<(WebSocketStream<TcpStream>, String)> {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        let initialize = receive_json(&mut socket).await?;
+        let client_id = initialize
+            .pointer("/params/clientId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| std::io::Error::other("initialize omitted client ID"))?
+            .to_owned();
+        send_result(
+            &mut socket,
+            &initialize,
+            json!({ "protocolVersion": "0.7.0", "serverSeq": 0, "snapshots": [] }),
+        )
+        .await?;
+        Ok((socket, client_id))
+    }
+
+    async fn receive_json(socket: &mut WebSocketStream<TcpStream>) -> TestResult<Value> {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| std::io::Error::other("websocket closed"))??;
+            if let Message::Text(text) = message {
+                return Ok(serde_json::from_str(text.as_str())?);
+            }
+        }
+    }
+
+    fn assert_method(message: &Value, expected: &str) {
+        assert_eq!(message.get("method").and_then(Value::as_str), Some(expected));
+    }
+
+    async fn send_result(socket: &mut WebSocketStream<TcpStream>, request: &Value, result: Value) -> TestResult<()> {
+        let id = request
+            .get("id")
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("request omitted id"))?;
+        socket
+            .send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                    .to_string()
+                    .into(),
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{TestResult, serve_delivery_attempt};
+    use super::{DeliveryState, delivery_state, queue_pr_events, queued_message_outcome};
+    use crate::user::github_pr::PrEvent;
+    use serde_json::json;
+    use tokio::net::TcpListener;
 
     #[test]
     fn classifies_accepted_delivery_from_durable_chat_state() {
@@ -393,10 +536,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_session_registration_disambiguates_shared_workspaces() -> TestResult<()> {
+    async fn direct_session_subscription_restores_the_registered_session() -> TestResult<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = tokio::spawn(serve_mock_agent_host(listener));
+        let server = tokio::spawn(async move { serve_delivery_attempt(&listener, "claude:/target", 1).await });
         let events = [PrEvent {
             id: "event-1".to_owned(),
             line: "pr=#1 event=review".to_owned(),
@@ -409,169 +552,20 @@ mod tests {
         Ok(())
     }
 
-    async fn serve_mock_agent_host(listener: TcpListener) -> TestResult<()> {
-        let (mut socket, client_id) = subscribe_mock_client(&listener, 1, json!({ "turns": [] })).await?;
-        let dispatch = receive_json(&mut socket).await?;
-        assert_eq!(dispatch.get("method").and_then(Value::as_str), Some("dispatchAction"));
-        assert_eq!(
-            dispatch.pointer("/params/action/type").and_then(Value::as_str),
-            Some("chat/pendingMessageSet")
-        );
-        assert_eq!(
-            dispatch.pointer("/params/action/kind").and_then(Value::as_str),
-            Some("queued")
-        );
-        let action = dispatch
-            .pointer("/params/action")
-            .cloned()
-            .ok_or_else(|| std::io::Error::other("dispatch omitted action"))?;
-        let prompt = action
-            .pointer("/message/text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| std::io::Error::other("dispatch omitted prompt"))?
-            .to_owned();
-        assert!(prompt.contains("<agentdp_delivery>agentdp-pr-"));
-        send_action(&mut socket, &action, "another-client", 3).await?;
-        send_action(&mut socket, &action, &client_id, 4).await?;
-        Ok(())
-    }
+    #[tokio::test]
+    async fn archived_session_is_not_delivered_to() -> TestResult<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { serve_delivery_attempt(&listener, "claude:/archived", 65).await });
+        let events = [PrEvent {
+            id: "event-1".to_owned(),
+            line: "pr=#1 event=review".to_owned(),
+        }];
 
-    async fn subscribe_mock_client(
-        listener: &TcpListener,
-        session_status: u64,
-        chat_state: Value,
-    ) -> TestResult<(WebSocketStream<TcpStream>, String)> {
-        let (stream, _) = listener.accept().await?;
-        let mut socket = accept_async(stream).await?;
+        let delivered = queue_pr_events(&format!("ws://{address}"), &events, "claude:/archived").await?;
 
-        let initialize = receive_json(&mut socket).await?;
-        let client_id = initialize
-            .pointer("/params/clientId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| std::io::Error::other("initialize omitted client ID"))?
-            .to_owned();
-        send_result(
-            &mut socket,
-            &initialize,
-            json!({ "protocolVersion": "0.7.0", "serverSeq": 0, "snapshots": [] }),
-        )
-        .await?;
-
-        let list = receive_json(&mut socket).await?;
-        assert_eq!(list.get("method").and_then(Value::as_str), Some("listSessions"));
-        send_result(
-            &mut socket,
-            &list,
-            json!({
-                "items": [
-                    {
-                        "resource": "codex:/other",
-                        "provider": "codex",
-                        "status": 1,
-                        "workingDirectories": ["file:///data/home/code"]
-                    },
-                    {
-                        "resource": "claude:/target",
-                        "provider": "claude",
-                        "status": session_status,
-                        "workingDirectories": ["file:///data/home/code"]
-                    }
-                ]
-            }),
-        )
-        .await?;
-
-        let session_subscription = receive_json(&mut socket).await?;
-        assert_eq!(
-            session_subscription.pointer("/params/channel").and_then(Value::as_str),
-            Some("claude:/target")
-        );
-        send_result(
-            &mut socket,
-            &session_subscription,
-            json!({
-                "snapshot": {
-                    "channel": "claude:/target",
-                    "serverSeq": 1,
-                    "state": { "defaultChat": "ahp-chat://default/target" }
-                }
-            }),
-        )
-        .await?;
-
-        let chat_subscription = receive_json(&mut socket).await?;
-        assert_eq!(
-            chat_subscription.pointer("/params/channel").and_then(Value::as_str),
-            Some("ahp-chat://default/target")
-        );
-        send_result(
-            &mut socket,
-            &chat_subscription,
-            json!({
-                "snapshot": {
-                    "channel": "ahp-chat://default/target",
-                    "serverSeq": 2,
-                    "state": chat_state
-                }
-            }),
-        )
-        .await?;
-        Ok((socket, client_id))
-    }
-
-    async fn send_action(
-        socket: &mut WebSocketStream<TcpStream>,
-        action: &Value,
-        client_id: &str,
-        server_sequence: u64,
-    ) -> TestResult<()> {
-        socket
-            .send(Message::Text(
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "action",
-                    "params": {
-                        "channel": "ahp-chat://default/target",
-                        "serverSeq": server_sequence,
-                        "origin": { "clientId": client_id, "clientSeq": 1 },
-                        "action": action
-                    }
-                })
-                .to_string()
-                .into(),
-            ))
-            .await?;
-        Ok(())
-    }
-
-    async fn receive_json(socket: &mut WebSocketStream<TcpStream>) -> TestResult<Value> {
-        loop {
-            let message = socket
-                .next()
-                .await
-                .ok_or_else(|| std::io::Error::other("websocket closed"))??;
-            if let Message::Text(text) = message {
-                return Ok(serde_json::from_str(text.as_str())?);
-            }
-        }
-    }
-
-    async fn send_result(socket: &mut WebSocketStream<TcpStream>, request: &Value, result: Value) -> TestResult<()> {
-        let id = request
-            .get("id")
-            .cloned()
-            .ok_or_else(|| std::io::Error::other("request omitted id"))?;
-        socket
-            .send(Message::Text(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": result
-                })
-                .to_string()
-                .into(),
-            ))
-            .await?;
+        assert!(!delivered);
+        server.await??;
         Ok(())
     }
 }

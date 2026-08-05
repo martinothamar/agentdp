@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use agentdp_platform::command::run_capture;
 use agentdp_platform::fs::{files_with_extension, remove_file, write_atomic};
@@ -54,18 +55,18 @@ pub(crate) struct SeenEvents {
     pub events: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct PrEvent {
     pub id: String,
     pub line: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct QueuedEvents {
     url: String,
     delivery: PrDelivery,
     events: Vec<PrEvent>,
-    updated_at: String,
+    queued_at: String,
 }
 
 #[derive(Debug)]
@@ -75,6 +76,7 @@ pub(crate) struct GithubPrService {
     queue_dir: PathBuf,
     automation: Arc<AgentAutomation>,
     poll_seconds: u64,
+    seen_transaction: Mutex<()>,
 }
 
 impl GithubPrService {
@@ -85,6 +87,7 @@ impl GithubPrService {
             queue_dir: paths.queue_dir.clone(),
             automation,
             poll_seconds,
+            seen_transaction: Mutex::new(()),
         }
     }
 
@@ -211,13 +214,29 @@ impl GithubPrService {
     }
 
     pub(crate) async fn poll_once(&self) -> Result<()> {
-        if matches!(self.automation.as_ref(), AgentAutomation::AgentHost(_)) && !self.flush_queued_events().await? {
-            return Ok(());
+        // The queue is the write-ahead record for notification discovery.
+        // Reconcile it before polling so a crash after queue creation cannot
+        // make an outstanding event appear new again.
+        self.commit_queued_events_to_seen().await?;
+        let poll_result = self.poll_registered_prs().await;
+        let delivery_result = async {
+            self.commit_queued_events_to_seen().await?;
+            self.flush_queued_events().await
         }
+        .await;
+        match (poll_result, delivery_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(poll_error), Err(delivery_error)) => Err(Error::Message(format!(
+                "PR polling failed: {poll_error}; queued PR delivery also failed: {delivery_error}"
+            ))),
+        }
+    }
+
+    async fn poll_registered_prs(&self) -> Result<()> {
         for entry in self.read_registry().await?.prs {
             self.handle_pr(&entry).await?;
         }
-        self.flush_queued_events().await?;
         Ok(())
     }
 
@@ -227,7 +246,7 @@ impl GithubPrService {
         }
         let view = pr_view(&entry.url, None).await?;
         let events = pr_events(&view, &current_gh_login().await.unwrap_or_default());
-        let mut seen = self.read_seen().await?;
+        let seen = self.read_seen().await?;
         let new_events = events
             .into_iter()
             .filter(|event| !seen.events.contains(&event.id))
@@ -235,48 +254,66 @@ impl GithubPrService {
         if new_events.is_empty() {
             return Ok(());
         }
-        self.queue_events(entry, &new_events).await?;
-        for event in new_events {
-            seen.events.insert(event.id);
-        }
-        self.write_seen(&seen).await
+        self.queue_events(entry, &new_events).await
     }
 
     async fn mark_seen_events_at_registration(&self, url: &str) -> Result<()> {
         let view = pr_view(url, None).await?;
-        let mut seen = self.read_seen().await?;
-        for event in pr_events(&view, &current_gh_login().await.unwrap_or_default()) {
-            seen.events.insert(event.id);
-        }
-        self.write_seen(&seen).await
+        let event_ids = pr_events(&view, &current_gh_login().await.unwrap_or_default())
+            .into_iter()
+            .map(|event| event.id);
+        self.commit_seen_ids(event_ids).await
     }
 
     async fn queue_events(&self, entry: &PrEntry, events: &[PrEvent]) -> Result<()> {
-        let file = self.queue_dir.join(format!("{}.json", stable_hash_hex(&entry.url)));
-        let mut queue = read_json_file(&file).await?.unwrap_or_else(|| QueuedEvents {
-            url: entry.url.clone(),
-            delivery: entry.delivery.clone(),
-            events: Vec::new(),
-            updated_at: String::new(),
-        });
-        let mut by_id = queue
-            .events
-            .into_iter()
+        let events = events
+            .iter()
+            .cloned()
             .map(|event| (event.id.clone(), event))
-            .collect::<BTreeMap<_, _>>();
-        for event in events {
-            by_id.insert(event.id.clone(), event.clone());
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return Ok(());
         }
-        queue = QueuedEvents {
+        let event_ids = events.iter().map(|event| event.id.as_str()).collect::<Vec<_>>();
+        let identity = serde_json::to_string(&(&entry.url, &entry.delivery, event_ids))?;
+        let file = self.queue_dir.join(format!("{}.json", stable_hash_hex(&identity)));
+        let queue = QueuedEvents {
             url: entry.url.clone(),
             delivery: entry.delivery.clone(),
-            events: by_id.into_values().collect(),
-            updated_at: now_marker(),
+            events,
+            queued_at: now_marker(),
         };
-        write_json_atomic(&file, &queue, 0o600).await
+        if let Some(existing) = read_json_file::<QueuedEvents>(&file).await? {
+            if existing.url != queue.url || existing.delivery != queue.delivery || existing.events != queue.events {
+                return Err(Error::Message(format!(
+                    "PR event queue identity collision: {}",
+                    file.display()
+                )));
+            }
+            return Ok(());
+        }
+        write_json_atomic(&file, &queue, 0o600).await?;
+        match &entry.delivery {
+            PrDelivery::AgentHost { session } => eprintln!(
+                "guestd: queued {} PR event(s): url={} session={} queued_at_unix_ms={}",
+                queue.events.len(),
+                entry.url,
+                session,
+                queue.queued_at
+            ),
+            PrDelivery::Tmux => eprintln!(
+                "guestd: queued {} PR event(s): url={} delivery=tmux queued_at_unix_ms={}",
+                queue.events.len(),
+                entry.url,
+                queue.queued_at
+            ),
+        }
+        Ok(())
     }
 
-    async fn flush_queued_events(&self) -> Result<bool> {
+    async fn flush_queued_events(&self) -> Result<()> {
         match self.automation.as_ref() {
             AgentAutomation::AgentHost(url) => {
                 let mut files = json_files(&self.queue_dir).await?;
@@ -292,13 +329,36 @@ impl GithubPrService {
                                 queue.url
                             )));
                         };
-                        if !super::agent_host::queue_pr_events(url, &queue.events, session).await? {
-                            return Ok(false);
+                        match super::agent_host::queue_pr_events(url, &queue.events, session).await {
+                            Ok(true) => eprintln!(
+                                "guestd: delivered {} queued PR event(s): url={} session={} queued_at_unix_ms={}",
+                                queue.events.len(),
+                                queue.url,
+                                session,
+                                queue.queued_at
+                            ),
+                            Ok(false) => {
+                                eprintln!(
+                                    "guestd: deferred {} queued PR event(s): url={} session={} reason=session-archived queued_at_unix_ms={}",
+                                    queue.events.len(),
+                                    queue.url,
+                                    session,
+                                    queue.queued_at
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "guestd: PR event delivery failed: url={} session={} queued_at_unix_ms={}: {error}",
+                                    queue.url, session, queue.queued_at
+                                );
+                                continue;
+                            }
                         }
                     }
                     remove_file(&file).await?;
                 }
-                Ok(true)
+                Ok(())
             }
             AgentAutomation::Tmux(tmux) => {
                 let files = json_files(&self.queue_dir).await?;
@@ -315,18 +375,43 @@ impl GithubPrService {
                     }
                 }
                 if events.is_empty() {
-                    return Ok(false);
+                    return Ok(());
                 }
                 if !tmux.inject_pr_events_if_idle(&events).await? {
-                    return Ok(false);
+                    return Ok(());
                 }
                 for file in files {
                     remove_file(&file).await?;
                 }
-                Ok(true)
+                Ok(())
             }
-            AgentAutomation::Unavailable => Ok(false),
+            AgentAutomation::Unavailable => Ok(()),
         }
+    }
+
+    async fn commit_queued_events_to_seen(&self) -> Result<()> {
+        let files = json_files(&self.queue_dir).await?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut event_ids = Vec::new();
+        for file in files {
+            if let Some(queue) = read_json_file::<QueuedEvents>(&file).await? {
+                event_ids.extend(queue.events.into_iter().map(|event| event.id));
+            }
+        }
+        self.commit_seen_ids(event_ids).await
+    }
+
+    async fn commit_seen_ids(&self, event_ids: impl IntoIterator<Item = String>) -> Result<()> {
+        let _transaction = self.seen_transaction.lock().await;
+        let mut seen = self.read_seen().await?;
+        let previous_count = seen.events.len();
+        seen.events.extend(event_ids);
+        if seen.events.len() == previous_count {
+            return Ok(());
+        }
+        self.write_seen(&seen).await
     }
 
     async fn read_registry(&self) -> Result<PrRegistry> {
@@ -668,10 +753,16 @@ fn now_marker() -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
 
-    use super::{GithubPrService, PrEvent, QueuedEvents, compact_text, pr_events, stable_hash_hex, write_json_atomic};
+    use super::{
+        GithubPrService, PrDelivery, PrEvent, QueuedEvents, compact_text, pr_events, stable_hash_hex, write_json_atomic,
+    };
     use crate::user::AgentAutomation;
+    use crate::user::agent_host::test_support::{TestResult, serve_delivery_attempt, serve_missing_session};
 
     #[test]
     fn compact_text_removes_html_and_limits_length() {
@@ -717,7 +808,7 @@ mod tests {
                 url: "https://example.test/pr/1".to_owned(),
                 delivery: super::PrDelivery::Tmux,
                 events: Vec::new(),
-                updated_at: "1".to_owned(),
+                queued_at: "1".to_owned(),
             },
             0o600,
         )
@@ -733,7 +824,7 @@ mod tests {
                     id: "event-1".to_owned(),
                     line: "pr=#1 event=review".to_owned(),
                 }],
-                updated_at: "1".to_owned(),
+                queued_at: "1".to_owned(),
             },
             0o600,
         )
@@ -745,6 +836,7 @@ mod tests {
             queue_dir: queue_dir.clone(),
             automation: Arc::new(AgentAutomation::Unavailable),
             poll_seconds: 1,
+            seen_transaction: tokio::sync::Mutex::new(()),
         };
 
         service
@@ -760,6 +852,7 @@ mod tests {
             queue_dir,
             automation: Arc::new(AgentAutomation::Unavailable),
             poll_seconds: 1,
+            seen_transaction: tokio::sync::Mutex::new(()),
         };
         restarted
             .poll_once()
@@ -768,6 +861,273 @@ mod tests {
         assert!(empty_file.exists());
         assert!(pending_file.exists());
         tokio::fs::remove_dir_all(root).await.expect("remove test queue");
+    }
+
+    #[tokio::test]
+    async fn unavailable_agent_host_session_does_not_block_other_deliveries() {
+        let (root, service, listener) = agent_host_queue_test().await;
+        let deferred = service.queue_dir.join("a-deferred.json");
+        write_test_queue(&deferred, "https://example.test/pr/1", "claude:/archived").await;
+        let deliverable = service.queue_dir.join("b-deliverable.json");
+        write_test_queue(&deliverable, "https://example.test/pr/2", "claude:/available").await;
+        let server = tokio::spawn(async move {
+            serve_delivery_attempt(&listener, "claude:/archived", 65).await?;
+            serve_delivery_attempt(&listener, "claude:/available", 1).await?;
+            TestResult::Ok(())
+        });
+
+        service
+            .flush_queued_events()
+            .await
+            .expect("flush queued Agent Host events");
+
+        assert!(deferred.exists(), "the archived session's event must remain queued");
+        assert!(!deliverable.exists(), "a later deliverable event must not be blocked");
+        server
+            .await
+            .expect("join mock Agent Host")
+            .expect("serve mock Agent Host");
+        tokio::fs::remove_dir_all(root).await.expect("remove test queue");
+    }
+
+    #[tokio::test]
+    async fn failed_agent_host_session_does_not_block_other_deliveries() {
+        let (root, service, listener) = agent_host_queue_test().await;
+        let missing = service.queue_dir.join("a-missing.json");
+        write_test_queue(&missing, "https://example.test/pr/1", "claude:/missing").await;
+        let deliverable = service.queue_dir.join("b-deliverable.json");
+        write_test_queue(&deliverable, "https://example.test/pr/2", "claude:/available").await;
+        let server = tokio::spawn(async move {
+            serve_missing_session(&listener, "claude:/missing").await?;
+            serve_delivery_attempt(&listener, "claude:/available", 1).await?;
+            TestResult::Ok(())
+        });
+
+        service
+            .flush_queued_events()
+            .await
+            .expect("flush queued Agent Host events");
+
+        assert!(missing.exists(), "the failed delivery must remain queued");
+        assert!(!deliverable.exists(), "a later deliverable event must not be blocked");
+        server
+            .await
+            .expect("join mock Agent Host")
+            .expect("serve mock Agent Host");
+        tokio::fs::remove_dir_all(root).await.expect("remove test queue");
+    }
+
+    #[tokio::test]
+    async fn poll_attempts_each_queued_batch_once() {
+        let (root, service, listener) = agent_host_queue_test().await;
+        write_test_queue(
+            &service.queue_dir.join("archived.json"),
+            "https://example.test/pr/1",
+            "claude:/archived",
+        )
+        .await;
+        let server = tokio::spawn(async move {
+            let mut attempts = 0;
+            loop {
+                let Ok(attempt) = timeout(
+                    Duration::from_millis(100),
+                    serve_delivery_attempt(&listener, "claude:/archived", 65),
+                )
+                .await
+                else {
+                    break;
+                };
+                attempt?;
+                attempts += 1;
+            }
+            TestResult::Ok(attempts)
+        });
+
+        service.poll_once().await.expect("poll PR service");
+
+        assert_eq!(
+            server
+                .await
+                .expect("join mock Agent Host")
+                .expect("serve mock Agent Host"),
+            1
+        );
+        tokio::fs::remove_dir_all(root).await.expect("remove test queue");
+    }
+
+    #[tokio::test]
+    async fn queued_events_are_committed_before_delivery_when_polling_fails() {
+        let (root, service, listener) = agent_host_queue_test().await;
+        let queue = service.queue_dir.join("deliverable.json");
+        write_test_queue(&queue, "https://example.test/pr/1", "claude:/available").await;
+        write_json_atomic(&service.registry, &json!({ "version": 999, "prs": [] }), 0o600)
+            .await
+            .expect("write invalid registry version");
+        let server = tokio::spawn(async move { serve_delivery_attempt(&listener, "claude:/available", 1).await });
+
+        let error = service
+            .poll_once()
+            .await
+            .expect_err("polling must report the registry error");
+
+        assert!(error.to_string().contains("unsupported PR registry version"));
+        assert!(!queue.exists(), "the committed queue should still be delivered");
+        let seen = service.read_seen().await.expect("read seen events");
+        assert!(seen.events.contains("event-claude:/available"));
+        server
+            .await
+            .expect("join mock Agent Host")
+            .expect("serve mock Agent Host");
+        tokio::fs::remove_dir_all(root).await.expect("remove test queue");
+    }
+
+    #[tokio::test]
+    async fn concurrent_seen_transactions_preserve_both_updates() {
+        let root = test_root("seen-transactions");
+        let service = unavailable_service(&root);
+
+        tokio::try_join!(
+            service.commit_seen_ids(["event-1".to_owned()]),
+            service.commit_seen_ids(["event-2".to_owned()])
+        )
+        .expect("commit concurrent seen events");
+
+        let seen = service.read_seen().await.expect("read seen events");
+        assert_eq!(
+            seen.events,
+            BTreeSet::from(["event-1".to_owned(), "event-2".to_owned()])
+        );
+        tokio::fs::remove_dir_all(root).await.expect("remove test state");
+    }
+
+    #[tokio::test]
+    async fn lost_acknowledgement_does_not_merge_later_events_into_retry_batch() {
+        let root = test_root("immutable-batches");
+        let service = unavailable_service(&root);
+        tokio::fs::create_dir_all(&service.queue_dir)
+            .await
+            .expect("create test queue");
+        let entry = test_entry("https://example.test/pr/1", "claude:/target");
+        let first = PrEvent {
+            id: "event-1".to_owned(),
+            line: "event=review".to_owned(),
+        };
+        let second = PrEvent {
+            id: "event-2".to_owned(),
+            line: "event=merge".to_owned(),
+        };
+
+        // An ambiguous delivery failure leaves this first file in place.
+        service
+            .queue_events(&entry, std::slice::from_ref(&first))
+            .await
+            .expect("queue first batch");
+        service
+            .queue_events(&entry, std::slice::from_ref(&second))
+            .await
+            .expect("queue second batch");
+        let files = super::json_files(&service.queue_dir).await.expect("list queue files");
+
+        assert_eq!(
+            files.len(),
+            2,
+            "a later event must not mutate an outstanding delivery batch"
+        );
+        let first_file = files
+            .iter()
+            .find(|file| std::fs::read_to_string(file).expect("read queue").contains("event-1"))
+            .expect("find first batch");
+        let mut queued = super::read_json_file::<QueuedEvents>(first_file)
+            .await
+            .expect("read first batch")
+            .expect("first batch exists");
+        queued.queued_at = "original".to_owned();
+        write_json_atomic(first_file, &queued, 0o600)
+            .await
+            .expect("mark original timestamp");
+
+        service
+            .queue_events(&entry, &[first])
+            .await
+            .expect("queue first batch again");
+
+        let queued = super::read_json_file::<QueuedEvents>(first_file)
+            .await
+            .expect("read first batch")
+            .expect("first batch exists");
+        assert_eq!(queued.queued_at, "original", "an existing batch must not be rewritten");
+        tokio::fs::remove_dir_all(root).await.expect("remove test queue");
+    }
+
+    async fn agent_host_queue_test() -> (std::path::PathBuf, GithubPrService, TcpListener) {
+        let root = test_root("agent-host-queue");
+        let queue_dir = root.join("queue");
+        tokio::fs::create_dir_all(&queue_dir).await.expect("create test queue");
+        write_json_atomic(&root.join("registry.json"), &super::PrRegistry::default(), 0o600)
+            .await
+            .expect("write test registry");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock Agent Host");
+        let address = listener.local_addr().expect("read mock Agent Host address");
+        let service = GithubPrService {
+            registry: root.join("registry.json"),
+            seen: root.join("seen.json"),
+            queue_dir,
+            automation: Arc::new(AgentAutomation::AgentHost(format!("ws://{address}"))),
+            poll_seconds: 1,
+            seen_transaction: tokio::sync::Mutex::new(()),
+        };
+        (root, service, listener)
+    }
+
+    fn unavailable_service(root: &std::path::Path) -> GithubPrService {
+        GithubPrService {
+            registry: root.join("registry.json"),
+            seen: root.join("seen.json"),
+            queue_dir: root.join("queue"),
+            automation: Arc::new(AgentAutomation::Unavailable),
+            poll_seconds: 1,
+            seen_transaction: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn test_entry(url: &str, session: &str) -> super::PrEntry {
+        super::PrEntry {
+            number: 1,
+            url: url.to_owned(),
+            branch: Some("feature".to_owned()),
+            delivery: PrDelivery::AgentHost {
+                session: session.to_owned(),
+            },
+            registered_at: "1".to_owned(),
+        }
+    }
+
+    fn test_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentdp-pr-{label}-{}-{}",
+            std::process::id(),
+            super::now_marker()
+        ))
+    }
+
+    async fn write_test_queue(path: &std::path::Path, url: &str, session: &str) {
+        write_json_atomic(
+            path,
+            &QueuedEvents {
+                url: url.to_owned(),
+                delivery: PrDelivery::AgentHost {
+                    session: session.to_owned(),
+                },
+                events: vec![PrEvent {
+                    id: format!("event-{session}"),
+                    line: format!("url={url} event=review"),
+                }],
+                queued_at: "1".to_owned(),
+            },
+            0o600,
+        )
+        .await
+        .expect("write test queue");
     }
 
     #[test]
