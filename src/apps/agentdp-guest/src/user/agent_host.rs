@@ -9,7 +9,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use super::github_pr::{PrEvent, render_prompt, stable_hash_hex};
 use crate::{Error, Result};
 
-const AHP_PROTOCOL_VERSION: &str = "0.7.0";
+const AHP_PROTOCOL_VERSION: &str = "0.8.0";
 const AHP_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_ARCHIVED: u64 = 1 << 6;
 const QUEUE_MESSAGE_CLIENT_SEQUENCE: u64 = 1;
@@ -417,7 +417,7 @@ pub(super) mod test_support {
         send_result(
             &mut socket,
             &initialize,
-            json!({ "protocolVersion": "0.7.0", "serverSeq": 0, "snapshots": [] }),
+            json!({ "protocolVersion": "0.8.0", "serverSeq": 0, "snapshots": [] }),
         )
         .await?;
         Ok((socket, client_id))

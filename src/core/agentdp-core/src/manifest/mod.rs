@@ -2335,7 +2335,7 @@ spec:
     bootstrap: {}
     plugins:
       codex:
-        version: 0.146.0
+        version: 0.146.1
         session: none
         auth: mediated
       agent_host: {}

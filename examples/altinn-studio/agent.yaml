@@ -158,7 +158,7 @@ spec:
       codex:
         # Keep this pinned to a version verified with AgentDP's pinned Agent Host runtime.
         # Bump it only after the AHP integration smoke test passes.
-        version: 0.146.0
+        version: 0.146.1
         session: none
         yolo: true
         auth: mediated

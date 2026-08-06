@@ -148,7 +148,7 @@ spec:
     bootstrap: {}
     plugins:
       codex:
-        version: 0.146.0
+        version: 0.146.1
         session: none
         auth: mediated
       agent_host: {}
@@ -166,7 +166,7 @@ spec:
         assert!(!base.steps.iter().any(|step| step.id == "plugin.codex.session"));
         assert!(base.steps.iter().any(|step| {
             step.id == "plugin.codex.install"
-                && step.contents.contains("@openai/codex@0.146.0")
+                && step.contents.contains("@openai/codex@0.146.1")
                 && step.contents.contains("npm install --prefix")
                 && step.contents.contains("codex/node_modules/@openai/codex/bin/codex.js")
         }));
@@ -174,10 +174,10 @@ spec:
             step.id == "plugin.agent_host.install"
                 && step
                     .contents
-                    .contains("https://update.code.visualstudio.com/commit:9e200810")
+                    .contains("https://update.code.visualstudio.com/commit:780ea331")
                 && step
                     .contents
-                    .contains("88052267db310b0d5493e4f758b0f9606d2b3925c69caa371a1ace69560925f1")
+                    .contains("126cf3b0b7bccbc30b97d74446d29604f69fcf216f5ae4d24b117194bea2698f")
                 && step.contents.contains("expected exactly one patch location")
                 && step.contents.contains("inherit web_search from the guest Codex config")
                 && step

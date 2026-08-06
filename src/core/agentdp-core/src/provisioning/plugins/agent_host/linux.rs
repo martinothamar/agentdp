@@ -8,8 +8,8 @@ use crate::provisioning::guest_os::linux::{paths, shell};
 // When bumping this pin, update both values and verify every AGENT_HOST_PATCHES
 // entry against the new bundle.
 const PINNED_AGENT_HOST_URL: &str =
-    "https://update.code.visualstudio.com/commit:9e200810d9e54a5c66a50ba9538bd8b2545761b2/server-linux-x64/insider";
-const PINNED_AGENT_HOST_SHA256: &str = "88052267db310b0d5493e4f758b0f9606d2b3925c69caa371a1ace69560925f1";
+    "https://update.code.visualstudio.com/commit:780ea331b2861816fe6bb8215d812933c81df83b/server-linux-x64/insider";
+const PINNED_AGENT_HOST_SHA256: &str = "126cf3b0b7bccbc30b97d74446d29604f69fcf216f5ae4d24b117194bea2698f";
 
 pub(super) fn apply(builder: &mut ProvisioningBuilder<'_>) {
     let Some(guest_port) = builder.guest_port(SERVICE) else {
@@ -108,8 +108,8 @@ fn render_install() -> String {
 
 const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
     (
-        "g.registerProvider(h.createInstance(Ge)),lg(process.env[Gx],!0)&&(!r.isBuilt||Te.isAvailable(Zd))&&g.registerProvider(h.createInstance(mc)),",
-        "lg(process.env[Gx],!1)&&(!r.isBuilt||Te.isAvailable(Zd))&&g.registerProvider(h.createInstance(mc)),",
+        "f.registerProvider(h.createInstance(Qe)),Ug(process.env[tP],!0)&&(!o.isBuilt||ne.isAvailable(pc))&&f.registerProvider(h.createInstance(Ac)),",
+        "Ug(process.env[tP],!1)&&(!o.isBuilt||ne.isAvailable(pc))&&f.registerProvider(h.createInstance(Ac)),",
         "disable the bundled Copilot provider and default Claude provider",
     ),
     (
@@ -123,23 +123,23 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         "reject protected-resource bearer tokens",
     ),
     (
-        ",c={web_search:UL(r[\"codex.webSearchMode\"])??tr[\"codex.webSearchMode\"]},u=Object.keys(d);",
-        ",c={},u=Object.keys(d);",
+        ",u={web_search:AU(o[\"codex.webSearchMode\"])??co[\"codex.webSearchMode\"],...c.config},p=Object.keys(d);",
+        ",u={...c.config},p=Object.keys(d);",
         "inherit web_search from the guest Codex config",
     ),
     (
-        "var wv=[\"default\",\"auto-review\",\"full-access\"],Sc=\"default\";",
-        "var wv=[\"default\",\"auto-review\",\"full-access\"],Sc=\"full-access\";",
+        "var rS=[\"default\",\"auto-review\",\"full-access\"],Dc=\"default\";",
+        "var rS=[\"default\",\"auto-review\",\"full-access\"],Dc=\"full-access\";",
         "default new sessions to Full Access",
     ),
     (
-        "\"codex.permissionsPreset\":Sc,\"codex.approvalPolicy\":\"on-request\",\"codex.sandboxMode\":\"workspace-write\"",
-        "\"codex.permissionsPreset\":Sc,\"codex.approvalPolicy\":\"never\",\"codex.sandboxMode\":\"danger-full-access\"",
+        "\"codex.permissionsPreset\":Dc,\"codex.approvalPolicy\":\"on-request\",\"codex.sandboxMode\":\"workspace-write\"",
+        "\"codex.permissionsPreset\":Dc,\"codex.approvalPolicy\":\"never\",\"codex.sandboxMode\":\"danger-full-access\"",
         "default new sessions to unrestricted Codex permissions",
     ),
     (
-        "enumDescriptions:bc.map(o=>ca(o)??\"\"),default:\"medium\",sessionMutable:!0",
-        "enumDescriptions:bc.map(o=>ca(o)??\"\"),default:\"high\",sessionMutable:!0",
+        "enumDescriptions:Oc.map(r=>Ra(r)??\"\"),default:\"medium\",sessionMutable:!0",
+        "enumDescriptions:Oc.map(r=>Ra(r)??\"\"),default:\"high\",sessionMutable:!0",
         "advertise high as the default reasoning effort",
     ),
     (
@@ -148,16 +148,16 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         "resolve high as the default reasoning effort",
     ),
     (
-        "description:f(970,null),default:\"medium\",enum:[...bc]",
-        "description:f(970,null),default:\"high\",enum:[...bc]",
+        "description:g(973,null),default:\"medium\",enum:[...Oc]",
+        "description:g(973,null),default:\"high\",enum:[...Oc]",
         "default the model picker to high reasoning effort",
     ),
-    // `_h` is this pinned bundle's currentSessionUri helper. Normalizing here
-    // matters because Copilot invokes server tools on a chat URI while Codex
-    // and Claude invoke them on their owning session URI.
+    // `ae` is this pinned bundle's parseRequiredSessionUriFromChatUri helper.
+    // Normalizing here matters because providers may invoke server tools on a
+    // chat URI while guestctl stores the owning session URI.
     (
-        "function PI(o){return[Yk,a1(o)]}",
-        r#"function PI(o){return[Yk,a1(o),{definitions:[{name:"agentdp_register_pr",title:"Register Pull Request",description:"Register a GitHub pull request for event notifications in this Agent Host session. Call this once after creating each pull request.",inputSchema:{type:"object",properties:{url:{type:"string",description:"Full GitHub pull request URL."}},required:["url"]},annotations:{readOnlyHint:!1,idempotentHint:!0}},{name:"agentdp_unregister_pr",title:"Unregister Pull Request",description:"Stop pull request event notifications previously registered by this Agent Host session.",inputSchema:{type:"object",properties:{url:{type:"string",description:"Full GitHub pull request URL."}},required:["url"]},annotations:{readOnlyHint:!1,idempotentHint:!0}}],execute(n,e,t,r){if(t!=="agentdp_register_pr"&&t!=="agentdp_unregister_pr")throw new Error(`Unknown AgentDP server tool: ${t}`);if(r===null||typeof r!=="object"||Array.isArray(r)||typeof r.url!=="string"||r.url.length===0)throw new Error(`${t} requires a pull request URL`);let i=t==="agentdp_register_pr"?"register-agent-host":"unregister-agent-host";return new Promise((s,a)=>{process.getBuiltinModule("child_process").execFile("/usr/local/bin/guestctl",["pr",i,_h(e).toString(),r.url],{encoding:"utf8",timeout:6e4},(l,c,d)=>{if(l){a(new Error((d.trim()||c.trim()||l.message)));return}s(c.trim()||r.url)})})}}]}"#,
+        "function l_(r){return[v0,P0(r)]}",
+        r#"function l_(r){return[v0,P0(r),{definitions:[{name:"agentdp_register_pr",title:"Register Pull Request",description:"Register a GitHub pull request for event notifications in this Agent Host session. Call this once after creating each pull request.",inputSchema:{type:"object",properties:{url:{type:"string",description:"Full GitHub pull request URL."}},required:["url"]},annotations:{readOnlyHint:!1,idempotentHint:!0}},{name:"agentdp_unregister_pr",title:"Unregister Pull Request",description:"Stop pull request event notifications previously registered by this Agent Host session.",inputSchema:{type:"object",properties:{url:{type:"string",description:"Full GitHub pull request URL."}},required:["url"]},annotations:{readOnlyHint:!1,idempotentHint:!0}}],execute(n,e,t,r){if(t!=="agentdp_register_pr"&&t!=="agentdp_unregister_pr")throw new Error(`Unknown AgentDP server tool: ${t}`);if(r===null||typeof r!=="object"||Array.isArray(r)||typeof r.url!=="string"||r.url.length===0)throw new Error(`${t} requires a pull request URL`);let i=t==="agentdp_register_pr"?"register-agent-host":"unregister-agent-host",l=e.toString(),d=l.startsWith("ahp-chat:")?ae(l):l;return new Promise((s,a)=>{process.getBuiltinModule("child_process").execFile("/usr/local/bin/guestctl",["pr",i,d,r.url],{encoding:"utf8",timeout:6e4},(l,c,d)=>{if(l){a(new Error((d.trim()||c.trim()||l.message)));return}s(c.trim()||r.url)})})}}]}"#,
         "add session-bound AgentDP PR server tools",
     ),
 ];
