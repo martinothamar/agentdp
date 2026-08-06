@@ -21,6 +21,11 @@ are not advertised, and AHP bearer-token authentication is rejected. Codex,
 GitHub, and Studio credentials continue to use AgentDP's mediated guest
 credentials; desktop VS Code credentials are never forwarded into the VM.
 
+The `Altinn/altinn-studio` checkout uses the upstream repository directly so
+agents can push feature branches and use the pinned `gh stack` preview. GitHub
+branch protection remains authoritative for `main`. The other seeded Altinn
+repositories retain their fork-and-upstream layout.
+
 Agent Host provides session-bound tools for registering and unregistering pull
 requests. `guestd` stores the registering AHP session URI and delivers each
 queued event to that exact session, independent of the underlying harness.

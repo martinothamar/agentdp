@@ -77,7 +77,14 @@ The above was written 30. april 2024.
 
 ### Projects
 
-Main monorepo is Altinn/altinn-studio. You dont have write access on projects, so you have to fork and submit PRs.
+The main monorepo is `Altinn/altinn-studio`. You have Write access there for
+feature branches. Its `origin` is the Altinn repository; never push to `main`
+or protected release branches, and never merge pull requests. Existing branches
+that track the transitional `fork` remote must continue updating that fork until
+their existing pull requests are merged.
+
+You do not have Write access to the other projects. Use their existing fork and
+`upstream` remotes and submit cross-fork pull requests.
 Other relevant repos owned by Altinn Studio team:
 
 - altinn-studio-docs (source code for docs.altinn.studio, the docs site for the Altinn 3 platform)
@@ -109,7 +116,11 @@ Apps should be cloned to `/data/home/code/apps`.
 
 ### Development
 
-- Start branches/development from a clean slate; from main/master (if forked, make sure it is updated from upstream)
+- Start branches/development from a clean slate: `origin/main` for
+  `Altinn/altinn-studio`, or the current `upstream` main/master for forked
+  repositories
+- For new `Altinn/altinn-studio` work, push feature branches to `origin`. Never
+  push to `main` or a protected release branch, and never merge pull requests
 - Always do task work in a dedicated Git worktree under `/data/home/code/.worktrees/`; never edit in the primary repository checkout
   - Use one worktree per task, with a path such as `/data/home/code/.worktrees/<repo>-<task>`
   - Use primary checkouts only to sync remotes and create, inspect, or remove worktrees
@@ -170,15 +181,22 @@ IMPORTANT: this is how you must work on PRs:
   - Provide brower screenshots when frontend/web interface changes is involved
   - Provide command input and output history/transcript when CLI changes is involved 
 - Create PRs with `gh pr create`, then call the `agentdp_register_pr` tool with the full PR URL
-  - Example from a fork: `gh pr create --fill --repo Altinn/altinn-studio --base main --head martinothamar-agent:<branch-name>`
+  - For `Altinn/altinn-studio`: `gh pr create --fill --repo Altinn/altinn-studio --base main --head <branch-name>`
+  - For a forked repository, use `<owner>:<branch-name>` as the head
   - After a PR is registered, you will receive PR event notifications regarding failing CI, reviews and top-level PR comments
   - Do not manually poll or watch PR status after registration
+- When a change should be split into dependent PRs in `Altinn/altinn-studio`,
+  use the installed `gh stack` extension and its `gh-stack` skill. Keep every
+  stack branch in the same repository, submit the stack to `origin`, and call
+  `agentdp_register_pr` once for every created PR URL. The skill's generic
+  merge guidance does not apply here: never invoke `gh stack merge` or any
+  other merge command; maintainers merge the pull requests
 - Builds, tests and lints must pass before push
 - Once review comments have been received, make further changes in follow up commits only, so it is simple to keep track for reviewer
 - PRs should be focused on a single topic/item. If unrelated problems/items are discovered and need fixes, fix in separate PRs to main branch
 - When PRs get merged, start cleanup procedure
   - Call `agentdp_unregister_pr` with the full PR URL
-  - Sync the fork to upstream
+  - Sync the repository default branch with `sync-upstreams`
   - Remove the worktree
   - State that you are ready for new work
 
@@ -190,10 +208,11 @@ Example lifecycle:
 4. Check review comments
 5. Local commit per review comment fix
 6. Comment back for anything you dont agree on. @martinothamar has final say
-7. Rebase on latest and synced (upstream) main
+7. Rebase on the latest default branch from `origin` for direct repositories or
+   `upstream` for forked repositories
 8. Push any changes, then go to step 2 (wait for next iteration)
 9. PR gets merged
-10. Cleanup procedure (`agentdp_unregister_pr`, sync from upstream, cleanup worktree, state readiness)
+10. Cleanup procedure (`agentdp_unregister_pr`, sync the default branch, cleanup worktree, state readiness)
 
 
 ##### GitHub CLI Comments
@@ -252,7 +271,7 @@ Make sure to check for existing content there first.
 Find and create useful scripts in `/data/home/code/.scripts/`.
 
 ```sh
-# Sync main/master branches to upstreams:
+# Sync direct repositories from origin and forked repositories from upstream:
 ./sync-upstreams # All repos when no argument
 ./sync-upstreams altinn-studio
 ./sync-upstreams ../code/altinn-studio-docs /data/home/code/app-lib-dotnet

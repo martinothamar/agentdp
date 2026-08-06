@@ -79,8 +79,7 @@ spec:
         - ripgrep
   
       repos:
-        - url: https://github.com/martinothamar-agent/altinn-studio.git
-          upstream: https://github.com/Altinn/altinn-studio.git
+        - url: https://github.com/Altinn/altinn-studio.git
         - url: https://github.com/martinothamar-agent/altinn-studio-docs.git
           upstream: https://github.com/Altinn/altinn-studio-docs.git
         - url: https://github.com/martinothamar-agent/altinn-storage.git
@@ -97,6 +96,12 @@ spec:
           upstream: https://github.com/Altinn/altinn-file-scan.git
         - url: https://github.com/martinothamar-agent/altinn-receipt.git
           upstream: https://github.com/Altinn/altinn-receipt.git
+
+      shell:
+        # Keep the preview CLI and agent guidance on the same verified release.
+        - gh extension install github/gh-stack --pin v0.1.0 --force
+        - gh skill install github/gh-stack gh-stack --agent codex --scope user --pin v0.1.0 --force
+        - gh skill install github/gh-stack gh-stack --agent claude-code --scope user --pin v0.1.0 --force
   
     secrets:
       - env: STUDIO_DEV_API_KEY

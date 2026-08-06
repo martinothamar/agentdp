@@ -5,14 +5,14 @@ usage() {
   cat <<'EOF'
 Usage: sync-upstreams [options] [repo-or-path ...]
 
-Sync direct child git repositories in the code folder from upstream main/master.
+Sync direct child git repositories in the code folder from main/master.
 When repo-or-path arguments are provided, sync only those repositories.
 
 Default behavior:
   - scans only direct child directories of the code directory
-  - requires origin and upstream remotes
-  - prefers upstream/main, falls back to upstream/master
-  - fast-forwards origin/<main|master> to upstream/<main|master>
+  - fetches direct repositories from origin
+  - fetches forked repositories from upstream and syncs the fork's origin
+  - prefers main, falls back to master
   - fast-forwards the local branch too when it exists and the worktree is clean
   - skips divergent forks instead of rewriting history
 
@@ -137,39 +137,46 @@ sync_repo() {
   local name
   local branch=
   local checked_out_branch
-  local upstream_ref
+  local source_remote
+  local source_ref
   local origin_ref
   local local_branch_ref
   local push_args=()
+  local forked=false
 
   name="$(basename "$repo")"
   echo "==> $name"
 
-  if ! has_remote "$repo" origin || ! has_remote "$repo" upstream; then
-    echo "    skip: missing origin or upstream remote"
+  if ! has_remote "$repo" origin; then
+    echo "    skip: missing origin remote"
     skipped=$((skipped + 1))
     return
   fi
 
-  git -C "$repo" fetch --prune --quiet upstream || return 1
   git -C "$repo" fetch --prune --quiet origin || return 1
+  source_remote=origin
+  if has_remote "$repo" upstream; then
+    git -C "$repo" fetch --prune --quiet upstream || return 1
+    source_remote=upstream
+    forked=true
+  fi
 
-  if ref_exists "$repo" refs/remotes/upstream/main; then
+  if ref_exists "$repo" "refs/remotes/$source_remote/main"; then
     branch=main
-  elif ref_exists "$repo" refs/remotes/upstream/master; then
+  elif ref_exists "$repo" "refs/remotes/$source_remote/master"; then
     branch=master
   else
-    echo "    skip: upstream has neither main nor master"
+    echo "    skip: $source_remote has neither main nor master"
     skipped=$((skipped + 1))
     return
   fi
 
-  upstream_ref="refs/remotes/upstream/$branch"
+  source_ref="refs/remotes/$source_remote/$branch"
   origin_ref="refs/remotes/origin/$branch"
   local_branch_ref="refs/heads/$branch"
 
-  if ref_exists "$repo" "$origin_ref"; then
-    if ! is_ancestor "$repo" "$origin_ref" "$upstream_ref"; then
+  if [[ "$forked" == true ]] && ref_exists "$repo" "$origin_ref"; then
+    if ! is_ancestor "$repo" "$origin_ref" "$source_ref"; then
       if [[ "$force_with_lease" == true ]]; then
         push_args+=(--force-with-lease="refs/heads/$branch:$(git -C "$repo" rev-parse "$origin_ref")")
       else
@@ -183,32 +190,34 @@ sync_repo() {
   if ref_exists "$repo" "$local_branch_ref"; then
     checked_out_branch="$(current_branch "$repo")"
     if [[ "$include_dirty_local" == true ]] || ! is_dirty "$repo"; then
-      if is_ancestor "$repo" "$local_branch_ref" "$upstream_ref"; then
+      if is_ancestor "$repo" "$local_branch_ref" "$source_ref"; then
         if [[ "$dry_run" == true ]]; then
-          echo "    dry-run: local $branch -> upstream/$branch"
+          echo "    dry-run: local $branch -> $source_remote/$branch"
         else
           if [[ "$checked_out_branch" == "$branch" ]]; then
-            git -C "$repo" merge --ff-only "$upstream_ref" >/dev/null || return 1
+            git -C "$repo" merge --ff-only "$source_ref" >/dev/null || return 1
           else
-            git -C "$repo" branch --force "$branch" "$upstream_ref" >/dev/null || return 1
+            git -C "$repo" branch --force "$branch" "$source_ref" >/dev/null || return 1
           fi
-          echo "    local $branch -> upstream/$branch"
+          echo "    local $branch -> $source_remote/$branch"
         fi
       else
-        echo "    local $branch not moved: it has commits not in upstream/$branch"
+        echo "    local $branch not moved: it has commits not in $source_remote/$branch"
       fi
     else
       echo "    local $branch not moved: dirty worktree"
     fi
   fi
 
-  if [[ "$dry_run" == true ]]; then
-    echo "    dry-run: git push origin $upstream_ref:refs/heads/$branch"
-  else
-    git -C "$repo" push "${push_args[@]}" origin "$upstream_ref:refs/heads/$branch" || return 1
+  if [[ "$forked" == true ]]; then
+    if [[ "$dry_run" == true ]]; then
+      echo "    dry-run: git push origin $source_ref:refs/heads/$branch"
+    else
+      git -C "$repo" push "${push_args[@]}" origin "$source_ref:refs/heads/$branch" || return 1
+    fi
   fi
 
-  echo "    synced $branch"
+  echo "    synced $branch from $source_remote"
   ok=$((ok + 1))
 }
 
