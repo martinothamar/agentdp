@@ -163,6 +163,12 @@ impl Http1Filter {
         while let Some(boundary) = header_boundary(&self.pending) {
             let body_offset = boundary + b"\r\n\r\n".len();
             let headers = &self.pending[..body_offset];
+            if is_github_workflow_dispatch_request(headers, self.host.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "GitHub workflow dispatch is blocked by AgentDP network policy",
+                ));
+            }
             let response_request = response_request(headers);
             let secret_mode = if request_authority_matches(&self.pending[..body_offset], self.host.as_str()) {
                 SecretMode::Substitute
@@ -864,6 +870,125 @@ fn request_authority_matches(headers: &[u8], expected_host: &str) -> bool {
         .is_some_and(|host| host == expected_host)
 }
 
+fn is_github_workflow_dispatch_request(headers: &[u8], connection_host: &str) -> bool {
+    // This guard intentionally covers AgentDP's current HTTP/1.x mediation path. HTTP/2 or HTTP/3
+    // support must enforce the same restriction before either protocol is enabled for intercepted traffic.
+    // The intercepted SNI is authoritative here. Unrelated malformed or duplicate headers must not disable the deny.
+    if normalize_host(connection_host) != "api.github.com" {
+        return false;
+    }
+    let mut line_start = 0;
+    let request_line = loop {
+        let Some(line_len) = headers[line_start..].iter().position(|byte| *byte == b'\n') else {
+            return false;
+        };
+        let line_end = line_start + line_len;
+        let line = &headers[line_start..line_end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line_start = line_end + 1;
+        if !line.is_empty() {
+            break line;
+        }
+    };
+    let mut parts = request_line
+        .split(u8::is_ascii_whitespace)
+        .filter(|part| !part.is_empty());
+    let (Some(method), Some(target), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if !method.eq_ignore_ascii_case(b"POST") || !matches!(version, b"HTTP/1.0" | b"HTTP/1.1") {
+        return false;
+    }
+    let Some(path) = request_target_path(target) else {
+        return false;
+    };
+    let path_end = path
+        .iter()
+        .position(|byte| matches!(byte, b'?' | b'#'))
+        .unwrap_or(path.len());
+    let mut segments = path[..path_end].split(|byte| *byte == b'/');
+    let (
+        Some(root),
+        Some(repos),
+        Some(owner),
+        Some(repo),
+        Some(actions),
+        Some(workflows),
+        Some(workflow_id),
+        Some(dispatches),
+        None,
+    ) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    )
+    else {
+        return false;
+    };
+    root.is_empty()
+        && percent_decoded_eq(repos, b"repos")
+        && !owner.is_empty()
+        && !repo.is_empty()
+        && percent_decoded_eq(actions, b"actions")
+        && percent_decoded_eq(workflows, b"workflows")
+        && !workflow_id.is_empty()
+        && percent_decoded_eq(dispatches, b"dispatches")
+}
+
+fn request_target_path(target: &[u8]) -> Option<&[u8]> {
+    if target.starts_with(b"/") {
+        return Some(target);
+    }
+    let scheme_end = target.windows(3).position(|window| window == b"://")?;
+    let rest = &target[scheme_end + 3..];
+    match rest.iter().position(|byte| matches!(byte, b'/' | b'?' | b'#')) {
+        Some(index) if rest[index] == b'/' => Some(&rest[index..]),
+        Some(_) | None => Some(b"/"),
+    }
+}
+
+fn percent_decoded_eq(input: &[u8], expected: &[u8]) -> bool {
+    let mut index = 0;
+    let mut expected = expected.iter();
+    while index < input.len() {
+        let (byte, consumed) = if input[index] == b'%' {
+            let Some(high) = input.get(index + 1).and_then(|byte| hex_value(*byte)) else {
+                return false;
+            };
+            let Some(low) = input.get(index + 2).and_then(|byte| hex_value(*byte)) else {
+                return false;
+            };
+            ((high << 4) | low, 3)
+        } else {
+            (input[index], 1)
+        };
+        if expected
+            .next()
+            .is_none_or(|expected| !byte.eq_ignore_ascii_case(expected))
+        {
+            return false;
+        }
+        index += consumed;
+    }
+    expected.next().is_none()
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn valid_http_token(token: &str) -> bool {
     !token.is_empty()
         && token.bytes().all(|byte| {
@@ -930,13 +1055,13 @@ fn normalize_host(host: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::RuntimeSecrets;
     use crate::buffers::BufferPool;
+    use crate::{RuntimeSecret, RuntimeSecrets};
 
     use super::{
         Http1Filter, Http1ResponseEof, Http1ResponseRequest, Http1ResponseTracker, MAX_BUFFERED_HTTP_HEADERS,
-        content_length, is_chunked, is_expect_continue, is_grpc_request, is_websocket_upgrade_request,
-        looks_like_http1, request_authority_matches,
+        content_length, is_chunked, is_expect_continue, is_github_workflow_dispatch_request, is_grpc_request,
+        is_websocket_upgrade_request, looks_like_http1, request_authority_matches,
     };
 
     #[test]
@@ -985,6 +1110,94 @@ mod tests {
             b"GET /path HTTP/1.1\r\nHost: allowed.test\r\nHost: duplicate.test\r\n\r\n",
             "allowed.test"
         ));
+    }
+
+    #[test]
+    fn identifies_github_workflow_dispatch_requests() {
+        assert!(is_github_workflow_dispatch_request(
+            b"POST /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            "api.github.com",
+        ));
+        assert!(is_github_workflow_dispatch_request(
+            b"POST https://api.github.com/repos/Altinn/altinn-studio/%61ctions/workflows/.github%2Fworkflows%2Frelease.yml/dispatches?ref=main HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            "API.GITHUB.COM.",
+        ));
+    }
+
+    #[test]
+    fn does_not_identify_nearby_github_requests_as_workflow_dispatches() {
+        for request in [
+            b"GET /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\r\nHost: api.github.com\r\n\r\n".as_slice(),
+            b"POST /repos/Altinn/altinn-studio/actions/runs/123/rerun HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            b"POST /repos/Altinn/altinn-studio/actions/workflows/release.yml/metadata/dispatches HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+        ] {
+            assert!(!is_github_workflow_dispatch_request(request, "api.github.com"));
+        }
+        assert!(!is_github_workflow_dispatch_request(
+            b"POST /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            "github.example.com",
+        ));
+    }
+
+    #[test]
+    fn blocks_github_workflow_dispatch_before_forwarding_request_bytes() {
+        let buffers = BufferPool::default();
+        buffers.prewarm_instance_network();
+        for (request, secrets) in [
+            (
+                b"POST /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 100\r\n\r\n".as_slice(),
+                RuntimeSecrets::new(),
+            ),
+            (
+                b"POST /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\r\nHost: api.github.com\r\nHost: api.github.com\r\n\r\n",
+                RuntimeSecrets::new(),
+            ),
+            (
+                b"POST /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\r\nHost: api.github.com\r\nX-Review: \xff\r\n\r\n",
+                RuntimeSecrets::new(),
+            ),
+            (
+                b"\r\nPOST /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+                RuntimeSecrets::new(),
+            ),
+            (
+                b"\n\nPOST /repos/Altinn/altinn-studio/actions/workflows/release.yml/dispatches HTTP/1.1\nHost: api.github.com\r\nAuthorization: Bearer AGENTDP_SECRET_TOKEN\r\n\r\n",
+                github_secrets(),
+            ),
+        ] {
+            let mut filter = Http1Filter::new(secrets, "api.github.com".to_owned(), &buffers);
+            let mut output = Vec::new();
+            let error = filter
+                .push(request, &mut output)
+                .expect_err("workflow dispatch should be blocked as soon as its headers are complete");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("workflow dispatch"));
+            assert!(output.is_empty());
+        }
+    }
+
+    fn github_secrets() -> RuntimeSecrets {
+        let mut secrets = RuntimeSecrets::new();
+        secrets.insert(RuntimeSecret::new(
+            "AGENTDP_SECRET_TOKEN",
+            "host-secret",
+            ["api.github.com".to_owned()],
+        ));
+        secrets
+    }
+
+    #[test]
+    fn forwards_other_github_api_requests_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+        let buffers = BufferPool::default();
+        buffers.prewarm_instance_network();
+        let mut filter = Http1Filter::new(RuntimeSecrets::new(), "api.github.com".to_owned(), &buffers);
+        let request = b"POST /repos/Altinn/altinn-studio/actions/runs/123/rerun HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 0\r\n\r\n";
+        let mut output = Vec::new();
+
+        assert!(filter.push(request, &mut output)?);
+        assert_eq!(output, request);
+        Ok(())
     }
 
     #[test]
