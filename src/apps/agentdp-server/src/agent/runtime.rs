@@ -12,13 +12,14 @@ use std::time::Duration;
 use agentdp_core::Context;
 use agentdp_core::agent::{
     AgentBaseKey, AgentDocument, AgentEvent, AgentEventEnvelope, AgentEventSource, AgentInstanceBootstrapState,
-    AgentInstanceBootstrapWorkPhase, AgentInstanceBootstrapWorkStatus, AgentInstanceDocument, AgentInstanceEvent,
-    AgentInstanceEventEnvelope, AgentInstanceEventSource, AgentInstanceId, AgentInstanceNetworkEvent,
-    AgentInstanceNetworkEventKind, AgentInstanceNetworkStatus, AgentInstancePhase, AgentInstanceSessionsWorkStatus,
-    AgentInstanceTarget, AgentInstanceTransitionKind, AgentInstanceTransitionWorkStatus, AgentInstanceWorkStatus,
-    AgentName, BackendState, BootstrapEvent, EventLevel, InstanceName, NetworkAllowState, NetworkIpv6State,
-    NetworkState, OperationResult, PortMappingState, PortRequestError, ReadinessResult, ReadinessState, ServiceStatus,
-    SessionKind, SessionResultSummary, TailscaleServeState, assign_port_mappings,
+    AgentInstanceBootstrapWorkPhase, AgentInstanceBootstrapWorkStatus, AgentInstanceCredentialPhase,
+    AgentInstanceDocument, AgentInstanceEvent, AgentInstanceEventEnvelope, AgentInstanceEventSource, AgentInstanceId,
+    AgentInstanceNetworkEvent, AgentInstanceNetworkEventKind, AgentInstanceNetworkStatus, AgentInstancePhase,
+    AgentInstanceSessionsWorkStatus, AgentInstanceTarget, AgentInstanceTransitionKind,
+    AgentInstanceTransitionWorkStatus, AgentInstanceWorkStatus, AgentName, BackendState, BootstrapEvent, EventLevel,
+    InstanceName, NetworkAllowState, NetworkIpv6State, NetworkState, OperationResult, PortMappingState,
+    PortRequestError, ReadinessResult, ReadinessState, ServiceStatus, SessionKind, SessionResultSummary,
+    TailscaleServeState, assign_port_mappings,
 };
 use agentdp_core::manifest::{AgentPhase, ValidationErrors};
 use agentdp_core::provisioning::bootstrap::BootstrapGraphError;
@@ -53,6 +54,7 @@ const INPUT_CAPACITY: usize = 256;
 const RECENT_EVENT_CAPACITY: usize = 128;
 const AGENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const HOST_INPUT_RECONCILE_INTERVAL: Duration = Duration::from_mins(15);
+const HOST_CREDENTIAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const HOST_INPUT_RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(15);
 const HOST_INPUT_RECONCILE_RETRY_MAX_DELAY: Duration = Duration::from_mins(5);
 const INSTANCE_CREATE_RETRY_DELAY: Duration = Duration::from_secs(15);
@@ -2142,12 +2144,21 @@ impl RunningAgentState {
             }
             match outcome.result {
                 Ok(output) => {
+                    let credentials_ready = output
+                        .credentials
+                        .values()
+                        .all(|credential| credential.phase == AgentInstanceCredentialPhase::Ready);
                     instance.documents.private.status.backend = outcome.backend;
                     instance.documents.private.status.host_inputs.credentials = output.credentials;
                     instance.runtime_repair = RuntimeRepairState::Idle;
                     instance.secret_host_files = Some(output.secret_files);
                     instance.runtime_secrets.failure_count = 0;
-                    instance.runtime_secrets.next_at = Instant::now() + HOST_INPUT_RECONCILE_INTERVAL;
+                    instance.runtime_secrets.next_at = Instant::now()
+                        + if credentials_ready {
+                            HOST_INPUT_RECONCILE_INTERVAL
+                        } else {
+                            HOST_CREDENTIAL_RECOVERY_INTERVAL
+                        };
                     instance.host_inputs.next_at = Instant::now();
                 }
                 Err(error) => {

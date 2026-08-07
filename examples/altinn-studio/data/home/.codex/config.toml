@@ -3,53 +3,6 @@ model_reasoning_effort = "xhigh"
 model_verbosity = "low"
 web_search = "cached"
 
-# These are VS Code/Copilot authoring helpers injected into Agent Host
-# sessions. Altinn development does not use them, so keep them out of the
-# model-visible skill catalog while preserving all guest and project skills.
-[[skills.config]]
-name = "agent-customization"
-enabled = false
-
-[[skills.config]]
-name = "chronicle"
-enabled = false
-
-[[skills.config]]
-name = "create-agent"
-enabled = false
-
-[[skills.config]]
-name = "create-hook"
-enabled = false
-
-[[skills.config]]
-name = "create-instructions"
-enabled = false
-
-[[skills.config]]
-name = "create-prompt"
-enabled = false
-
-[[skills.config]]
-name = "create-skill"
-enabled = false
-
-[[skills.config]]
-name = "get-search-view-results"
-enabled = false
-
-[[skills.config]]
-name = "init"
-enabled = false
-
-[[skills.config]]
-name = "project-setup-info-local"
-enabled = false
-
-[[skills.config]]
-name = "troubleshoot"
-enabled = false
-
 [features]
 multi_agent_v2 = true
 

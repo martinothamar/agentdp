@@ -286,6 +286,55 @@ async fn credential_health_from_runtime_reconcile_is_persisted() {
 }
 
 #[tokio::test(flavor = "local")]
+async fn unhealthy_credentials_are_rechecked_without_the_steady_state_delay() {
+    let manifest = manifest_with_codex_mediated_auth(1);
+    let backend = Rc::new(FakeBackend::default());
+    backend.set_runtime_credentials(std::collections::BTreeMap::from([(
+        "codex".to_owned(),
+        AgentInstanceCredentialState {
+            phase: AgentInstanceCredentialPhase::Expired,
+            expires_at_unix_seconds: Some(1_000),
+            last_refresh_at: None,
+            last_error: Some("sign in again on the host".to_owned()),
+        },
+    )]));
+    let agent_backend: backend::BackendRef = backend.clone();
+    let (layout, agent_name) = unique_layout(&manifest);
+    let agent = Agent::spawn(Context::quiet(), agent_name, layout, agent_backend, tailscale_service());
+    let mut stream = watch(&agent).await;
+
+    apply(&agent, manifest_context(manifest)).await;
+    wait_for_count(&backend.runtime_secret_reconciles, 1, "expired credential observation").await;
+    backend.set_runtime_credentials(std::collections::BTreeMap::from([(
+        "codex".to_owned(),
+        AgentInstanceCredentialState {
+            phase: AgentInstanceCredentialPhase::Ready,
+            expires_at_unix_seconds: Some(4_102_444_800),
+            last_refresh_at: Some("2026-08-07T06:21:53Z".to_owned()),
+            last_error: None,
+        },
+    )]));
+
+    wait_for_count(&backend.runtime_secret_reconciles, 2, "credential recovery observation").await;
+    let recovered = wait_for_document(&mut stream, |document| {
+        document
+            .status
+            .instances
+            .get(&AgentInstanceId::new(0))
+            .and_then(|instance| instance.host_inputs.credentials.get("codex"))
+            .is_some_and(|credential| credential.phase == AgentInstanceCredentialPhase::Ready)
+    })
+    .await;
+    assert_eq!(
+        recovered.status.instances[&AgentInstanceId::new(0)]
+            .host_inputs
+            .credentials["codex"]
+            .phase,
+        AgentInstanceCredentialPhase::Ready
+    );
+}
+
+#[tokio::test(flavor = "local")]
 async fn backend_state_reconcile_waits_for_runtime_secrets() {
     let manifest = manifest_with_codex_mediated_auth(1);
     let (layout, agent_name) = unique_layout(&manifest);

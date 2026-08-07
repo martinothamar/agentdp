@@ -122,6 +122,14 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         r"async authenticate(n,e){return{authenticated:!1};this._logService.trace(`[AgentHostAuthenticationService] authenticate called: resource=${n.resource}`);",
         "reject protected-resource bearer tokens",
     ),
+    // The desktop pushes its own general-purpose skills and MCP servers into
+    // every remote session. AgentDP guests own their customization surface, so
+    // do not import that overlapping, host-specific context into Codex.
+    (
+        "async _syncClientCustomizations(e,t,o,i){let s=this._sessions.get(P.id(e));if(!s)return;",
+        "async _syncClientCustomizations(e,t,o,i){return;",
+        "ignore client-pushed customizations",
+    ),
     // This Agent Host version only schedules model refreshes after a turn starts.
     // AgentDP uses Codex's OpenAI account directly, so no Copilot authentication
     // event primes the initial catalog; refresh it when Codex is constructed.
@@ -129,6 +137,14 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         "this._queueProviderConfigurationWrite()})),this._refreshProviderConfiguration()}",
         "this._queueProviderConfigurationWrite()})),this._refreshProviderConfiguration(),this._queueModelRefresh()}",
         "populate the initial Codex model catalog",
+    ),
+    // Reconnect replay restores session actions but does not carry the root
+    // model catalog. Always return the already-collected subscription snapshots
+    // so a desktop cannot retain an old or empty model pool after reconnecting.
+    (
+        r#"if(this._reconcileActiveClientsAfterReconnect(e),o){let a=[];for(let l of this._replayBuffer)l.serverSeq>t.lastSeenServerSeq&&this._isRelevantToClient(e,l)&&a.push(l);return{type:"replay",actions:a,missing:i}}return{type:"snapshot",snapshots:s.filter(a=>a!==void 0)}"#,
+        r#"this._reconcileActiveClientsAfterReconnect(e);return{type:"snapshot",snapshots:s.filter(a=>a!==void 0)}"#,
+        "restore authoritative state snapshots after reconnect",
     ),
     // The Agents window contributes a large direct tool set. Keep the two
     // editor navigation tools and AgentDP's PR tools direct; expose the host's
@@ -142,14 +158,6 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         "if(i&&e.namespace===null&&i.toolNames.includes(e.tool))",
         r#"if(i&&(e.namespace===null||e.namespace==="agent_host")&&i.toolNames.includes(e.tool))"#,
         "route deferred Agent Host tools",
-    ),
-    // VS Code syncs its built-in GitHub MCP server as a client plugin. The
-    // guest already has gh plus AgentDP's session-bound PR tools, so omit that
-    // overlapping server while leaving every other client MCP untouched.
-    (
-        "for(let e of r)for(let t of e.parsed?.mcpServers??iK)Object.prototype.hasOwnProperty.call(n,t.name)||(n[t.name]=vw(t.configuration));return n}",
-        r#"for(let e of r)for(let t of e.parsed?.mcpServers??iK){if(t.name.toLowerCase()==="github")continue;Object.prototype.hasOwnProperty.call(n,t.name)||(n[t.name]=vw(t.configuration))}return n}"#,
-        "omit the VS Code GitHub MCP server",
     ),
     (
         ",u={web_search:AU(o[\"codex.webSearchMode\"])??co[\"codex.webSearchMode\"],...c.config},p=Object.keys(d);",
@@ -273,11 +281,13 @@ mod tests {
         assert!(script.contains("return{authenticated:!1}"));
         assert!(script.contains("populate the initial Codex model catalog"));
         assert!(script.contains("this._refreshProviderConfiguration(),this._queueModelRefresh()"));
+        assert!(script.contains("restore authoritative state snapshots after reconnect"));
+        assert!(script.contains("this._reconcileActiveClientsAfterReconnect(e);return{type:\"snapshot\""));
         assert!(script.contains("prune and defer Agent Host tools"));
         assert!(script.contains("deferLoading:!0"));
         assert!(script.contains("route deferred Agent Host tools"));
-        assert!(script.contains("omit the VS Code GitHub MCP server"));
-        assert!(script.contains("t.name.toLowerCase()"));
+        assert!(script.contains("ignore client-pushed customizations"));
+        assert!(script.contains("async _syncClientCustomizations(e,t,o,i){return;"));
         assert!(script.contains("add session-bound AgentDP PR server tools"));
         assert!(script.contains("agentdp_register_pr"));
         assert!(script.contains("agentdp_unregister_pr"));

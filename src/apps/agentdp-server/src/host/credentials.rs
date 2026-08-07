@@ -25,7 +25,7 @@ const REFRESH_WINDOW: Duration = Duration::from_hours(1);
 const OPAQUE_TOKEN_REFRESH_AGE: Duration = Duration::from_hours(7 * 24);
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_mins(15);
 const CONCURRENT_REFRESH_OBSERVE_INTERVAL: Duration = Duration::from_millis(25);
-const CONCURRENT_REFRESH_OBSERVE_TIMEOUT: Duration = Duration::from_secs(1);
+const CONCURRENT_REFRESH_OBSERVE_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_CAPACITY: usize = 1024;
 
@@ -197,6 +197,12 @@ async fn prepare_codex_auth(
     {
         return Ok(snapshot.failure_state(failure.message.clone(), now));
     }
+    if snapshot.is_expired(now)
+        && let Some(state) = observe_concurrent_host_refresh(path, digest, now).await?
+    {
+        failures.remove(path);
+        return Ok(state);
+    }
 
     match refresh_codex_token(client, oauth, &refresh_token).await {
         Ok(tokens) => {
@@ -342,12 +348,16 @@ impl<'a> AuthSnapshot<'a> {
     }
 
     fn failure_state(&self, error: String, now: u64) -> AgentInstanceCredentialState {
-        let phase = if self.expires_at.is_some_and(|expires_at| expires_at <= now) {
+        let phase = if self.is_expired(now) {
             AgentInstanceCredentialPhase::Expired
         } else {
             AgentInstanceCredentialPhase::RefreshFailed
         };
         self.state(phase, Some(error))
+    }
+
+    fn is_expired(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
     }
 
     fn state(&self, phase: AgentInstanceCredentialPhase, error: Option<String>) -> AgentInstanceCredentialState {
@@ -712,6 +722,51 @@ mod tests {
                 .last_error
                 .as_deref()
                 .is_some_and(|error| error.contains("sign in again on the host"))
+        );
+        let _removed = tokio::fs::remove_dir_all(auth_path.parent().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn expired_auth_gives_a_concurrent_host_refresh_priority() {
+        agentdp_crypto::install_default_provider();
+        let auth_path = temp_auth_path("host-refresh-priority");
+        write_expired_auth(&auth_path).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+        let oauth = CodexOAuthConfig::resolve(Some(endpoint), None);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let host_path = auth_path.clone();
+        let host_refresh = async {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "AgentDP must not race an expired host credential immediately"
+            );
+            tokio::fs::write(
+                host_path,
+                br#"{"last_refresh":"2026-08-05T10:00:00Z","tokens":{"id_token":"host-id","access_token":"header.eyJleHAiOjQxMDI0NDQ4MDB9.host","refresh_token":"host-refresh"}}"#,
+            )
+            .await
+            .unwrap();
+        };
+        let prepare = async {
+            prepare_codex_auth(&client, &oauth, &auth_path, &mut BTreeMap::new())
+                .await
+                .unwrap()
+        };
+        let ((), state) = tokio::join!(host_refresh, prepare);
+
+        assert_eq!(state.phase, AgentInstanceCredentialPhase::Ready);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "AgentDP must adopt the host refresh without sending its own OAuth request"
         );
         let _removed = tokio::fs::remove_dir_all(auth_path.parent().unwrap()).await;
     }
