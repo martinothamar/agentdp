@@ -122,6 +122,35 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         r"async authenticate(n,e){return{authenticated:!1};this._logService.trace(`[AgentHostAuthenticationService] authenticate called: resource=${n.resource}`);",
         "reject protected-resource bearer tokens",
     ),
+    // This Agent Host version only schedules model refreshes after a turn starts.
+    // AgentDP uses Codex's OpenAI account directly, so no Copilot authentication
+    // event primes the initial catalog; refresh it when Codex is constructed.
+    (
+        "this._queueProviderConfigurationWrite()})),this._refreshProviderConfiguration()}",
+        "this._queueProviderConfigurationWrite()})),this._refreshProviderConfiguration(),this._queueModelRefresh()}",
+        "populate the initial Codex model catalog",
+    ),
+    // The Agents window contributes a large direct tool set. Keep the two
+    // editor navigation tools and AgentDP's PR tools direct; expose the host's
+    // session/feedback tools through one deferred namespace instead.
+    (
+        r#"_buildDynamicTools(e){let t=this._serverToolHost?.definitions??[],o=e.clientToolSet.merged(),i=new Set,s=[];for(let a of[...t,...o])i.has(a.name)||(i.add(a.name),s.push(a));if(s.length!==0)return s.map(a=>({type:"function",name:a.name,description:a.description??"",inputSchema:a.inputSchema??{type:"object"}}))}"#,
+        r#"_buildDynamicTools(e){let t=this._serverToolHost?.definitions??[],o=new Set(["agentdp_register_pr","agentdp_unregister_pr"]),i=t.filter(n=>o.has(n.name)),s=t.filter(n=>!o.has(n.name)),a=e.clientToolSet.merged().filter(n=>n.name==="rename"||n.name==="usages"),l=new Set,d=[];for(let n of[...i,...a])l.has(n.name)||(l.add(n.name),d.push({type:"function",name:n.name,description:n.description??"",inputSchema:n.inputSchema??{type:"object"}}));s.length>0&&d.push({type:"namespace",name:"agent_host",description:"Agent Host session and feedback tools.",tools:s.map(n=>({type:"function",name:n.name,description:n.description??"",inputSchema:n.inputSchema??{type:"object"},deferLoading:!0}))});if(d.length!==0)return d}"#,
+        "prune and defer Agent Host tools",
+    ),
+    (
+        "if(i&&e.namespace===null&&i.toolNames.includes(e.tool))",
+        r#"if(i&&(e.namespace===null||e.namespace==="agent_host")&&i.toolNames.includes(e.tool))"#,
+        "route deferred Agent Host tools",
+    ),
+    // VS Code syncs its built-in GitHub MCP server as a client plugin. The
+    // guest already has gh plus AgentDP's session-bound PR tools, so omit that
+    // overlapping server while leaving every other client MCP untouched.
+    (
+        "for(let e of r)for(let t of e.parsed?.mcpServers??iK)Object.prototype.hasOwnProperty.call(n,t.name)||(n[t.name]=vw(t.configuration));return n}",
+        r#"for(let e of r)for(let t of e.parsed?.mcpServers??iK){if(t.name.toLowerCase()==="github")continue;Object.prototype.hasOwnProperty.call(n,t.name)||(n[t.name]=vw(t.configuration))}return n}"#,
+        "omit the VS Code GitHub MCP server",
+    ),
     (
         ",u={web_search:AU(o[\"codex.webSearchMode\"])??co[\"codex.webSearchMode\"],...c.config},p=Object.keys(d);",
         ",u={...c.config},p=Object.keys(d);",
@@ -242,6 +271,13 @@ mod tests {
         assert!(script.contains("reject protected-resource bearer tokens"));
         assert!(script.contains("protectedResources:void 0"));
         assert!(script.contains("return{authenticated:!1}"));
+        assert!(script.contains("populate the initial Codex model catalog"));
+        assert!(script.contains("this._refreshProviderConfiguration(),this._queueModelRefresh()"));
+        assert!(script.contains("prune and defer Agent Host tools"));
+        assert!(script.contains("deferLoading:!0"));
+        assert!(script.contains("route deferred Agent Host tools"));
+        assert!(script.contains("omit the VS Code GitHub MCP server"));
+        assert!(script.contains("t.name.toLowerCase()"));
         assert!(script.contains("add session-bound AgentDP PR server tools"));
         assert!(script.contains("agentdp_register_pr"));
         assert!(script.contains("agentdp_unregister_pr"));
