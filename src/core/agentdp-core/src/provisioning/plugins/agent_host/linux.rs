@@ -146,6 +146,33 @@ const AGENT_HOST_PATCHES: &[(&str, &str, &str)] = &[
         r#"this._reconcileActiveClientsAfterReconnect(e);return{type:"snapshot",snapshots:s.filter(a=>a!==void 0)}"#,
         "restore authoritative state snapshots after reconnect",
     ),
+    // A persisted workbench session and Codex's canonical thread session can
+    // temporarily alias the same thread. Route a turn to the session that
+    // actually sent it, rather than whichever alias happened to restore last.
+    (
+        "let S=d.threadId;if(d.needsResume)try{",
+        "let S=d.threadId;this._sessionIdByThreadId.set(S,l);if(d.needsResume)try{",
+        "claim Codex thread routing when sending a turn",
+    ),
+    // Merely reading a second alias must not steal live notification routing.
+    // The send path above claims ownership before Codex can emit turn events.
+    (
+        "this._sessions.set(t,c),this._sessionIdByThreadId.set(a,t),d&&Vo(d).modelProvider",
+        "this._sessions.set(t,c),this._sessionIdByThreadId.has(a)||this._sessionIdByThreadId.set(a,t),d&&Vo(d).modelProvider",
+        "preserve existing Codex thread routing during restore",
+    ),
+    // Idle eviction of a stale alias must neither remove the active alias's
+    // routing entry nor unsubscribe their shared Codex thread.
+    (
+        "}e.threadId!==void 0&&this._sessionIdByThreadId.delete(e.threadId),e.pendingCommandApprovals",
+        "}let o=e.threadId!==void 0&&this._sessionIdByThreadId.get(e.threadId)===t;o&&this._sessionIdByThreadId.delete(e.threadId),e.pendingCommandApprovals",
+        "release Codex thread routing only from its owner",
+    ),
+    (
+        r#"let o=this._connection;if(o.kind==="ready"&&e.threadId!==void 0){let i=e.threadId;try{await o.client.request("thread/unsubscribe",{threadId:i})}catch(s){this._logService.info(`[Codex:${i}] thread/unsubscribe failed: ${s instanceof Error?s.message:String(s)}`)}}}async _changeModel"#,
+        r#"let i=this._connection;if(o&&i.kind==="ready"&&e.threadId!==void 0){let s=e.threadId;try{await i.client.request("thread/unsubscribe",{threadId:s})}catch(a){this._logService.info(`[Codex:${s}] thread/unsubscribe failed: ${a instanceof Error?a.message:String(a)}`)}}}async _changeModel"#,
+        "unsubscribe a Codex thread only from its routing owner",
+    ),
     // The Agents window contributes a large direct tool set. Keep the two
     // editor navigation tools and AgentDP's PR tools direct; expose the host's
     // session/feedback tools through one deferred namespace instead.
@@ -283,6 +310,14 @@ mod tests {
         assert!(script.contains("this._refreshProviderConfiguration(),this._queueModelRefresh()"));
         assert!(script.contains("restore authoritative state snapshots after reconnect"));
         assert!(script.contains("this._reconcileActiveClientsAfterReconnect(e);return{type:\"snapshot\""));
+        assert!(script.contains("claim Codex thread routing when sending a turn"));
+        assert!(script.contains("this._sessionIdByThreadId.set(S,l)"));
+        assert!(script.contains("preserve existing Codex thread routing during restore"));
+        assert!(script.contains("this._sessionIdByThreadId.has(a)||this._sessionIdByThreadId.set(a,t)"));
+        assert!(script.contains("release Codex thread routing only from its owner"));
+        assert!(script.contains("this._sessionIdByThreadId.get(e.threadId)===t"));
+        assert!(script.contains("unsubscribe a Codex thread only from its routing owner"));
+        assert!(script.contains("if(o&&i.kind===\"ready\""));
         assert!(script.contains("prune and defer Agent Host tools"));
         assert!(script.contains("deferLoading:!0"));
         assert!(script.contains("route deferred Agent Host tools"));
