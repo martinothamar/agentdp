@@ -178,7 +178,7 @@ impl NetworkLimits {
             frame_device_queue_capacity: 512,
             frame_buffer_capacity: 1514,
             max_pooled_frame_capacity: 65_535,
-            frame_buffer_pool_capacity: 256,
+            frame_buffer_pool_capacity: 512,
             small_byte_capacity: 2 * 1024,
             medium_byte_capacity: 16 * 1024,
             tcp_byte_capacity: 64 * 1024,
@@ -207,9 +207,10 @@ impl NetworkLimits {
     }
 
     pub(crate) fn validate_for_event_loop(&self) -> Result<(), String> {
-        if self.frame_buffer_pool_capacity < 2 {
+        if self.frame_buffer_pool_capacity < 3 {
             return Err(
-                "frame_buffer_pool_capacity must be at least two so guest input preserves gateway capacity".to_owned(),
+                "frame_buffer_pool_capacity must be at least three so guest input and its gateway response retain progress capacity"
+                    .to_owned(),
             );
         }
         if self.drive_event_budget == 0 {
@@ -1004,15 +1005,15 @@ mod tests {
     }
 
     #[test]
-    fn network_limits_require_separate_guest_and_gateway_frame_capacity() {
+    fn network_limits_require_guest_input_and_gateway_response_progress_capacity() {
         let limits = NetworkLimits {
-            frame_buffer_pool_capacity: 1,
+            frame_buffer_pool_capacity: 2,
             ..NetworkLimits::default()
         };
 
         let error = limits
             .validate_for_event_loop()
-            .expect_err("one frame cannot serve guest input and gateway output");
+            .expect_err("two frames cannot serve output, guest input, and its gateway response");
 
         assert!(error.contains("frame_buffer_pool_capacity"));
     }

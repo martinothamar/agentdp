@@ -96,7 +96,7 @@ impl Device for FrameDevice {
         }
         let tx_frame = self
             .buffers
-            .try_frame_with_capacity(self.mtu + ETHERNET_HEADER_LEN)
+            .try_gateway_response_frame_with_capacity(self.mtu + ETHERNET_HEADER_LEN)
             .ok()?;
         let frame = self.rx.pop_front()?;
         self.rx_budget = self.rx_budget.saturating_sub(1);
@@ -115,7 +115,7 @@ impl Device for FrameDevice {
         }
         let frame = self
             .buffers
-            .try_frame_with_capacity(self.mtu + ETHERNET_HEADER_LEN)
+            .try_output_frame_with_capacity(self.mtu + ETHERNET_HEADER_LEN)
             .ok()?;
         Some(FrameTxToken { device: self, frame })
     }
@@ -174,7 +174,7 @@ mod tests {
         let buffers = BufferPool::default();
         buffers.prewarm_instance_network();
         let mut device = FrameDevice::new(1500, buffers.clone(), 512);
-        let mut frame = buffers.try_frame().expect("prewarmed frame");
+        let mut frame = buffers.try_guest_frame().expect("prewarmed guest frame");
         frame.as_mut_vec().extend_from_slice(b"frame");
         assert!(device.receive_frame(frame));
 
@@ -204,9 +204,9 @@ mod tests {
         buffers.prewarm_instance_network();
         let mut device = FrameDevice::new(1500, buffers.clone(), 1);
 
-        let mut first = buffers.try_frame().expect("prewarmed frame");
+        let mut first = buffers.try_guest_frame().expect("prewarmed guest frame");
         first.as_mut_vec().extend_from_slice(b"first");
-        let mut second = buffers.try_frame().expect("prewarmed frame");
+        let mut second = buffers.try_guest_frame().expect("prewarmed guest frame");
         second.as_mut_vec().extend_from_slice(b"second");
 
         assert!(device.receive_frame(first));
@@ -218,9 +218,9 @@ mod tests {
         let buffers = BufferPool::default();
         buffers.prewarm_instance_network();
         let mut device = FrameDevice::new(1500, buffers.clone(), 4);
-        let mut first = buffers.try_frame().expect("prewarmed frame");
+        let mut first = buffers.try_guest_frame().expect("prewarmed guest frame");
         first.as_mut_vec().extend_from_slice(b"first");
-        let mut second = buffers.try_frame().expect("prewarmed frame");
+        let mut second = buffers.try_guest_frame().expect("prewarmed guest frame");
         second.as_mut_vec().extend_from_slice(b"second");
         assert!(device.receive_frame(first));
         assert!(device.receive_frame(second));
@@ -241,9 +241,11 @@ mod tests {
         });
         buffers.prewarm_instance_network();
         let mut device = FrameDevice::new(1500, buffers.clone(), 1);
-        let mut frame = buffers.try_frame().expect("prewarmed frame");
+        let mut frame = buffers.try_guest_frame().expect("prewarmed guest frame");
         frame.as_mut_vec().extend_from_slice(b"saved");
-        let held = buffers.try_frame().expect("prewarmed frame");
+        let held = buffers
+            .try_gateway_response_frame_with_capacity(1500 + ETHERNET_HEADER_LEN)
+            .expect("prewarmed response frame");
         assert!(device.receive_frame(frame));
 
         assert!(device.receive(smoltcp_now()).is_none());

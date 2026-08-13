@@ -3,7 +3,8 @@ use std::rc::Rc;
 
 use crate::network::NetworkLimits;
 
-const GATEWAY_FRAME_RESERVE: usize = 1;
+const GUEST_PROGRESS_FRAME_RESERVE: usize = 2;
+const GATEWAY_RESPONSE_FRAME_RESERVE: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("{kind:?} buffer pool exhausted for requested capacity {capacity}")]
@@ -44,18 +45,29 @@ impl BufferPool {
         }
     }
 
-    pub(crate) fn try_frame(&self) -> Result<FrameBuf, PoolExhausted> {
-        self.frames.try_take(self.limits.frame_buffer_capacity, 0)
+    /// Leaves enough capacity to read one guest frame and give smoltcp the
+    /// transmit token paired with that frame. Guest-bound traffic must not
+    /// consume this reserve or QEMU's full-duplex stream can deadlock when its
+    /// own writes and the host's writes are both backpressured.
+    pub(crate) fn try_output_frame(&self) -> Result<FrameBuf, PoolExhausted> {
+        self.frames
+            .try_take(self.limits.frame_buffer_capacity, GUEST_PROGRESS_FRAME_RESERVE)
     }
 
-    /// Keeps one frame available for smoltcp's receive-side transmit token so
-    /// a guest input batch cannot prevent the gateway from consuming that batch.
+    /// Keeps one frame available for smoltcp's receive-side transmit token.
     pub(crate) fn try_guest_frame(&self) -> Result<FrameBuf, PoolExhausted> {
         self.frames
-            .try_take(self.limits.frame_buffer_capacity, GATEWAY_FRAME_RESERVE)
+            .try_take(self.limits.frame_buffer_capacity, GATEWAY_RESPONSE_FRAME_RESERVE)
     }
 
-    pub(crate) fn try_frame_with_capacity(&self, capacity: usize) -> Result<FrameBuf, PoolExhausted> {
+    pub(crate) fn try_output_frame_with_capacity(&self, capacity: usize) -> Result<FrameBuf, PoolExhausted> {
+        self.frames.try_take(capacity, GUEST_PROGRESS_FRAME_RESERVE)
+    }
+
+    /// Allocates the transmit token paired with an already-reserved guest
+    /// input frame. This is the only allocation allowed to consume the final
+    /// progress buffer.
+    pub(crate) fn try_gateway_response_frame_with_capacity(&self, capacity: usize) -> Result<FrameBuf, PoolExhausted> {
         self.frames.try_take(capacity, 0)
     }
 
@@ -468,7 +480,7 @@ mod tests {
         let pool = prewarmed_pool();
         let clone = pool.clone();
 
-        let frame = pool.try_frame().expect("prewarmed frame");
+        let frame = pool.try_output_frame().expect("prewarmed output frame");
         let io = clone.try_byte_with_capacity(64).expect("prewarmed byte buffer");
 
         drop(frame);
@@ -480,14 +492,16 @@ mod tests {
     #[test]
     fn recycled_frame_buffers_are_cleared_and_reused() {
         let pool = prewarmed_pool();
-        let mut frame = pool.try_frame_with_capacity(4096).expect("prewarmed frame");
+        let mut frame = pool
+            .try_output_frame_with_capacity(4096)
+            .expect("prewarmed output frame");
         frame.resize_zeroed(1024);
         assert_eq!(frame.len(), 1024);
 
         drop(frame);
         let warmed = pool.frames.inner.borrow().len();
 
-        let frame = pool.try_frame().expect("recycled frame");
+        let frame = pool.try_output_frame().expect("recycled output frame");
         assert!(frame.is_empty());
         assert!(frame.bytes.capacity() >= 4096);
         assert_eq!(pool.frames.inner.borrow().len(), warmed - 1);
@@ -567,7 +581,7 @@ mod tests {
         let pool = prewarmed_pool();
 
         assert!(
-            pool.try_frame_with_capacity(pool.limits.max_pooled_frame_capacity + 1)
+            pool.try_output_frame_with_capacity(pool.limits.max_pooled_frame_capacity + 1)
                 .is_err()
         );
         assert!(pool.try_byte_with_capacity(pool.limits.tcp_byte_capacity + 1).is_err());
@@ -577,14 +591,17 @@ mod tests {
     #[test]
     fn pool_retains_at_most_configured_capacity() {
         let limits = NetworkLimits {
-            frame_buffer_pool_capacity: 2,
+            frame_buffer_pool_capacity: 3,
             small_byte_pool_capacity: 2,
             ..NetworkLimits::default()
         };
         let pool = BufferPool::new(limits);
         pool.prewarm_instance_network();
         let frames: Vec<_> = (0..pool.limits.frame_buffer_pool_capacity)
-            .map(|_| pool.try_frame().expect("prewarmed frame"))
+            .map(|_| {
+                pool.try_gateway_response_frame_with_capacity(pool.limits.frame_buffer_capacity)
+                    .expect("prewarmed frame")
+            })
             .collect();
         let io_buffers: Vec<_> = (0..pool.limits.small_byte_pool_capacity)
             .map(|_| pool.try_byte_with_capacity(8).expect("prewarmed small buffer"))
@@ -610,7 +627,9 @@ mod tests {
         let pool = prewarmed_pool();
 
         for _ in 0..1024 {
-            let mut frame = pool.try_frame_with_capacity(1500).expect("prewarmed frame");
+            let mut frame = pool
+                .try_output_frame_with_capacity(1500)
+                .expect("prewarmed output frame");
             frame.resize_zeroed(1500);
             drop(frame);
 
@@ -628,7 +647,7 @@ mod tests {
     #[should_panic(expected = "frame buffers still checked out")]
     fn assert_drained_detects_unrecycled_frame() {
         let pool = prewarmed_pool();
-        let _frame = pool.try_frame().expect("prewarmed frame");
+        let _frame = pool.try_output_frame().expect("prewarmed output frame");
 
         pool.assert_drained();
     }
@@ -646,7 +665,7 @@ mod tests {
     fn cold_pool_rejects_runtime_checkout() {
         let pool = BufferPool::default();
 
-        assert!(pool.try_frame().is_err());
+        assert!(pool.try_output_frame().is_err());
         assert!(pool.try_byte_with_capacity(64).is_err());
     }
 }

@@ -427,7 +427,7 @@ where
     pub(crate) fn queue_guest_frame_for_test(&mut self, bytes: &[u8]) -> Result<(), String> {
         let mut frame = self
             .buffers
-            .try_frame_with_capacity(bytes.len())
+            .try_output_frame_with_capacity(bytes.len())
             .map_err(|error| error.to_string())?;
         frame.as_mut_vec().extend_from_slice(bytes);
         self.component_outputs.guest_frames.push(frame);

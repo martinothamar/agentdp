@@ -88,7 +88,7 @@ pub(super) fn udp_frame(
     buffers: &BufferPool,
 ) -> Option<FrameBuf> {
     let (IpAddr::V4(src_addr), IpAddr::V4(dst_addr)) = (src.ip(), dst.ip()) else {
-        return buffers.try_frame().ok();
+        return buffers.try_output_frame().ok();
     };
     let udp = UdpRepr {
         src_port: src.port(),
@@ -102,7 +102,7 @@ pub(super) fn udp_frame(
         hop_limit: 64,
     };
     let frame_len = ETHERNET_HEADER_LEN + ipv4.buffer_len() + ipv4.payload_len;
-    let mut bytes = buffers.try_frame_with_capacity(frame_len).ok()?;
+    let mut bytes = buffers.try_output_frame_with_capacity(frame_len).ok()?;
     bytes.resize_zeroed(frame_len);
     let mut ethernet = EthernetFrame::new_unchecked(bytes.as_mut_vec());
     ethernet.set_src_addr(source_mac.smoltcp());

@@ -309,18 +309,18 @@ mod tests {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stream pair should initialize");
         reader.set_nonblocking(true).expect("reader should become nonblocking");
         writer.set_nonblocking(true).expect("writer should become nonblocking");
-        let mut guest = GuestIo::register(TestSession { reader, writer }, 1, &buffers, &mut runtime)
+        let mut guest = GuestIo::register(TestSession::new(reader, writer), 1, &buffers, &mut runtime)
             .expect("guest session should register");
         let mut budget = DriveBudget::event_loop(&crate::network::NetworkLimits::default());
         let mut report = DriveReport::new();
         let mut drive = DriveTurn::new(&mut budget, &mut report);
 
         assert!(matches!(
-            guest.enqueue(frame(&buffers, b"first"), &mut drive, &runtime),
+            guest.enqueue(output_frame(&buffers, b"first"), &mut drive, &runtime),
             Ok(GuestFrameEnqueue::Queued)
         ));
         assert!(matches!(
-            guest.enqueue(frame(&buffers, b"second"), &mut drive, &runtime),
+            guest.enqueue(output_frame(&buffers, b"second"), &mut drive, &runtime),
             Ok(GuestFrameEnqueue::Queued)
         ));
         guest
@@ -350,18 +350,18 @@ mod tests {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stream pair should initialize");
         reader.set_nonblocking(true).expect("reader should become nonblocking");
         writer.set_nonblocking(true).expect("writer should become nonblocking");
-        let mut guest = GuestIo::register(TestSession { reader, writer }, 1, &buffers, &mut runtime)
+        let mut guest = GuestIo::register(TestSession::new(reader, writer), 1, &buffers, &mut runtime)
             .expect("guest session should register");
         let mut budget = DriveBudget::event_loop(&limits);
         let mut report = DriveReport::new();
         let mut drive = DriveTurn::new(&mut budget, &mut report);
 
         assert!(matches!(
-            guest.enqueue(frame(&buffers, b"first"), &mut drive, &runtime),
+            guest.enqueue(output_frame(&buffers, b"first"), &mut drive, &runtime),
             Ok(GuestFrameEnqueue::Queued)
         ));
         assert!(matches!(
-            guest.enqueue(frame(&buffers, b"second"), &mut drive, &runtime),
+            guest.enqueue(output_frame(&buffers, b"second"), &mut drive, &runtime),
             Ok(GuestFrameEnqueue::Blocked(_))
         ));
         assert!(report.wait().contains(crate::drive::DriveWait::GUEST_SEND_CAPACITY));
@@ -378,7 +378,7 @@ mod tests {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stream pair should initialize");
         reader.set_nonblocking(true).expect("reader should become nonblocking");
         writer.set_nonblocking(true).expect("writer should become nonblocking");
-        let mut guest = GuestIo::register(TestSession { reader, writer }, 1, &buffers, &mut runtime)
+        let mut guest = GuestIo::register(TestSession::new(reader, writer), 1, &buffers, &mut runtime)
             .expect("guest session should register");
         let mut events = Vec::new();
         let mut budget = DriveBudget::event_loop(&NetworkLimits::default());
@@ -403,8 +403,74 @@ mod tests {
         assert!(!guest.io.io().can_read());
     }
 
-    fn frame(buffers: &BufferPool, bytes: &[u8]) -> FrameBuf {
-        let mut frame = buffers.try_frame().expect("prewarmed frame");
+    #[test]
+    fn saturated_guest_output_preserves_guest_input_progress() {
+        let limits = NetworkLimits {
+            frame_buffer_pool_capacity: 4,
+            frame_device_queue_capacity: 4,
+            ..NetworkLimits::default()
+        };
+        let buffers = BufferPool::new(limits.clone());
+        buffers.prewarm_instance_network();
+        let mut runtime = runtime_context(
+            default_backend(limits.reactor_event_capacity).expect("unit-test reactor should initialize"),
+        );
+        let (mut peer, writer) = std::os::unix::net::UnixStream::pair().expect("stream pair should initialize");
+        peer.set_nonblocking(true).expect("peer should become nonblocking");
+        writer.set_nonblocking(true).expect("writer should become nonblocking");
+        let mut guest = GuestIo::register(
+            TestSession::with_blocked_writes(peer.try_clone().unwrap(), writer),
+            1,
+            &buffers,
+            &mut runtime,
+        )
+        .expect("guest session should register");
+        let mut budget = DriveBudget::event_loop(&limits);
+        let mut report = DriveReport::new();
+        let mut drive = DriveTurn::new(&mut budget, &mut report);
+
+        for payload in [b"one".as_slice(), b"two"] {
+            assert!(matches!(
+                guest.enqueue(output_frame(&buffers, payload), &mut drive, &runtime),
+                Ok(GuestFrameEnqueue::Queued)
+            ));
+        }
+        assert!(
+            buffers
+                .try_output_frame_with_capacity(limits.frame_buffer_capacity)
+                .is_err(),
+            "guest-bound output must preserve progress buffers"
+        );
+        peer.write_all(b"inbound").expect("peer should send a guest frame");
+        let mut events = Vec::new();
+
+        guest
+            .drive_ready(
+                &[ReactorReady::Io {
+                    item: ReactorItemId::Guest,
+                    readable: true,
+                    writable: true,
+                }],
+                &mut events,
+                &mut drive,
+                &runtime,
+            )
+            .expect("guest input should remain readable while output is blocked");
+
+        let [super::GuestEvent::Frame { frame, .. }] = events.as_slice() else {
+            panic!("guest input must retain progress capacity");
+        };
+        assert_eq!(frame.as_slice(), b"inbound");
+        let response = buffers
+            .try_gateway_response_frame_with_capacity(limits.frame_buffer_capacity)
+            .expect("the paired gateway response must retain progress capacity");
+        drop(response);
+    }
+
+    fn output_frame(buffers: &BufferPool, bytes: &[u8]) -> FrameBuf {
+        let mut frame = buffers
+            .try_output_frame_with_capacity(bytes.len())
+            .expect("prewarmed output frame");
         frame.as_mut_vec().extend_from_slice(bytes);
         frame
     }
@@ -412,6 +478,28 @@ mod tests {
     struct TestSession {
         reader: std::os::unix::net::UnixStream,
         writer: std::os::unix::net::UnixStream,
+        block_writes: bool,
+    }
+
+    impl TestSession {
+        const fn new(reader: std::os::unix::net::UnixStream, writer: std::os::unix::net::UnixStream) -> Self {
+            Self {
+                reader,
+                writer,
+                block_writes: false,
+            }
+        }
+
+        const fn with_blocked_writes(
+            reader: std::os::unix::net::UnixStream,
+            writer: std::os::unix::net::UnixStream,
+        ) -> Self {
+            Self {
+                reader,
+                writer,
+                block_writes: true,
+            }
+        }
     }
 
     impl GuestFrameSession for TestSession {
@@ -442,6 +530,9 @@ mod tests {
         }
 
         fn write_frame(&mut self, frame: &[u8]) -> Result<FrameWrite, TransportError> {
+            if self.block_writes {
+                return Ok(FrameWrite::Blocked);
+            }
             match self.writer.write(frame) {
                 Ok(len) if len == frame.len() => Ok(FrameWrite::Flushed),
                 Ok(_) => Err(TransportError::operation("write test session", "partial write")),

@@ -305,7 +305,7 @@ fn simulated_guest_read_batch_preserves_gateway_output_capacity() -> Result<()> 
     let mut sim = Simulator::new(Seed::new(0x10a));
     let guest_link = sim.guest_link()?;
     let mut network = allow_all_network_config();
-    network.limits.frame_buffer_pool_capacity = 2;
+    network.limits.frame_buffer_pool_capacity = 3;
     let mut running = AgentdpNetworkSim::start(
         ScenarioNetworkConfig {
             seed: sim.seed(),

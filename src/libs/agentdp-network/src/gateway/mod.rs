@@ -1256,7 +1256,7 @@ mod tests {
         let buffers = test_buffers();
         let config = InstanceNetworkConfig::new(TEST_ADDRESSES, TEST_MAC, EgressPolicy::allow_all());
         let mut gateway = Gateway::new(&config, buffers.clone(), SystemClock);
-        let mut frame = buffers.try_frame().expect("prewarmed frame");
+        let mut frame = buffers.try_guest_frame().expect("prewarmed guest frame");
         frame.as_mut_vec().extend_from_slice(b"invalid");
         assert!(gateway.device.receive_frame(frame));
         let mut guest_frames = test_guest_frames(&config.limits);
@@ -1453,7 +1453,7 @@ mod tests {
             hop_limit: 64,
         };
         let frame_len = ETHERNET_HEADER_LEN + ipv4.buffer_len() + tcp.buffer_len();
-        let mut bytes = buffers.try_frame_with_capacity(frame_len).expect("prewarmed frame");
+        let mut bytes = buffers.try_guest_frame().expect("prewarmed guest frame");
         bytes.resize_zeroed(frame_len);
         let mut ethernet = EthernetFrame::new_unchecked(bytes.as_mut_vec());
         ethernet.set_src_addr(TEST_MAC.guest.smoltcp());
